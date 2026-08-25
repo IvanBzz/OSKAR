@@ -6,6 +6,13 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — STATS_MANIFEST (ст. 3) + актуализация дашборда и задач
+
+`src/oskar/agents/prompts/STATS_MANIFEST.md` — аудируемый манифест статистик в промптах: разрешенные (внешние данные, рыночные фичи, знания), запрещенные навсегда (направление портфеля, WR по направлениям, «prefer shorts» — петля v1), Analyst-only (полная статистика — агенту без права торговать). Обновлены index.md и задачи: Фаза 0 закрыта по знаниям (31 заметка), блокеры на Иване выделены.
+
+### Затронутые файлы
+CREATE: src/oskar/agents/prompts/STATS_MANIFEST.md; MODIFY: vault/00-home/index.md, vault/progress/задачи
+
 ## 2026-08-26 — claude_cli мост + бюджеты агентов из analysis_log
 
 `agents/claude_cli.py`: subprocess-мост к `claude -p --output-format json` — байтовый stdin UTF-8 (v1: text=True кодировал cp1251 и ломал русский), ретрай, prompt_sha, extract_json_block (голый JSON / ```json-блок / JSON в тексте). Тесты на стаб-процессах (ok/fail/garbage) — реальный CLI не дергается.
