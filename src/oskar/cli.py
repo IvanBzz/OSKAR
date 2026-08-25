@@ -21,7 +21,16 @@ def main() -> int:
     p_search.add_argument("query", nargs="+")
     p_search.add_argument("--limit", type=int, default=8)
 
+    p_sync = sub.add_parser("sync", help="read-only exchange window (exists BEFORE first trade)")
+    sync_sub = p_sync.add_subparsers(dest="sync_command", required=True)
+    sync_sub.add_parser("balance", help="exchange balance snapshot")
+    sync_sub.add_parser("positions", help="open positions on exchange")
+    sync_sub.add_parser("diff", help="journal vs exchange discrepancy report")
+
     args = parser.parse_args()
+
+    if args.command == "sync":
+        return _cmd_sync(args)
 
     if args.command == "knowledge":
         from oskar.knowledge.index import build_index, search
@@ -50,6 +59,57 @@ def main() -> int:
         print(f"  actual: {actual}")
         print("  Amendment procedure (Art. 4) required. Runtime would enter safe_mode.")
         return 1
+    return 0
+
+
+def _cmd_sync(args) -> int:
+    import os
+    from pathlib import Path
+
+    from dotenv import load_dotenv
+
+    from oskar.sync.exchange_sync import (
+        diff_positions,
+        exchange_position_qty,
+        make_bingx_view,
+        render_diff,
+        snapshot_balance,
+    )
+
+    repo = Path(__file__).resolve().parents[2]
+    load_dotenv(repo / ".env")
+    key, secret = os.getenv("BINGX_API_KEY", ""), os.getenv("BINGX_API_SECRET", "")
+    if not key or not secret:
+        print("ERROR: BINGX_API_KEY / BINGX_API_SECRET not set (see .env.example)")
+        return 1
+    view = make_bingx_view(key, secret, sandbox=True)
+
+    if args.sync_command == "balance":
+        b = snapshot_balance(view)
+        print(f"USDT total={b['total']:.2f} free={b['free']:.2f} used={b['used']:.2f}")
+        return 0
+    if args.sync_command == "positions":
+        positions = view.positions()
+        if not positions:
+            print("no open positions")
+            return 0
+        for p in positions:
+            qty = exchange_position_qty(p)
+            if qty == 0:
+                continue
+            print(f"{p.get('symbol')} {p.get('side')} qty={qty:.8g} "
+                  f"entry={p.get('entryPrice')} upnl={p.get('unrealizedPnl')}")
+        return 0
+    if args.sync_command == "diff":
+        from oskar.journal.db import connect
+
+        conn = connect(repo / "data" / "oskar.db")
+        try:
+            d = diff_positions(view, conn)
+            print(render_diff(d))
+            return 0 if d.clean else 1
+        finally:
+            conn.close()
     return 0
 
 

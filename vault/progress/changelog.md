@@ -6,6 +6,16 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — exchange_sync: read-only окно в биржу, детектор qty-бага
+
+`sync/exchange_sync.py` (ст. 1 п. 3 — существует ДО первой сделки): чистые функции над протоколом ExchangeView (реальный ccxt-BingX VST через фабрику, тесты на фейке). `diff` сверяет открытые сделки журнала с позициями биржи: наличие (фантомы в обе стороны — v1-баг «-$329 vs -$7.56») + qty per symbol+side через `contracts * contractSize` с ratio-отчетом — прямой инструмент против открытого qty-бага v1 (SUSHI 6.98x — тест воспроизводит сценарий). Сравнение символов через canonical() — ADA-USDT == ADA/USDT:USDT не считается расхождением. CLI: `oskar sync balance|positions|diff` (ключи из .env, ASCII-вывод, diff возвращает exit 1 при грязи — можно в cron/CI).
+
+### Тесты
+- test_exchange_sync (8): clean/dirty diff, сценарий SUSHI 6.98x, иммунитет к форматам символов, фантомы журнала и биржи, ASCII-чистота вывода. Итого 107.
+
+### Затронутые файлы
+CREATE: src/oskar/sync/{__init__,exchange_sync}.py, tests/unit/test_exchange_sync.py; MODIFY: src/oskar/cli.py
+
 ## 2026-08-26 — реплей-харнесс: конвейер целиком, бар-за-баром, без LLM
 
 `ops/replay.py`: каждый бар t — analyze(candles[:t]) -> индикаторы -> score -> options -> риск-лестница; исходы разрешаются по high/low последующих баров, коллизия SL+TP в одном баре — консервативно SL первым. Без LLM: дефолтные опции меню (market/свинг-SL/первый TP) — это оценка механического слоя и генератор counterfactual-когорт (executed / risk_rejected), не бэктест Scout'а. Статистика: setups/executed/rejected/WR.
