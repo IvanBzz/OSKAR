@@ -1,0 +1,25 @@
+# Торговые профили OSKAR. Стартовый: intraday (решение сессии 2026-08-25).
+# Скальп 1-5м отложен: латентность claude -p (30-90с) + Telegram-подтверждение несовместимы.
+# SL/TP здесь — ГРАНИЦЫ для меню опций, которые детекторы предлагают Trader'у,
+# не свободные значения. Финальную валидацию делает риск-лестница + caps.yaml.
+
+active_profile: intraday
+
+profiles:
+  intraday:
+    signal_timeframes: ["15m", "1h"]     # где ищем сетапы
+    context_timeframes: ["4h", "1d"]     # старшие ТФ для тренда/структуры
+    sl_distance_pct: [0.5, 3.0]          # допустимый диапазон стопа от входа
+    max_loss_hold_seconds: 10800         # duration-stop: лосер старше 3ч закрывается (урок v1: лосеры жили 3.4x дольше)
+    approval_ttl_seconds: 1200           # 20 минут на подтверждение карточки, потом reject
+    max_leverage: 8                      # <= caps.max_leverage
+    scan_interval_seconds: 30
+
+  swing:
+    signal_timeframes: ["1h", "4h"]
+    context_timeframes: ["1d"]
+    sl_distance_pct: [1.0, 5.0]
+    max_loss_hold_seconds: 43200         # 12 часов
+    approval_ttl_seconds: 3600
+    max_leverage: 5
+    scan_interval_seconds: 120

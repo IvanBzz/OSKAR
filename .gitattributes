@@ -1,0 +1,4 @@
+# caps.yaml участвует в hash-pin (CONSTITUTION.md ст. 4) — фиксируем LF навсегда
+config/caps.yaml text eol=lf
+# схемы экспортируются детерминированно
+src/oskar/contracts/json/*.json text eol=lf

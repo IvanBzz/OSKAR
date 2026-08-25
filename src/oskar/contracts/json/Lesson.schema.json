@@ -1,0 +1,93 @@
+{
+  "$defs": {
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "metric": {
+          "title": "Metric",
+          "type": "string"
+        },
+        "n": {
+          "minimum": 1,
+          "title": "N",
+          "type": "integer"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "n",
+        "value"
+      ],
+      "title": "Evidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "evidence": {
+      "$ref": "#/$defs/Evidence"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "observation": {
+      "minLength": 10,
+      "title": "Observation",
+      "type": "string"
+    },
+    "proposal_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Proposal Ref"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "status": {
+      "default": "hypothesis",
+      "enum": [
+        "hypothesis",
+        "validated",
+        "refuted"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "trade_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Trade Ids",
+      "type": "array"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "ts",
+    "trade_ids",
+    "observation",
+    "evidence"
+  ],
+  "title": "Lesson",
+  "type": "object"
+}

@@ -1,0 +1,63 @@
+{
+  "additionalProperties": false,
+  "description": "Trader выбирает опции ПО ID из SetupCandidate. Свободных чисел нет —\nопечатка модели физически не может стать кривым ордером (ст. 2).",
+  "properties": {
+    "candidate_id": {
+      "title": "Candidate Id",
+      "type": "string"
+    },
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "entry_option_id": {
+      "title": "Entry Option Id",
+      "type": "string"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string"
+    },
+    "prompt_sha": {
+      "title": "Prompt Sha",
+      "type": "string"
+    },
+    "rationale": {
+      "minLength": 10,
+      "title": "Rationale",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "sl_option_id": {
+      "title": "Sl Option Id",
+      "type": "string"
+    },
+    "tp_option_id": {
+      "title": "Tp Option Id",
+      "type": "string"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision_id",
+    "ts",
+    "candidate_id",
+    "entry_option_id",
+    "sl_option_id",
+    "tp_option_id",
+    "rationale",
+    "model",
+    "prompt_sha"
+  ],
+  "title": "TradeDecision",
+  "type": "object"
+}

@@ -1,0 +1,132 @@
+{
+  "$defs": {
+    "Fill": {
+      "additionalProperties": false,
+      "properties": {
+        "fee": {
+          "title": "Fee",
+          "type": "number"
+        },
+        "order_id": {
+          "title": "Order Id",
+          "type": "string"
+        },
+        "price": {
+          "title": "Price",
+          "type": "number"
+        },
+        "qty": {
+          "title": "Qty",
+          "type": "number"
+        },
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        }
+      },
+      "required": [
+        "order_id",
+        "price",
+        "qty",
+        "fee",
+        "ts"
+      ],
+      "title": "Fill",
+      "type": "object"
+    },
+    "OrderRef": {
+      "additionalProperties": false,
+      "properties": {
+        "client_order_id": {
+          "title": "Client Order Id",
+          "type": "string"
+        },
+        "exchange_id": {
+          "title": "Exchange Id",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "MARKET",
+            "LIMIT",
+            "STOP_MARKET",
+            "TAKE_PROFIT_MARKET"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "exchange_id",
+        "client_order_id",
+        "type",
+        "status"
+      ],
+      "title": "OrderRef",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "client_order_id": {
+      "title": "Client Order Id",
+      "type": "string"
+    },
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "fills": {
+      "items": {
+        "$ref": "#/$defs/Fill"
+      },
+      "title": "Fills",
+      "type": "array"
+    },
+    "orders": {
+      "items": {
+        "$ref": "#/$defs/OrderRef"
+      },
+      "title": "Orders",
+      "type": "array"
+    },
+    "position_side": {
+      "enum": [
+        "LONG",
+        "SHORT"
+      ],
+      "title": "Position Side",
+      "type": "string"
+    },
+    "reconciled": {
+      "default": false,
+      "title": "Reconciled",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision_id",
+    "ts",
+    "client_order_id",
+    "orders",
+    "position_side"
+  ],
+  "title": "ExecutionReport",
+  "type": "object"
+}

@@ -1,0 +1,102 @@
+{
+  "$defs": {
+    "SetupVerdict": {
+      "additionalProperties": false,
+      "description": "Вердикт Scout по одному кандидату. Схема ПРИНУЖДАЕТ к адверсариальности:\nbear_case и bear_rebuttal обязательны и непусты — слабый rebuttal режет\nриск-движок (сжатые дебаты быков/медведей в одном вызове).",
+      "properties": {
+        "bear_case": {
+          "minLength": 20,
+          "title": "Bear Case",
+          "type": "string"
+        },
+        "bear_rebuttal": {
+          "minLength": 20,
+          "title": "Bear Rebuttal",
+          "type": "string"
+        },
+        "bull_case": {
+          "minLength": 20,
+          "title": "Bull Case",
+          "type": "string"
+        },
+        "candidate_id": {
+          "title": "Candidate Id",
+          "type": "string"
+        },
+        "confidence": {
+          "maximum": 75,
+          "minimum": 0,
+          "title": "Confidence",
+          "type": "integer"
+        },
+        "knowledge_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Knowledge Refs",
+          "type": "array"
+        },
+        "verdict": {
+          "enum": [
+            "take",
+            "pass"
+          ],
+          "title": "Verdict",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate_id",
+        "bull_case",
+        "bear_case",
+        "bear_rebuttal",
+        "verdict",
+        "confidence"
+      ],
+      "title": "SetupVerdict",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "model": {
+      "title": "Model",
+      "type": "string"
+    },
+    "prompt_sha": {
+      "title": "Prompt Sha",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "setups": {
+      "items": {
+        "$ref": "#/$defs/SetupVerdict"
+      },
+      "title": "Setups",
+      "type": "array"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision_id",
+    "ts",
+    "setups",
+    "model",
+    "prompt_sha"
+  ],
+  "title": "ScoutReport",
+  "type": "object"
+}

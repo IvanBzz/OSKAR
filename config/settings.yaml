@@ -1,0 +1,47 @@
+# Рабочие настройки OSKAR (не-конституционные, можно менять обычным коммитом
+# с changelog-записью; конституционные лимиты — в caps.yaml).
+
+mode: paper                        # paper (BingX VST) | live — live откроется только через гейт Фазы 5
+
+exchange:
+  id: bingx
+  sandbox: true                    # true = VST (open-api-vst.bingx.com), реальные цены
+  hedge_mode: true                 # BingX VST всегда hedge: positionSide обязателен
+  adjust_for_time_difference: true # Windows clock drift (урок v1)
+  rate_limit_ms: 100
+  # ключи ТОЛЬКО из .env: BINGX_API_KEY, BINGX_API_SECRET
+
+scanner:
+  universe: swap_usdt              # все активные USDT-перпы
+  quick_filter_top: 100
+  full_analysis_top: 20
+  min_opportunity_score: 70        # порог эскалации к Scout
+  per_symbol_cooldown_seconds: 1800
+
+api:
+  host: 127.0.0.1
+  port: 8321                       # bind = single-instance lock
+
+telegram:
+  # токен и chat_id ТОЛЬКО из .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+  send_charts: true
+
+agents:
+  scout:  { model_cmd: "claude -p", daily_budget: 30, hourly_budget: 6 }
+  trader: { model_cmd: "claude -p", daily_budget: 20 }
+  analyst: { model_cmd: "claude -p", daily_budget: 3 }
+  # Sentinel живет в Hermes, бюджет там
+
+safe_mode:
+  consecutive_errors: 3
+  error_cooldown_minutes: 60
+  drawdown_pct: 10                 # этот триггер НЕ снимается автоматически (урок v1)
+  token_budget_floor_pct: 20
+
+journal:
+  db_path: data/oskar.db
+  archive_before_run: true         # снепшот в data/archive/ перед каждым большим прогоном
+
+knowledge:
+  library_path: vault/library
+  max_prompt_tokens: 1500

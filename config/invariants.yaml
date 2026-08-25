@@ -1,0 +1,39 @@
+# Machine-checkable инварианты прогонов (Статья 5 CONSTITUTION.md).
+# Каждый behavior-changing коммит объявляет здесь инвариант; ops/invariants.py
+# проверяет их по журналу и пишет вердикты в vault/runs/. Красный вердикт =
+# Telegram-алерт (+ опционально safe_mode). Статус committed_not_live_validated
+# снимается ТОЛЬКО зеленым вердиктом.
+#
+# Формат:
+#   - id: INV-NNN
+#     commit: <hash|pending>
+#     description: человеческое описание
+#     metric: SQL-выражение или именованная метрика из ops/invariants.py
+#     window: {closed_trades: N} | {hours: N}
+#     expect: условие
+#     status: pending | green | red
+
+invariants:
+  - id: INV-001
+    commit: pending
+    description: "close_reason 'unknown' не встречается (v1: 76% unknown/manual)"
+    metric: close_reason_unknown_count
+    window: { closed_trades: 20 }
+    expect: "== 0"
+    status: pending
+
+  - id: INV-002
+    commit: pending
+    description: "Ни один лосер не живет дольше max_loss_hold_seconds профиля"
+    metric: loser_overhold_count
+    window: { closed_trades: 20 }
+    expect: "== 0"
+    status: pending
+
+  - id: INV-003
+    commit: pending
+    description: "Журнал и биржа сходятся: reconcile diff пуст"
+    metric: reconcile_diff_rows
+    window: { hours: 48 }
+    expect: "== 0"
+    status: pending

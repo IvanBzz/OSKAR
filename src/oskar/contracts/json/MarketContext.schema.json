@@ -1,0 +1,90 @@
+{
+  "additionalProperties": false,
+  "description": "Брифинг Sentinel. stale=true деградирует в neutral, НИКОГДА не блокирует\nторговлю (Sentinel — контекст, не альфа; его отсутствие не останавливает цикл).",
+  "properties": {
+    "btc_dominance": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Btc Dominance"
+    },
+    "events": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Events",
+      "type": "array"
+    },
+    "fear_greed": {
+      "anyOf": [
+        {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Fear Greed"
+    },
+    "funding_notes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Funding Notes",
+      "type": "array"
+    },
+    "regime": {
+      "enum": [
+        "risk_on",
+        "risk_off",
+        "neutral"
+      ],
+      "title": "Regime",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "source_health": {
+      "additionalProperties": {
+        "type": "boolean"
+      },
+      "title": "Source Health",
+      "type": "object"
+    },
+    "stale": {
+      "default": false,
+      "title": "Stale",
+      "type": "boolean"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    },
+    "ttl_sec": {
+      "exclusiveMinimum": 0,
+      "title": "Ttl Sec",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "ts",
+    "ttl_sec",
+    "regime"
+  ],
+  "title": "MarketContext",
+  "type": "object"
+}

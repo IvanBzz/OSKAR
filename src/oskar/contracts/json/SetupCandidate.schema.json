@@ -1,0 +1,313 @@
+{
+  "$defs": {
+    "FvgInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "bottom": {
+          "title": "Bottom",
+          "type": "number"
+        },
+        "mitigated": {
+          "title": "Mitigated",
+          "type": "boolean"
+        },
+        "timeframe": {
+          "enum": [
+            "1m",
+            "5m",
+            "15m",
+            "1h",
+            "4h",
+            "1d"
+          ],
+          "title": "Timeframe",
+          "type": "string"
+        },
+        "top": {
+          "title": "Top",
+          "type": "number"
+        }
+      },
+      "required": [
+        "top",
+        "bottom",
+        "mitigated",
+        "timeframe"
+      ],
+      "title": "FvgInfo",
+      "type": "object"
+    },
+    "ObInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "bottom": {
+          "title": "Bottom",
+          "type": "number"
+        },
+        "tested": {
+          "title": "Tested",
+          "type": "boolean"
+        },
+        "timeframe": {
+          "enum": [
+            "1m",
+            "5m",
+            "15m",
+            "1h",
+            "4h",
+            "1d"
+          ],
+          "title": "Timeframe",
+          "type": "string"
+        },
+        "top": {
+          "title": "Top",
+          "type": "number"
+        }
+      },
+      "required": [
+        "top",
+        "bottom",
+        "tested",
+        "timeframe"
+      ],
+      "title": "ObInfo",
+      "type": "object"
+    },
+    "PriceOption": {
+      "additionalProperties": false,
+      "description": "Одна опция entry/SL/TP, порожденная детекторами. Trader выбирает по id.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        },
+        "price": {
+          "exclusiveMinimum": 0,
+          "title": "Price",
+          "type": "number"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "price"
+      ],
+      "title": "PriceOption",
+      "type": "object"
+    },
+    "SetupFeatures": {
+      "additionalProperties": false,
+      "properties": {
+        "atr_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Atr Pct"
+        },
+        "candle_pattern": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Candle Pattern"
+        },
+        "fvg": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FvgInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "ob": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ObInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "rsi": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rsi"
+        },
+        "swept_liquidity": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Swept Liquidity"
+        },
+        "trend_mtf": {
+          "anyOf": [
+            {
+              "enum": [
+                "bullish",
+                "bearish",
+                "mixed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Trend Mtf"
+        }
+      },
+      "title": "SetupFeatures",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Кандидат сетапа от детерминированного ядра. Вход Scout'а.",
+  "properties": {
+    "detector_versions": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "title": "Detector Versions",
+      "type": "object"
+    },
+    "direction": {
+      "enum": [
+        "long",
+        "short"
+      ],
+      "title": "Direction",
+      "type": "string"
+    },
+    "entry_options": {
+      "items": {
+        "$ref": "#/$defs/PriceOption"
+      },
+      "minItems": 1,
+      "title": "Entry Options",
+      "type": "array"
+    },
+    "features": {
+      "$ref": "#/$defs/SetupFeatures"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "score": {
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Score",
+      "type": "integer"
+    },
+    "setup_type": {
+      "enum": [
+        "fvg",
+        "ob",
+        "liquidity_sweep",
+        "bos",
+        "choch",
+        "confluence"
+      ],
+      "title": "Setup Type",
+      "type": "string"
+    },
+    "sl_options": {
+      "items": {
+        "$ref": "#/$defs/PriceOption"
+      },
+      "minItems": 1,
+      "title": "Sl Options",
+      "type": "array"
+    },
+    "symbol": {
+      "title": "Symbol",
+      "type": "string"
+    },
+    "timeframe": {
+      "enum": [
+        "1m",
+        "5m",
+        "15m",
+        "1h",
+        "4h",
+        "1d"
+      ],
+      "title": "Timeframe",
+      "type": "string"
+    },
+    "tp_options": {
+      "items": {
+        "$ref": "#/$defs/PriceOption"
+      },
+      "minItems": 1,
+      "title": "Tp Options",
+      "type": "array"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "ts",
+    "symbol",
+    "direction",
+    "setup_type",
+    "timeframe",
+    "score",
+    "features",
+    "entry_options",
+    "sl_options",
+    "tp_options"
+  ],
+  "title": "SetupCandidate",
+  "type": "object"
+}

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Secrets — NEVER commit
+.env
+*.key
+
+# Runtime state (exchange is the only ground truth; DB is a cache)
+data/
+runtime/
+*.db
+*.db-wal
+*.db-shm
+
+# Obsidian workspace noise (vault content IS committed, workspace state is not)
+vault/.obsidian/workspace*
+vault/.obsidian/cache/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,119 @@
+{
+  "$defs": {
+    "RiskComputed": {
+      "additionalProperties": false,
+      "description": "Размер/леверидж вычислены ТОЛЬКО Python (ст. 2 п. 3).",
+      "properties": {
+        "leverage": {
+          "minimum": 1,
+          "title": "Leverage",
+          "type": "number"
+        },
+        "qty": {
+          "exclusiveMinimum": 0,
+          "title": "Qty",
+          "type": "number"
+        },
+        "risk_usd": {
+          "minimum": 0,
+          "title": "Risk Usd",
+          "type": "number"
+        },
+        "rr_fee_adjusted": {
+          "title": "Rr Fee Adjusted",
+          "type": "number"
+        }
+      },
+      "required": [
+        "qty",
+        "leverage",
+        "risk_usd",
+        "rr_fee_adjusted"
+      ],
+      "title": "RiskComputed",
+      "type": "object"
+    },
+    "RiskStep": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": "",
+          "title": "Limit",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "passed": {
+          "title": "Passed",
+          "type": "boolean"
+        },
+        "value": {
+          "default": "",
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "passed"
+      ],
+      "title": "RiskStep",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "caps_hash": {
+      "title": "Caps Hash",
+      "type": "string"
+    },
+    "computed": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RiskComputed"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "decision_id": {
+      "title": "Decision Id",
+      "type": "string"
+    },
+    "passed": {
+      "title": "Passed",
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/$defs/RiskStep"
+      },
+      "title": "Steps",
+      "type": "array"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "decision_id",
+    "ts",
+    "passed",
+    "steps",
+    "caps_hash"
+  ],
+  "title": "RiskVerdict",
+  "type": "object"
+}

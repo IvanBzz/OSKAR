@@ -1,0 +1,103 @@
+{
+  "$defs": {
+    "Evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "metric": {
+          "title": "Metric",
+          "type": "string"
+        },
+        "n": {
+          "minimum": 1,
+          "title": "N",
+          "type": "integer"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "metric",
+        "n",
+        "value"
+      ],
+      "title": "Evidence",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Предложение самоэволюции: Analyst -> Telegram-approve -> Claudexor ->\nrepo-task-proof-loop -> инвариант. risk_class определяет глубину ревью;\ncaps идет ТОЛЬКО через процедуру ст. 4.",
+  "properties": {
+    "declared_invariant": {
+      "title": "Declared Invariant",
+      "type": "string"
+    },
+    "evidence": {
+      "$ref": "#/$defs/Evidence"
+    },
+    "id": {
+      "title": "Id",
+      "type": "string"
+    },
+    "problem": {
+      "title": "Problem",
+      "type": "string"
+    },
+    "proposed_change": {
+      "title": "Proposed Change",
+      "type": "string"
+    },
+    "risk_class": {
+      "enum": [
+        "prompt",
+        "knowledge",
+        "detector",
+        "risk",
+        "execution",
+        "caps"
+      ],
+      "title": "Risk Class",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "status": {
+      "default": "draft",
+      "enum": [
+        "draft",
+        "approved",
+        "implemented",
+        "validated",
+        "reverted"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "title": {
+      "title": "Title",
+      "type": "string"
+    },
+    "ts": {
+      "format": "date-time",
+      "title": "Ts",
+      "type": "string"
+    }
+  },
+  "required": [
+    "id",
+    "ts",
+    "title",
+    "problem",
+    "evidence",
+    "proposed_change",
+    "declared_invariant",
+    "risk_class"
+  ],
+  "title": "Proposal",
+  "type": "object"
+}
