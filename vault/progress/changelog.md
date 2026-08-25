@@ -6,6 +6,21 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — риск-движок: лестница v2 + сайзинг; капс экспозиции переопределен как суммарный риск
+
+`src/oskar/risk/sizing.py`: fee-aware R:R (минус 2x round-trip fee 0.08% до расчета), динамический леверидж `max_lev * conf_factor(0.3->1.0 на 50->100) * vol_factor(min(1, 1.5/sl%))` — восстановлен по worked-примерам v1 (60%/3.0% -> 2.2x; 90%/0.5% -> 8.6x), риск-базированный размер (потеря при SL = ровно risk_pct).
+
+`src/oskar/risk/ladder.py`: 12 шагов с полным следом в RiskVerdict: анти-feedback ассерт (ст. 3) -> safe_mode -> paused -> context (stale НЕ блокирует) -> confidence [60..75] -> SL-дистанция по профилю -> геометрия цен -> fee-aware R:R >= 2.0 (tolerance 0.01, урок v1) -> леверидж -> осуществимость маржи -> суммарный риск <= 5% -> лимит позиций -> дубли (через canonical) -> confluence gate СИММЕТРИЧНО для обоих направлений (v1 закрыл только LONG).
+
+**Смена семантики капса (до первого прогона, не поправка ст. 4):** `max_total_exposure_pct` -> `max_total_risk_pct`. Тест вскрыл: экспозиция по марже при риск-сайзинге недостижима (SL 1.5% дает маржу ~12% equity при капсе 5%). Правильная семантика: сумма risk_usd открытых позиций <= 5% equity (при 1%/сделку и максимум 3 позициях — потолок 3%, запас есть). Маржа проверяется отдельным шагом осуществимости. Хеш caps.yaml перепинен: 80540a6e...
+
+### Тесты
+- test_sizing (8): worked-примеры v1, fee съедает тонкий TP, риск-базированный размер
+- test_ladder (19): каждый шаг таблично, RR float tolerance, дубль ADA в разных форматах, stale не блокирует, симметрия confluence, сторож анти-feedback полей. Итого 60.
+
+### Затронутые файлы
+CREATE: src/oskar/risk/{__init__,sizing,ladder}.py, tests/unit/{test_sizing,test_ladder}.py; MODIFY: config/caps.yaml, CONSTITUTION.md (перепин хеша)
+
 ## 2026-08-26 — symbols.py: единая точка нормализации символов
 
 `src/oskar/data/symbols.py`: канон = ccxt-формат перпа `SOL/USDT:USDT`; `canonical()` принимает все форматы, виденные в v1 (SOLUSDT, SOL-USDT, sol/usdt, 1000PEPEUSDT, ONE_USDT...), `to_exchange()` дает нативный BingX `SOL-USDT`. Все границы системы обязаны прогонять символы через canonical() на входе. Прямой ответ на баг v1 «дубль ADA SHORT из-за ADA/USDT:USDT vs ADA-USDT». Спот не поддерживается (только USDT-перпы), settle != quote отклоняется.
