@@ -6,6 +6,18 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — claude_cli мост + бюджеты агентов из analysis_log
+
+`agents/claude_cli.py`: subprocess-мост к `claude -p --output-format json` — байтовый stdin UTF-8 (v1: text=True кодировал cp1251 и ломал русский), ретрай, prompt_sha, extract_json_block (голый JSON / ```json-блок / JSON в тексте). Тесты на стаб-процессах (ok/fail/garbage) — реальный CLI не дергается.
+
+`agents/budget.py`: лимиты per-agent считаются COUNT-запросом по analysis_log — никакого скрытого состояния, переживает рестарты. check_budget бросает BudgetExceeded ДО вызова LLM; log_call пишет полный промпт+ответ (ст. 1 п. 4) и этим же движет счетчик.
+
+### Тесты
+- test_claude_cli (7): UTF-8 round-trip русского промпта, ретраи, мусорный вывод, JSON-варианты, дневной/часовой бюджет, полный промпт восстановим по sha. Итого 114.
+
+### Затронутые файлы
+CREATE: src/oskar/agents/{__init__,claude_cli,budget}.py, tests/unit/test_claude_cli.py
+
 ## 2026-08-26 — exchange_sync: read-only окно в биржу, детектор qty-бага
 
 `sync/exchange_sync.py` (ст. 1 п. 3 — существует ДО первой сделки): чистые функции над протоколом ExchangeView (реальный ccxt-BingX VST через фабрику, тесты на фейке). `diff` сверяет открытые сделки журнала с позициями биржи: наличие (фантомы в обе стороны — v1-баг «-$329 vs -$7.56») + qty per symbol+side через `contracts * contractSize` с ratio-отчетом — прямой инструмент против открытого qty-бага v1 (SUSHI 6.98x — тест воспроизводит сценарий). Сравнение символов через canonical() — ADA-USDT == ADA/USDT:USDT не считается расхождением. CLI: `oskar sync balance|positions|diff` (ключи из .env, ASCII-вывод, diff возвращает exit 1 при грязи — можно в cron/CI).
