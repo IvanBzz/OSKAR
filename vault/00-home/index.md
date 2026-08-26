@@ -4,7 +4,7 @@ date: 2026-08-25
 ---
 # OSKAR — дашборд
 
-**Orchestrated System Kernel for Autonomous Reasoning / Adaptive Risk** — мультиагентная трейдинговая система v2. Конституция: [[../../CONSTITUTION|CONSTITUTION.md]].
+**Orchestrated System Kernel for Autonomous Reasoning / Adaptive Risk** — мультиагентная трейдинговая система v2. Конституция: [[конституция — 7 статей, капсы hash-pinned]].
 
 ## Статус
 
@@ -15,12 +15,12 @@ date: 2026-08-25
 
 ## Карта
 
-- **atlas/** — анатомия системы: [[../atlas/архитектура — два процесса, oskard владеет биржей|архитектура]]
+- **atlas/** — анатомия системы: [[архитектура — два процесса, oskard владеет биржей|архитектура]], [[конституция — 7 статей, капсы hash-pinned|конституция]]
 - **knowledge/** — decisions (почему X, а не Y), debugging (симптом→причина→фикс→урок), patterns, integrations
-- **library/** — знания из книг INVEST ZONE (smc/, risk-math/, levels/, patterns/), `reliability: book_claim` пока Analyst не подтвердит данными
+- **library/** — знания из книг INVEST ZONE: [[_карта SMC — семантика сетапов|SMC]] · [[_карта уровней — Герчик и ложные пробои|уровни]] · [[_карта риск-математики — Винс|риск-математика]]; `reliability: book_claim` пока Analyst не подтвердит данными
 - **runs/** — авто: вердикты инвариантов, статистика, реконсиляция по каждому прогону
 - **lessons/** — авто от Analyst | **proposals/** — P-NNN предложения самоэволюции
-- **progress/** — [[../progress/changelog|changelog]], [[../progress/задачи — Сделано, Не проверено, План|задачи]]
+- **progress/** — [[changelog]], [[задачи — Сделано, Не проверено, План|задачи]]
 - **reference/** — API reference, реестр скиллов
 
 ## Конвенции (унаследованы из v1)
@@ -38,5 +38,6 @@ _Заполняется автоматически с Фазы 1 (сделки, 
 
 ## Связи
 
-- [[../progress/changelog]]
-- [[../atlas/архитектура — два процесса, oskard владеет биржей]]
+- [[changelog]]
+- [[архитектура — два процесса, oskard владеет биржей]]
+- [[конституция — 7 статей, капсы hash-pinned]]

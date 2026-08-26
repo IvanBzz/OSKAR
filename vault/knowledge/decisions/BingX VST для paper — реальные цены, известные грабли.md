@@ -22,4 +22,4 @@ Paper-фаза на BingX VST (Virtual Simulated Trading, `open-api-vst.bingx.co
 
 ## Связи
 
-- [[../../atlas/архитектура — два процесса, oskard владеет биржей]]
+- [[архитектура — два процесса, oskard владеет биржей]]

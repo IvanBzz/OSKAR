@@ -6,6 +6,17 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — vault стал полноценным Obsidian-vault: конфиг, регистрация, MOC-хабы
+
+Vault не отображался в Obsidian: не было `.obsidian/` и записи в реестре приложения. Сделано: конфиг на базе легаси-vault (core-plugins, тема) + **цветные группы графа по папкам** (atlas синий, smc фиолетовый, levels оранжевый, risk-math зеленый, knowledge голубой, progress желтый, proposals красный); vault зарегистрирован в `%APPDATA%\obsidian\obsidian.json` и открыт (Obsidian перезапущен).
+
+Связность графа: три MOC-хаба `_карта SMC/уровней/риск-математики` (ссылки на все 35 заметок кластеров, сгенерированы скриптом), заметка-карта [[конституция — 7 статей, капсы hash-pinned]] (сам CONSTITUTION.md вне vault — его читает рантайм); все относительные ссылки `[[../...]]` заменены на резолвящиеся имена (в Obsidian ссылки за пределы vault висели unresolved).
+
+Официальный Obsidian CLI (встроен с 1.12.4): требует однократного включения тумблера Settings -> General -> Command line interface — дальше vault-гигиена через `obsidian orphans/unresolved/backlinks`.
+
+### Затронутые файлы
+CREATE: vault/.obsidian/{app,appearance,core-plugins,graph}.json, vault/library/*/_карта*.md (3), vault/atlas/конституция*.md; MODIFY: vault/00-home/index.md, ссылки в 2 заметках
+
 ## 2026-08-26 — ядро: демон с port-lock, управляющий API, shadow-цикл
 
 `core/daemon.py` (entry point `oskard`): порядок старта — verify_caps (ст. 4, mismatch = отказ) -> пробный бинд 127.0.0.1:8321 (второй экземпляр = громкая ошибка, урок дубля ADA) -> журнал + RuntimeState(run_id) -> uvicorn. `core/api.py`: /status, /pending, approve/reject (TTL истек = fail-closed 409 + автопометка expired; повторное разрешение = 409; pause блокирует approve, reject разрешен всегда), /pause /resume /panic — **после panic /resume отказывает** (ст. 6.3: только ручной сброс оператором).

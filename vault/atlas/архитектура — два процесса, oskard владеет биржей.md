@@ -38,5 +38,5 @@ Hermes — чужой код с широкими возможностями; д�
 
 ## Связи
 
-- [[../knowledge/decisions/BingX VST для paper — реальные цены, известные грабли]]
-- [[../../CONSTITUTION|CONSTITUTION.md]]
+- [[BingX VST для paper — реальные цены, известные грабли]]
+- [[конституция — 7 статей, капсы hash-pinned]]
