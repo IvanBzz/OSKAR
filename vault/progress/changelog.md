@@ -6,6 +6,20 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — execution-слой: ABC-шов, BingX hedge-mode, paper-симулятор
+
+`execution/base.py`: ExchangeAdapter ABC (normalize_qty / set_leverage / place_entry / place_sl / place_tp / cancel_all / close_position / positions / balance) — архитектурный шов для будущих DEX/MT5. Внутри системы стороны long|short и канонические символы; биржевые условности — забота адаптера.
+
+`execution/bingx.py`: все грабли v1 зашиты и охраняются кодом: positionSide обязателен (guard бросает без него), reduceOnly в списке FORBIDDEN_PARAMS (guard бросает при попытке), SL/TP только отдельными STOP_MARKET/TAKE_PROFIT_MARKET с closePosition=True и stopPrice (qty=None), set_leverage с params side, clientOrderId в каждом ордере, normalize_qty через amount_to_precision (анти-qty-баг).
+
+`execution/paper.py`: in-memory фоллбек — market-вход по инжектируемой цене, mark(high, low) прогоняет бар (SL первым при коллизии, как в реплее), учет PnL в балансе, дубль позиции отвергается по канону символа.
+
+### Тесты
+- test_execution (11): параметры каждого типа ордера против фикстур, канонизация на границе, side у set_leverage, close по contracts*contractSize, paper TP/SL-коллизия/дубль. Итого 136.
+
+### Затронутые файлы
+CREATE: src/oskar/execution/{__init__,base,bingx,paper}.py, tests/unit/test_execution.py
+
 ## 2026-08-26 — ФИКС .gitignore: пакет src/oskar/data не попадал в git
 
 Голый паттерн `data/` в .gitignore (задуманный для runtime-БД) матчил каталоги с именем data НА ЛЮБОМ уровне — весь пакет src/oskar/data/ (symbols, client, candles, scanner) молча не отслеживался с первого коммита. Локально тесты шли (файлы на диске), но клон с GitHub был бы сломан, CI бы упал. Паттерн заякорен к корню (`/data/`, `/runtime/`), пакет добавлен. Урок в копилку: `git ls-files` после добавления нового пакета — обязательная проверка; «тесты зеленые локально» не значит «репозиторий полон».
