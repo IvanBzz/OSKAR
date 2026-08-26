@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS counterfactuals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     decision_id TEXT NOT NULL UNIQUE,
     cohort TEXT NOT NULL CHECK (cohort IN
-        ('scout_pass','risk_rejected','approval_rejected','approval_expired')),
+        ('shadow','scout_pass','risk_rejected','approval_rejected','approval_expired')),
     candidate_json TEXT NOT NULL,
     entry_price REAL NOT NULL,
     sl_price REAL NOT NULL,
@@ -141,9 +141,13 @@ CREATE TABLE IF NOT EXISTS sync_snapshots (
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
-    """Открыть журнал, применить схему, проставить версию."""
+    """Открыть журнал, применить схему, проставить версию.
+
+    check_same_thread=False: демон один, но uvicorn исполняет эндпоинты в
+    worker-потоках; WAL + сериализация записей через commit достаточны.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(DDL)
     conn.execute(

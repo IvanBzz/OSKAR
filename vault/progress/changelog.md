@@ -6,6 +6,18 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — ядро: демон с port-lock, управляющий API, shadow-цикл
+
+`core/daemon.py` (entry point `oskard`): порядок старта — verify_caps (ст. 4, mismatch = отказ) -> пробный бинд 127.0.0.1:8321 (второй экземпляр = громкая ошибка, урок дубля ADA) -> журнал + RuntimeState(run_id) -> uvicorn. `core/api.py`: /status, /pending, approve/reject (TTL истек = fail-closed 409 + автопометка expired; повторное разрешение = 409; pause блокирует approve, reject разрешен всегда), /pause /resume /panic — **после panic /resume отказывает** (ст. 6.3: только ручной сброс оператором).
+
+`core/cycle.py` — ShadowCycle (Фаза 1, без LLM и ордеров): свечи -> analyze -> мульти-ТФ -> score -> options -> лестница (confidence=68) -> журнал decisions + counterfactuals (cohort shadow/risk_rejected). Кулдаун по барам per-symbol, сбой символа изолирован. resolve_counterfactuals дорешивает исходы ТОЛЬКО по барам, открывшимся после создания кандидата (пойман и убит собственный look-ahead: первый вариант сканировал все свечи окна). В counterfactuals добавлен cohort 'shadow'; journal connect теперь check_same_thread=False (uvicorn worker-потоки).
+
+### Тесты
+- test_core (11): API-потоки (approve/reject/TTL/повтор/pause/panic-no-resume), port-lock на живом сокете, shadow-цикл журналирует, кулдаун-идемпотентность, pause, изоляция ошибок. Итого 147.
+
+### Затронутые файлы
+CREATE: src/oskar/core/{__init__,state,api,cycle,daemon}.py, tests/unit/test_core.py; MODIFY: src/oskar/journal/db.py, pyproject.toml
+
 ## 2026-08-26 — execution-слой: ABC-шов, BingX hedge-mode, paper-симулятор
 
 `execution/base.py`: ExchangeAdapter ABC (normalize_qty / set_leverage / place_entry / place_sl / place_tp / cancel_all / close_position / positions / balance) — архитектурный шов для будущих DEX/MT5. Внутри системы стороны long|short и канонические символы; биржевые условности — забота адаптера.

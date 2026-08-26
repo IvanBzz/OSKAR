@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 oskar = "oskar.cli:main"
+oskard = "oskar.core.daemon:main"
 
 [build-system]
 requires = ["hatchling"]
