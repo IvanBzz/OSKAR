@@ -13,8 +13,9 @@ build/
 *.key
 
 # Runtime state (exchange is the only ground truth; DB is a cache)
-data/
-runtime/
+# ЯКОРЬ К КОРНЮ: голый "data/" матчил и src/oskar/data/ — пакет не попадал в git
+/data/
+/runtime/
 *.db
 *.db-wal
 *.db-shm
