@@ -170,6 +170,59 @@ def test_shadow_cycle_respects_pause(state):
     assert report.scanned == 0
 
 
+def test_live_mode_creates_pending_and_sends_card(state):
+    """С card_sink прошедший лестницу кандидат попадает в pending_approvals
+    с будущим TTL и уходит карточкой; без sink — чистый shadow (нет pending)."""
+    sent = []
+    cfg = CycleConfig(
+        signal_timeframe="15m", context_timeframes=(),
+        min_score=30, smc=SmcConfig(swing_length=5), approval_ttl_seconds=1200,
+    )
+    prefix = market_df().iloc[:130].reset_index(drop=True)
+    cycle = ShadowCycle(
+        FakeCache(prefix), state, CAPS, PROFILE, cfg,
+        card_sink=lambda cand, verd: sent.append((cand.id, verd.passed)),
+    )
+    report = cycle.run_once(["SOL/USDT:USDT"], 1000.0)
+    pending = state.journal.execute(
+        "SELECT decision_id, expires_at FROM pending_approvals WHERE resolution IS NULL"
+    ).fetchall()
+    if report.risk_passed:
+        assert sent and sent[0][1] is True
+        assert len(pending) == len(sent)
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        assert all(p["expires_at"] > now for p in pending)
+    else:
+        assert not sent and not pending
+
+
+def test_shadow_mode_never_creates_pending(state):
+    cycle = make_cycle(state)  # без card_sink
+    cycle.run_once(["SOL/USDT:USDT"], 1000.0)
+    n = state.journal.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+    assert n == 0
+
+
+def test_card_sink_failure_does_not_break_cycle(state):
+    def broken_sink(cand, verd):
+        raise ConnectionError("telegram down")
+
+    cfg = CycleConfig(
+        signal_timeframe="15m", context_timeframes=(),
+        min_score=30, smc=SmcConfig(swing_length=5),
+    )
+    prefix = market_df().iloc[:130].reset_index(drop=True)
+    cycle = ShadowCycle(FakeCache(prefix), state, CAPS, PROFILE, cfg, card_sink=broken_sink)
+    report = cycle.run_once(["SOL/USDT:USDT"], 1000.0)
+    if report.risk_passed:
+        # pending создан (TTL fail-closed защитит), ошибка канала — в отчете
+        assert any("card_sink" in e for e in report.errors)
+        n = state.journal.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+        assert n >= 1
+
+
 def test_shadow_cycle_symbol_error_isolated(state):
     class BrokenCache:
         def get(self, *a):

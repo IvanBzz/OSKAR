@@ -6,6 +6,18 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — поток подтверждений подключен к циклу; Telegram-канал живой
+
+Telegram: chat_id Ивана получен через getUpdates (@OSKAR_agnt_bot, /start), записан в .env; тестовое сообщение от бота доставлено — исходящий канал работает.
+
+`core/cycle.py`: ShadowCycle получил опциональный `card_sink` — с ним (Фаза 2) кандидат, прошедший лестницу, дополнительно пишется в pending_approvals (TTL из конфига, fail-closed) и уходит карточкой; без него — чистый shadow. Падение канала карточек не валит цикл: pending уже создан, TTL защитит, ошибка в отчете. outcome_detail различает shadow_mode/live_pending.
+
+### Тесты
+- +3 в test_core: pending+карточка в live-режиме с будущим TTL, чистый shadow без pending, падение sink не ломает цикл. Итого 157.
+
+### Затронутые файлы
+MODIFY: src/oskar/core/cycle.py, tests/unit/test_core.py
+
 ## 2026-08-26 — telegram_out: карточки сетапов с графиком и кнопками
 
 `core/telegram_out.py` — только ИСХОДЯЩЕЕ (входящие/getUpdates — монополия Hermes, делить long-poll нельзя, а отправка конфликтов не создает). TelegramSender: send_text + send_setup_card (sendPhoto с графиком или sendMessage), inline-кнопки Approve/Reject/Snooze с callback_data `oskar:approve:{id}` — их ловит Hermes-скилл oskar-approvals. render_card_text — вся суть в один экран телефона (символ/направление/тип, score, entry/SL/TP с процентом стопа, R:R/риск/леверидж/qty из RiskVerdict, зоны FVG/OB/sweep, тренд/RSI/TTL). render_chart — mplfinance PNG: 120 свечей + зоны FVG (фиолетовая) и OB (оранжевая) + линии entry/SL/TP.

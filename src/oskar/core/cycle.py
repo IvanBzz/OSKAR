@@ -12,7 +12,7 @@ Look-ahead дисциплина: cache отдает только закрыты�
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from oskar.core.state import RuntimeState
 from oskar.data.candles import CandleCache
@@ -36,6 +36,7 @@ class CycleConfig:
     candles_limit: int = 300
     min_score: int = 70
     cooldown_bars: int = 30
+    approval_ttl_seconds: int = 1200  # profiles.yaml: intraday 20 мин
     smc: SmcConfig = DEFAULT_CONFIG
 
 
@@ -49,6 +50,10 @@ class CycleReport:
 
 
 class ShadowCycle:
+    """card_sink=None -> чистый shadow. С card_sink (Фаза 2) прошедшие лестницу
+    кандидаты дополнительно попадают в pending_approvals (TTL fail-closed) и
+    уходят карточкой в Telegram. Исполнение по approve — отдельный компонент."""
+
     def __init__(
         self,
         cache: CandleCache,
@@ -56,12 +61,14 @@ class ShadowCycle:
         caps: Caps,
         profile: ProfileLimits,
         config: CycleConfig | None = None,
+        card_sink=None,  # Callable[[SetupCandidate, RiskVerdict], None] | None
     ):
         self._cache = cache
         self._state = state
         self._caps = caps
         self._profile = profile
         self._cfg = config or CycleConfig()
+        self._card_sink = card_sink
         self._last_bar: dict[str, int] = {}  # symbol -> bar_index последнего кандидата
 
     def run_once(self, symbols: list[str], equity_usd: float) -> CycleReport:
@@ -126,7 +133,7 @@ class ShadowCycle:
                 self._state.run_id, candidate.id, candidate.model_dump_json(),
                 verdict.model_dump_json(),
                 "risk_rejected" if not verdict.passed else "scout_pass",
-                "shadow_mode",
+                "shadow_mode" if self._card_sink is None else "live_pending",
             ),
         )
         j.execute(
@@ -138,6 +145,21 @@ class ShadowCycle:
                 candidate.model_dump_json(), entry, sl, tp,
             ),
         )
+        if verdict.passed and self._card_sink is not None:
+            expires = (
+                datetime.now(UTC) + timedelta(seconds=self._cfg.approval_ttl_seconds)
+            ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            j.execute(
+                "INSERT OR IGNORE INTO pending_approvals (decision_id, card_json, expires_at) "
+                "VALUES (?,?,?)",
+                (candidate.id, candidate.model_dump_json(), expires),
+            )
+            j.commit()
+            try:
+                self._card_sink(candidate, verdict)
+            except Exception as e:  # noqa: BLE001 - канал упал: TTL все равно fail-closed
+                report.errors.append(f"card_sink {candidate.id}: {type(e).__name__}: {e}")
+            return
         j.commit()
 
     def resolve_counterfactuals(self, symbol: str) -> int:
