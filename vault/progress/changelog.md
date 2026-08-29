@@ -6,6 +6,16 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — telegram_out: карточки сетапов с графиком и кнопками
+
+`core/telegram_out.py` — только ИСХОДЯЩЕЕ (входящие/getUpdates — монополия Hermes, делить long-poll нельзя, а отправка конфликтов не создает). TelegramSender: send_text + send_setup_card (sendPhoto с графиком или sendMessage), inline-кнопки Approve/Reject/Snooze с callback_data `oskar:approve:{id}` — их ловит Hermes-скилл oskar-approvals. render_card_text — вся суть в один экран телефона (символ/направление/тип, score, entry/SL/TP с процентом стопа, R:R/риск/леверидж/qty из RiskVerdict, зоны FVG/OB/sweep, тренд/RSI/TTL). render_chart — mplfinance PNG: 120 свечей + зоны FVG (фиолетовая) и OB (оранжевая) + линии entry/SL/TP.
+
+### Тесты
+- test_telegram_out (7): payload кнопок, sendPhoto с multipart, текст карточки, PNG-рендер (магические байты + размер), отказ без кредов. Итого 154.
+
+### Затронутые файлы
+CREATE: src/oskar/core/telegram_out.py, tests/unit/test_telegram_out.py
+
 ## 2026-08-26 — первое живое подключение к VST: defaultType=swap, валюта VST
 
 Ключи добавлены (перехвачены из .env.example ДО коммита — секреты живут только в .env). Два открытия на живом подключении:
