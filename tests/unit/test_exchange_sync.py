@@ -40,7 +40,14 @@ def journal_with_open(tmp_path: Path, rows):
 
 def test_balance_snapshot():
     b = snapshot_balance(FakeView())
-    assert b == {"total": 100.0, "free": 80.0, "used": 20.0}
+    assert b == {"currency": "USDT", "total": 100.0, "free": 80.0, "used": 20.0}
+
+
+def test_balance_snapshot_vst_demo():
+    """BingX VST держит демо-средства в валюте 'VST'."""
+    view = FakeView(bal={"VST": {"total": 121.71, "free": 121.71, "used": 0.0}})
+    b = snapshot_balance(view)
+    assert b["currency"] == "VST" and b["total"] == 121.71
 
 
 def test_contract_size_multiplication():

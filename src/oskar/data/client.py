@@ -97,7 +97,9 @@ def make_bingx_exchange(api_key: str = "", secret: str = "", sandbox: bool = Tru
         "apiKey": api_key,
         "secret": secret,
         "enableRateLimit": True,
-        "options": {"adjustForTimeDifference": True},
+        # defaultType=swap ОБЯЗАТЕЛЕН: без него fetch_balance уходит в SPOT
+        # реального аккаунта даже в sandbox (VST — это swap-хост)
+        "options": {"adjustForTimeDifference": True, "defaultType": "swap"},
     })
     if sandbox:
         ex.set_sandbox_mode(True)

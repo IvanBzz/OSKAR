@@ -171,9 +171,10 @@ class BingXAdapter(ExchangeAdapter):
 
     def balance(self) -> BalanceInfo:
         raw = self._ex.fetch_balance()
-        usdt = raw.get("USDT", {})
+        # VST-демо держит средства в валюте 'VST', реал — в USDT
+        entry = raw.get("USDT") or raw.get("VST") or {}
         return BalanceInfo(
-            total=float(usdt.get("total") or 0.0),
-            free=float(usdt.get("free") or 0.0),
-            used=float(usdt.get("used") or 0.0),
+            total=float(entry.get("total") or 0.0),
+            free=float(entry.get("free") or 0.0),
+            used=float(entry.get("used") or 0.0),
         )

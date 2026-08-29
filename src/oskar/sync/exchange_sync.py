@@ -53,14 +53,28 @@ class PositionDiff:
         )
 
 
-def snapshot_balance(view: ExchangeView) -> dict[str, float]:
+def snapshot_balance(view: ExchangeView) -> dict:
+    """Баланс USDT или VST (демо-валюта BingX VST называется 'VST', не USDT)."""
     raw = view.balance()
-    usdt = raw.get("USDT", {}) if isinstance(raw.get("USDT"), dict) else raw
-    return {
-        "total": float(usdt.get("total") or 0.0),
-        "free": float(usdt.get("free") or 0.0),
-        "used": float(usdt.get("used") or 0.0),
-    }
+    for cur in ("USDT", "VST"):
+        entry = raw.get(cur)
+        if isinstance(entry, dict) and entry.get("total") is not None:
+            return {
+                "currency": cur,
+                "total": float(entry.get("total") or 0.0),
+                "free": float(entry.get("free") or 0.0),
+                "used": float(entry.get("used") or 0.0),
+            }
+    totals = raw.get("total") or {}
+    for cur in ("USDT", "VST"):
+        if totals.get(cur) is not None:
+            return {
+                "currency": cur,
+                "total": float(totals.get(cur) or 0.0),
+                "free": float((raw.get("free") or {}).get(cur) or 0.0),
+                "used": float((raw.get("used") or {}).get(cur) or 0.0),
+            }
+    return {"currency": "USDT", "total": 0.0, "free": 0.0, "used": 0.0}
 
 
 def exchange_position_qty(pos: dict[str, Any]) -> float:
@@ -145,7 +159,8 @@ def make_bingx_view(api_key: str, secret: str, sandbox: bool = True) -> Exchange
     ex = ccxt.bingx({
         "apiKey": api_key,
         "secret": secret,
-        "options": {"adjustForTimeDifference": True},
+        # defaultType=swap: иначе balance уходит в SPOT реального аккаунта
+        "options": {"adjustForTimeDifference": True, "defaultType": "swap"},
     })
     ex.set_sandbox_mode(sandbox)
 

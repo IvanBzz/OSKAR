@@ -6,6 +6,20 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — первое живое подключение к VST: defaultType=swap, валюта VST
+
+Ключи добавлены (перехвачены из .env.example ДО коммита — секреты живут только в .env). Два открытия на живом подключении:
+1. **ccxt без `defaultType: swap` уходит в SPOT реального аккаунта даже в sandbox** — первый вызов показал реальный спот-кошелек (пыль TRX), а не демо. Фикс в обеих фабриках (data/client, sync/exchange_sync)
+2. **Демо-валюта называется VST, не USDT** (баланс: 121.71 VST — судя по сумме, тот самый счет v1). snapshot_balance/BalanceInfo понимают обе валюты
+
+Живая проверка: `oskar sync balance` = 121.71 VST; `positions` = пусто; **`diff` = DIFF CLEAN — первая реальная реконсиляция журнал==биржа чистая**. Obsidian CLI включен Иваном и подтвердил гигиену vault: 0 orphans, 0 unresolved. Telegram-бот @OSKAR_agnt_bot жив, ждем первого сообщения Ивана для chat_id.
+
+### Тесты
+- +test_balance_snapshot_vst_demo. Итого 148.
+
+### Затронутые файлы
+MODIFY: src/oskar/data/client.py, src/oskar/sync/exchange_sync.py, src/oskar/execution/bingx.py, src/oskar/cli.py, tests/unit/test_exchange_sync.py
+
 ## 2026-08-26 — vault стал полноценным Obsidian-vault: конфиг, регистрация, MOC-хабы
 
 Vault не отображался в Obsidian: не было `.obsidian/` и записи в реестре приложения. Сделано: конфиг на базе легаси-vault (core-plugins, тема) + **цветные группы графа по папкам** (atlas синий, smc фиолетовый, levels оранжевый, risk-math зеленый, knowledge голубой, progress желтый, proposals красный); vault зарегистрирован в `%APPDATA%\obsidian\obsidian.json` и открыт (Obsidian перезапущен).
