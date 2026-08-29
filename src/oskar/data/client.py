@@ -23,8 +23,26 @@ UNIVERSE_TTL_SEC = 4 * 3600  # v1: кеш списка пар 4 часа
 
 
 class ExchangeLike(Protocol):
-    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list]: ...
+    """Сигнатура как у ccxt: третий ПОЗИЦИОННЫЙ аргумент — since, не limit!
+    (баг с limit на месте since дал since=201мс-от-1970 -> пустые ответы,
+    ошибки 109415 и 15-минутный бан API — limit передаем ТОЛЬКО keyword'ом)."""
+
+    def fetch_ohlcv(
+        self, symbol: str, timeframe: str = "1m",
+        since: int | None = None, limit: int | None = None,
+    ) -> list[list]: ...
+
     def load_markets(self, reload: bool = False) -> dict[str, Any]: ...
+
+
+def _retryable(e: Exception) -> bool:
+    """Ретраим ТОЛЬКО сетевые сбои. Биржевые ошибки (неверный символ, бан
+    109429...) повторами не долбим — урок: ретраи на ошибочные коды копят
+    счетчик нарушений и приводят к временному бану API."""
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return True
+    retryable_names = {"NetworkError", "RequestTimeout", "ExchangeNotAvailable", "DDoSProtection"}
+    return any(base.__name__ in retryable_names for base in type(e).__mro__)
 
 
 class MarketDataClient:
@@ -46,10 +64,11 @@ class MarketDataClient:
         for attempt in range(1 + RETRIES):
             try:
                 return fn(*args, **kwargs)
-            except Exception as e:  # noqa: BLE001 - ccxt кидает разные Network/Exchange ошибки
+            except Exception as e:  # noqa: BLE001 - фильтруем через _retryable
                 last = e
-                if attempt < RETRIES:
-                    self._sleep(RETRY_DELAY_SEC * (attempt + 1))
+                if not _retryable(e) or attempt >= RETRIES:
+                    raise
+                self._sleep(RETRY_DELAY_SEC * (attempt + 1))
         raise last  # type: ignore[misc]
 
     def fetch_closed_ohlcv(self, symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
@@ -60,7 +79,7 @@ class MarketDataClient:
         и колонкой ts (миллисекунды открытия бара).
         """
         sym = canonical(symbol)
-        raw = self._with_retry(self._ex.fetch_ohlcv, sym, timeframe, limit + 1)
+        raw = self._with_retry(self._ex.fetch_ohlcv, sym, timeframe, limit=limit + 1)
         if not raw or len(raw) < 2:
             raise RuntimeError(f"not enough candles for {sym} {timeframe}: got {len(raw or [])}")
         df = pd.DataFrame(raw, columns=OHLCV_COLUMNS)
@@ -90,7 +109,7 @@ class MarketDataClient:
 
 
 def make_bingx_exchange(api_key: str = "", secret: str = "", sandbox: bool = True):
-    """Фабрика ccxt BingX. Для публичных данных ключи не обязательны."""
+    """Фабрика для ПРИВАТНЫХ вызовов (баланс/ордера): sandbox=True -> VST."""
     import ccxt
 
     ex = ccxt.bingx({
@@ -104,3 +123,18 @@ def make_bingx_exchange(api_key: str = "", secret: str = "", sandbox: bool = Tru
     if sandbox:
         ex.set_sandbox_mode(True)
     return ex
+
+
+def make_bingx_public_exchange():
+    """Фабрика для РЫНОЧНЫХ ДАННЫХ: продакшн-хост, без sandbox и без ключей.
+
+    Свечи/markets публичны, VST-цены == реальные цены (в этом суть VST).
+    Kline-эндпоинт VST-хоста банит за ошибки (109429 после 5x109415 за 15 мин) —
+    рыночные данные ходят мимо него всегда.
+    """
+    import ccxt
+
+    return ccxt.bingx({
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},
+    })

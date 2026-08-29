@@ -23,11 +23,15 @@ class FakeExchange:
         self.ohlcv_calls = 0
         self.markets_calls = 0
 
-    def fetch_ohlcv(self, symbol, timeframe, limit):
+    def fetch_ohlcv(self, symbol, timeframe="1m", since=None, limit=None):
+        """Сигнатура ccxt: 3-й позиционный — since! Фейк с неправильной
+        сигнатурой замаскировал боевой баг (limit улетал в since)."""
         self.ohlcv_calls += 1
+        self.last_since, self.last_limit = since, limit
         if self.fail_times > 0:
             self.fail_times -= 1
             raise ConnectionError("transient")
+        assert limit is not None, "client must pass limit as keyword"
         return self._candles[-limit:]
 
     def load_markets(self, reload=False):
@@ -61,6 +65,34 @@ def test_retry_exhausted_raises():
     ex = FakeExchange(fail_times=10)
     with pytest.raises(ConnectionError):
         make_client(ex).fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 100)
+
+
+def test_limit_passed_as_keyword_never_positional():
+    """Регресс живого бага: limit третьим позиционным = since 1970 года ->
+    пустые ответы + 109415 + бан API."""
+    ex = FakeExchange(make_raw(301))
+    make_client(ex).fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 300)
+    assert ex.last_limit == 301
+    assert ex.last_since is None
+
+
+class ExchangeError(Exception):
+    """Имитация ccxt.ExchangeError (не сетевая)."""
+
+
+def test_exchange_errors_not_retried():
+    """Биржевые ошибки не долбим повторами: ретраи на ошибочные коды копят
+    счетчик нарушений BingX и ведут к бану API (109429 — пойман вживую)."""
+
+    class FailingExchange(FakeExchange):
+        def fetch_ohlcv(self, symbol, timeframe, limit):
+            self.ohlcv_calls += 1
+            raise ExchangeError("bingx 109415 invalid something")
+
+    ex = FailingExchange()
+    with pytest.raises(ExchangeError):
+        make_client(ex).fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 100)
+    assert ex.ohlcv_calls == 1  # ровно одна попытка, без ретраев
 
 
 def test_universe_filters_and_caches():
