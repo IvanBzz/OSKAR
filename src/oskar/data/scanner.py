@@ -14,6 +14,10 @@ from oskar.detect.indicators import compute, tf_trend
 
 QUICK_TIMEFRAME = "1h"
 QUICK_CANDLES = 80
+# Пол ликвидности: средний ЧАСОВОЙ оборот в quote (volume*close по 1h-барам).
+# Живая проба 2026-08-26: без пола топ-20 забивают мемкоины с нулевым оборотом
+# (RSI-экстремум неликвида = дутые очки, спреды убийственные).
+MIN_HOURLY_QUOTE_VOLUME_USD = 200_000.0
 
 
 @dataclass(frozen=True)
@@ -26,10 +30,15 @@ class QuickScore:
     atr_pct: float
 
 
-def quick_score_one(cache, symbol: str) -> QuickScore | None:
-    """None = символ не скорится (мало данных/ошибка) — пропуск без падения."""
+def quick_score_one(
+    cache, symbol: str, min_quote_volume: float = MIN_HOURLY_QUOTE_VOLUME_USD
+) -> QuickScore | None:
+    """None = символ не скорится (неликвид/мало данных/ошибка) — пропуск."""
     try:
         df = cache.get(symbol, QUICK_TIMEFRAME, QUICK_CANDLES)
+        avg_quote_vol = float((df["volume"] * df["close"]).tail(20).mean())
+        if avg_quote_vol < min_quote_volume:
+            return None
         ind = compute(df)
     except Exception:  # noqa: BLE001 - любой сбой одного символа не валит скан
         return None
@@ -58,8 +67,16 @@ def quick_score_one(cache, symbol: str) -> QuickScore | None:
     )
 
 
-def quick_filter(cache, symbols: list[str], top_n: int = 20) -> list[QuickScore]:
+def quick_filter(
+    cache,
+    symbols: list[str],
+    top_n: int = 20,
+    min_quote_volume: float = MIN_HOURLY_QUOTE_VOLUME_USD,
+) -> list[QuickScore]:
     """Скорит все символы, возвращает top_n по убыванию (при равенстве — по имени)."""
-    scored = [qs for s in symbols if (qs := quick_score_one(cache, s)) is not None]
+    scored = [
+        qs for s in symbols
+        if (qs := quick_score_one(cache, s, min_quote_volume)) is not None
+    ]
     scored.sort(key=lambda q: (-q.score, q.symbol))
     return scored[:top_n]

@@ -12,11 +12,18 @@ exchange:
   # ключи ТОЛЬКО из .env: BINGX_API_KEY, BINGX_API_SECRET
 
 scanner:
-  universe: swap_usdt              # все активные USDT-перпы
+  universe: swap_usdt              # все активные USDT-перпы (829 на 2026-08-26)
   quick_filter_top: 100
   full_analysis_top: 20
-  min_opportunity_score: 70        # порог эскалации к Scout
+  min_hourly_quote_volume_usd: 200000  # пол ликвидности (мемкоины с дутыми RSI-очками — мимо)
+  min_opportunity_score: 50        # порог эскалации; калибровка shadow-фазы по живой пробе
+                                   # (реальные кандидаты 13-55: объемный компонент редок);
+                                   # пересмотр по counterfactual-когортам
   per_symbol_cooldown_seconds: 1800
+
+detect:
+  swing_length: 5                  # живая проба 2026-08-26 на 15м: swing=5 дает 8 кандидатов
+                                   # на топ-10/300 баров, swing=10 — только 2 (слишком медленно)
 
 api:
   host: 127.0.0.1

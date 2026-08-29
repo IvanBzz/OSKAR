@@ -43,11 +43,19 @@ class FakeCache:
 
 def test_trending_scores_above_flat():
     cache = FakeCache({"HOT/USDT:USDT": df_trending(), "FLAT/USDT:USDT": df_flat()})
-    hot = quick_score_one(cache, "HOT/USDT:USDT")
-    flat = quick_score_one(cache, "FLAT/USDT:USDT")
+    hot = quick_score_one(cache, "HOT/USDT:USDT", min_quote_volume=0)
+    flat = quick_score_one(cache, "FLAT/USDT:USDT", min_quote_volume=0)
     assert hot.score > flat.score
     assert hot.volume_ratio >= 2.0
     assert hot.trend == "bullish"
+
+
+def test_liquidity_floor_filters_illiquid():
+    """Живая проба: мемкоины с нулевым оборотом забивали топ дутыми очками."""
+    cache = FakeCache({"MEME/USDT:USDT": df_trending()})
+    # оборот df_trending ~ 1000 * ~120 = ~120k/час < пола 200k
+    assert quick_score_one(cache, "MEME/USDT:USDT", min_quote_volume=200_000) is None
+    assert quick_score_one(cache, "MEME/USDT:USDT", min_quote_volume=50_000) is not None
 
 
 def test_broken_symbol_skipped_not_fatal():
@@ -55,7 +63,10 @@ def test_broken_symbol_skipped_not_fatal():
         "OK/USDT:USDT": df_trending(),
         "SHORT/USDT:USDT": df_trending(20),  # < 60 свечей -> compute бросает
     })
-    result = quick_filter(cache, ["OK/USDT:USDT", "SHORT/USDT:USDT", "MISSING/USDT:USDT"])
+    result = quick_filter(
+        cache, ["OK/USDT:USDT", "SHORT/USDT:USDT", "MISSING/USDT:USDT"],
+        min_quote_volume=0,
+    )
     assert [q.symbol for q in result] == ["OK/USDT:USDT"]
 
 
@@ -63,7 +74,7 @@ def test_top_n_and_deterministic_order():
     data = {f"S{i}/USDT:USDT": df_trending() for i in range(5)}
     data["FLAT/USDT:USDT"] = df_flat()
     cache = FakeCache(data)
-    result = quick_filter(cache, sorted(data), top_n=3)
+    result = quick_filter(cache, sorted(data), top_n=3, min_quote_volume=0)
     assert len(result) == 3
     # одинаковые скоры -> алфавитный порядок, флэт не попал
     assert [q.symbol for q in result] == ["S0/USDT:USDT", "S1/USDT:USDT", "S2/USDT:USDT"]
