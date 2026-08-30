@@ -47,6 +47,7 @@ def test_confidence_cap_enforced_at_schema_level():
     """Ст. 3 п. 5: confidence > 75 отклоняется контрактом, не полиси-кодом."""
     ok = dict(
         candidate_id="sc-001",
+        tldr="выжимка сетапа одной фразой",
         bull_case="x" * 30,
         bear_case="y" * 30,
         bear_rebuttal="z" * 30,

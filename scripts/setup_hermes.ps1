@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # Установка и настройка Hermes для OSKAR — запускать из СВОЕГО терминала
 # (не из агентской сессии: песочница Claude Desktop виртуализирует установки).
 #
@@ -38,7 +38,10 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-$HermesHome = "$env:LOCALAPPDATA\hermes"
+# Установщик уважает HERMES_HOME (user env) — определяем фактический дом
+$HermesHome = [System.Environment]::GetEnvironmentVariable("HERMES_HOME", "User")
+if (-not $HermesHome) { $HermesHome = "$env:LOCALAPPDATA\hermes" }
+Write-Host "[ok] HERMES_HOME = $HermesHome"
 
 # --- 2. Telegram-конфиг ------------------------------------------------------
 $hermesEnv = Join-Path $HermesHome ".env"

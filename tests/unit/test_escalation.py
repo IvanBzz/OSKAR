@@ -49,6 +49,7 @@ def candidate() -> SetupCandidate:
 def sv(verdict="take", conf=68) -> SetupVerdict:
     return SetupVerdict(
         candidate_id="SOLUSDTUSDT-100-short",
+        tldr="Свип и CHoCH; цель — пул ликвидности снизу.",
         bull_case="Свип и CHoCH, ретест FVG в премиуме, цель — пул ликвидности.",
         bear_case="Тренд старшего ТФ может продолжиться вверх без ретеста.",
         bear_rebuttal="Инвалидация за свингом узкая, риск ограничен профилем.",

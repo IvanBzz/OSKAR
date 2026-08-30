@@ -2,7 +2,7 @@
   "$defs": {
     "SetupVerdict": {
       "additionalProperties": false,
-      "description": "Вердикт Scout по одному кандидату. Схема ПРИНУЖДАЕТ к адверсариальности:\nbear_case и bear_rebuttal обязательны и непусты — слабый rebuttal режет\nриск-движок (сжатые дебаты быков/медведей в одном вызове).",
+      "description": "Вердикт Scout по одному кандидату. Схема ПРИНУЖДАЕТ к адверсариальности:\nbear_case и bear_rebuttal обязательны и непусты — слабый rebuttal режет\nриск-движок (сжатые дебаты быков/медведей в одном вызове).\n\nv2: tldr — вывод одной фразой для карточки (фидбек Ивана: в карточке\nтолько выжимка, полные дебаты остаются в журнале).",
       "properties": {
         "bear_case": {
           "minLength": 20,
@@ -36,6 +36,12 @@
           "title": "Knowledge Refs",
           "type": "array"
         },
+        "tldr": {
+          "maxLength": 160,
+          "minLength": 10,
+          "title": "Tldr",
+          "type": "string"
+        },
         "verdict": {
           "enum": [
             "take",
@@ -47,6 +53,7 @@
       },
       "required": [
         "candidate_id",
+        "tldr",
         "bull_case",
         "bear_case",
         "bear_rebuttal",
@@ -72,8 +79,8 @@
       "type": "string"
     },
     "schema_version": {
-      "const": 1,
-      "default": 1,
+      "const": 2,
+      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },

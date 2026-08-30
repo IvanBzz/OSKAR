@@ -69,7 +69,7 @@ def test_approve_unknown_404(client):
 def test_expired_ttl_fail_closed(client, state):
     add_pending(state, "old", expires_in_min=-5)
     r = client.post("/decisions/old/approve")
-    assert r.status_code == 409 and "expired" in r.json()["detail"]
+    assert r.status_code == 409 and "TTL" in r.json()["detail"]
     row = state.journal.execute(
         "SELECT resolution FROM pending_approvals WHERE decision_id='old'"
     ).fetchone()

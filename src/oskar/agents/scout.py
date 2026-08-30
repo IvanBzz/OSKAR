@@ -65,6 +65,8 @@ def analyze_candidate(
     )
     try:
         data = extract_json_block(call.text)
+        if isinstance(data.get("tldr"), str):  # страховка от перелива лимита схемы
+            data["tldr"] = data["tldr"][:160]
         verdict = SetupVerdict(**data)
     except Exception as e:
         raise ScoutError(f"scout output invalid for {candidate.id}: {e}") from e

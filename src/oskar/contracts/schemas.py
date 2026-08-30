@@ -106,9 +106,13 @@ class MarketContext(_Contract):
 class SetupVerdict(_Contract):
     """Вердикт Scout по одному кандидату. Схема ПРИНУЖДАЕТ к адверсариальности:
     bear_case и bear_rebuttal обязательны и непусты — слабый rebuttal режет
-    риск-движок (сжатые дебаты быков/медведей в одном вызове)."""
+    риск-движок (сжатые дебаты быков/медведей в одном вызове).
+
+    v2: tldr — вывод одной фразой для карточки (фидбек Ивана: в карточке
+    только выжимка, полные дебаты остаются в журнале)."""
 
     candidate_id: str
+    tldr: str = Field(min_length=10, max_length=160)
     bull_case: str = Field(min_length=20)
     bear_case: str = Field(min_length=20)
     bear_rebuttal: str = Field(min_length=20)
@@ -118,7 +122,7 @@ class SetupVerdict(_Contract):
 
 
 class ScoutReport(_Contract):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2  # v2: SetupVerdict.tldr
     decision_id: str
     ts: datetime
     setups: list[SetupVerdict]

@@ -108,39 +108,37 @@ def render_card_text(
     ttl_minutes: int,
     scout_verdict=None,
 ) -> str:
-    """Компактная карточка: вся суть решения в одном экране телефона."""
+    """Карточка-выжимка (фидбек Ивана): решение за 5 секунд с телефона.
+
+    Только то, что нужно для «да/нет»: направление, цены, риск, вывод одной
+    фразой. Вся техника (зоны, индикаторы, полные дебаты) — в журнале,
+    доступна через Hermes («почему этот сетап?»)."""
     c = verdict.computed
+    arrow = "🔻" if candidate.direction == "short" else "🔺"
     direction = "SHORT" if candidate.direction == "short" else "LONG"
     entry = next(o for o in candidate.entry_options if o.kind == "market")
     sl = candidate.sl_options[0]
     tp = candidate.tp_options[0]
     sl_pct = abs(sl.price - entry.price) / entry.price * 100
+
     lines = [
-        f"<b>{to_display(candidate.symbol)} {direction}</b> | {candidate.setup_type} {candidate.timeframe}",
-        f"score {candidate.score}",
-        f"entry {entry.price:.6g} | SL {sl.price:.6g} ({sl_pct:.1f}%) | TP {tp.price:.6g}",
+        f"{arrow} <b>{to_display(candidate.symbol)} {direction}</b> · {candidate.timeframe}",
+        f"вход {entry.price:.6g} → стоп {sl.price:.6g} ({sl_pct:.1f}%) → цель {tp.price:.6g}",
     ]
+    stats = []
     if c is not None:
-        lines.append(
-            f"R:R {c.rr_fee_adjusted:.2f} | risk ${c.risk_usd:.2f} | lev {c.leverage:g}x | qty {c.qty:.6g}"
-        )
-    f = candidate.features
-    ctx = []
-    if f.fvg is not None:
-        ctx.append(f"FVG {f.fvg.bottom:.6g}-{f.fvg.top:.6g}")
-    if f.ob is not None:
-        ctx.append(f"OB {f.ob.bottom:.6g}-{f.ob.top:.6g}")
-    if f.swept_liquidity:
-        ctx.append("sweep")
-    if ctx:
-        lines.append(" | ".join(ctx))
+        stats.append(f"R:R {c.rr_fee_adjusted:.1f}")
+        stats.append(f"риск ${c.risk_usd:.2f}")
+        stats.append(f"плечо {c.leverage:g}x")
     if scout_verdict is not None:
+        stats.append(f"conf {scout_verdict.confidence}")
+    if stats:
+        lines.append(" · ".join(stats))
+    lines.append(f"⏱ {ttl_minutes} мин")
+    if scout_verdict is not None:
+        tldr = getattr(scout_verdict, "tldr", "") or _clip(scout_verdict.bull_case, 140)
         lines.append("")
-        lines.append(f"Тезис: {_clip(scout_verdict.bull_case)}")
-        lines.append(f"Против: {_clip(scout_verdict.bear_case)}")
-        lines.append(f"Ответ: {_clip(scout_verdict.bear_rebuttal)}")
-        lines.append(f"conf {scout_verdict.confidence}")
-    lines.append(f"trend {f.trend_mtf or '?'} | RSI {f.rsi or '?'} | TTL {ttl_minutes} min")
+        lines.append(_clip(tldr, 160))
     return "\n".join(lines)
 
 

@@ -7,7 +7,7 @@ Bump версии здесь И в Literal-поле schema_version соотве�
 CONTRACT_VERSIONS: dict[str, int] = {
     "SetupCandidate": 1,
     "MarketContext": 1,
-    "ScoutReport": 1,
+    "ScoutReport": 2,  # v2: SetupVerdict.tldr — выжимка для карточки
     "TradeDecision": 2,  # v2: право вето Trader'а (verdict execute|decline)
     "RiskVerdict": 1,
     "ExecutionReport": 1,

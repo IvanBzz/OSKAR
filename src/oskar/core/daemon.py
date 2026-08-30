@@ -90,7 +90,12 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
         ).decision
 
     card_sink = None
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    # Карточки шлет СИГНАЛЬНЫЙ бот (кнопки ловит наш поллер); фоллбек на
+    # основного бота оставлен, но его кнопки мертвы (Hermes глотает чужие
+    # callback'и) — лог предупредит.
+    token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if not os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN"):
+        print("WARNING: TELEGRAM_SIGNALS_BOT_TOKEN not set - card buttons will be dead")
     chat = os.getenv("TELEGRAM_CHAT_ID", "")
     if token and chat:
         from oskar.core.telegram_out import TelegramSender, render_chart
@@ -196,6 +201,17 @@ def main() -> int:
     )
     cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache)
     runner.start_thread()
+
+    import os
+
+    signals_token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if signals_token and chat_id:
+        from oskar.core.telegram_buttons import ButtonPoller
+
+        poller = ButtonPoller(signals_token, chat_id, state)
+        poller.start_thread()
+        print("button poller: ON (signals bot)")
 
     app = build_app(state, shadow=runner)
     print(

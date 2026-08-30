@@ -53,39 +53,28 @@ def build_app(state: RuntimeState, shadow=None) -> FastAPI:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def _resolve(decision_id: str, resolution: str) -> dict:
-        row = state.journal.execute(
-            "SELECT resolution, expires_at FROM pending_approvals WHERE decision_id = ?",
-            (decision_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(404, f"unknown decision {decision_id}")
-        if row["resolution"] is not None:
-            raise HTTPException(409, f"already resolved: {row['resolution']}")
-        if row["expires_at"] <= _now_iso():
-            state.journal.execute(
-                "UPDATE pending_approvals SET resolution='expired', resolved_at=? "
-                "WHERE decision_id = ?",
-                (_now_iso(), decision_id),
-            )
-            state.journal.commit()
-            raise HTTPException(409, "approval TTL expired (fail-closed)")
-        state.journal.execute(
-            "UPDATE pending_approvals SET resolution=?, resolved_at=? WHERE decision_id=?",
-            (resolution, _now_iso(), decision_id),
+    def _resolve(decision_id: str, action: str) -> dict:
+        from oskar.core.approvals import resolve_approval
+
+        out = resolve_approval(
+            state.journal, decision_id, action,
+            paused=state.paused, safe_mode=state.safe_mode,
         )
-        state.journal.commit()
-        return {"decision_id": decision_id, "resolution": resolution}
+        if not out.ok:
+            raise HTTPException(out.code, out.message)
+        return {"decision_id": decision_id, "resolution": out.resolution}
 
     @app.post("/decisions/{decision_id}/approve")
     def approve(decision_id: str):
-        if state.paused or state.safe_mode:
-            raise HTTPException(423, "system paused or in safe mode")
-        return _resolve(decision_id, "approved")
+        return _resolve(decision_id, "approve")
 
     @app.post("/decisions/{decision_id}/reject")
     def reject(decision_id: str):
-        return _resolve(decision_id, "rejected")
+        return _resolve(decision_id, "reject")
+
+    @app.post("/decisions/{decision_id}/snooze")
+    def snooze(decision_id: str):
+        return _resolve(decision_id, "snooze")
 
     @app.post("/pause")
     def pause():

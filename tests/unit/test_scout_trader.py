@@ -42,6 +42,7 @@ def candidate() -> SetupCandidate:
 def scout_json(candidate_id="SOLUSDTUSDT-100-short", verdict="take", conf=68):
     return json.dumps({
         "candidate_id": candidate_id,
+        "tldr": "Свип хая и ретест FVG сверху; цель — пул ликвидности.",
         "bull_case": "Свип хая и медвежий CHoCH на 15м, ретест FVG в премиуме.",
         "bear_case": "Тренд 4ч еще бычий, шорт против старшего таймфрейма опасен.",
         "bear_rebuttal": "Вход только по лимитке от края FVG с узкой инвалидацией.",

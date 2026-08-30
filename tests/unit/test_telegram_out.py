@@ -101,14 +101,27 @@ def test_card_with_chart_uses_sendphoto():
     assert b"chart.png" in req.content
 
 
-def test_card_text_contents():
-    text = render_card_text(candidate(), verdict(), ttl_minutes=20)
+def test_card_text_is_minimal_digest():
+    """Фидбек Ивана: только выжимка — направление, цены, риск, tldr.
+    Никаких индикаторов, зон и score в карточке."""
+    from oskar.contracts.schemas import SetupVerdict
+
+    sv = SetupVerdict(
+        candidate_id="SOLUSDTUSDT-100-short",
+        tldr="Свип хая и ретест FVG сверху; цель — ликвидность под лоями.",
+        bull_case="б" * 40, bear_case="м" * 40, bear_rebuttal="о" * 40,
+        verdict="take", confidence=62,
+    )
+    text = render_card_text(candidate(), verdict(), ttl_minutes=20, scout_verdict=sv)
     assert "SOL/USDT SHORT" in text
-    assert "confluence 15m" in text
-    assert "SL 103.65 (3.7%)" in text
-    assert "risk $10.00" in text and "lev 5.4x" in text
-    assert "FVG 101-102" in text and "sweep" in text
-    assert "TTL 20 min" in text
+    assert "вход 100" in text and "стоп 103.65 (3.7%)" in text and "цель 95" in text
+    assert "риск $10.00" in text and "плечо 5.4x" in text and "conf 62" in text
+    assert "Свип хая и ретест FVG" in text
+    # техника скрыта:
+    for banned in ("score", "FVG 101", "OB ", "RSI", "trend", "sweep", "confluence"):
+        assert banned not in text
+    # компактность: 6 строк, влезает в подпись фото с запасом
+    assert len(text) < 400 and text.count("\n") <= 6
 
 
 def test_sender_requires_credentials():
