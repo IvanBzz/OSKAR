@@ -16,7 +16,7 @@ client_order_id для точной реконсиляции; reconciled-фла�
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: исходы trader_decline/pending, cohort trader_decline
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -71,7 +71,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     trade_json TEXT,                   -- TradeDecision (если Scout сказал take)
     risk_json TEXT,                    -- RiskVerdict (всегда, если дошло до лестницы)
     outcome TEXT NOT NULL CHECK (outcome IN
-        ('executed','risk_rejected','scout_pass','approval_rejected','approval_expired','error')),
+        ('executed','risk_rejected','scout_pass','trader_decline','pending',
+         'approval_rejected','approval_expired','error')),
     outcome_detail TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -118,7 +119,8 @@ CREATE TABLE IF NOT EXISTS counterfactuals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     decision_id TEXT NOT NULL UNIQUE,
     cohort TEXT NOT NULL CHECK (cohort IN
-        ('shadow','scout_pass','risk_rejected','approval_rejected','approval_expired')),
+        ('shadow','scout_pass','trader_decline','risk_rejected',
+         'approval_rejected','approval_expired')),
     candidate_json TEXT NOT NULL,
     entry_price REAL NOT NULL,
     sl_price REAL NOT NULL,

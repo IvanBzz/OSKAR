@@ -38,6 +38,88 @@ def check_port_free(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         s.close()
 
 
+def _connect_journal():
+    """Журнал; при несовпадении версии схемы — архив старого и чистый старт
+    (допустимо ТОЛЬКО в shadow-фазе: реальных сделок в базе нет)."""
+    from oskar.journal.archive import archive_journal
+    from oskar.journal.db import connect
+
+    db_path = REPO_ROOT / "data" / "oskar.db"
+    try:
+        return connect(db_path)
+    except RuntimeError as e:
+        snap = archive_journal(db_path)
+        for suffix in ("", "-wal", "-shm"):
+            p = db_path.parent / (db_path.name + suffix)
+            p.unlink(missing_ok=True)
+        print(f"journal schema mismatch ({e}); old journal archived to {snap}")
+        return connect(db_path)
+
+
+def _make_escalator(state, caps, profile_settings, settings, runner, cache):
+    """Escalator строится, только если claude CLI и Telegram доступны."""
+    import os
+    import shutil
+
+    if shutil.which("claude") is None:
+        print("escalation OFF: claude CLI not found (pure shadow mode)")
+        return None
+
+    from oskar.agents.budget import BudgetLimits
+    from oskar.agents.scout import analyze_candidate, knowledge_for_candidate
+    from oskar.agents.trader import decide, resolve_prices
+    from oskar.core.escalation import Escalator
+
+    a = settings.get("agents", {})
+    scout_limits = BudgetLimits(
+        daily=int(a.get("scout", {}).get("daily_budget", 30)),
+        hourly=int(a.get("scout", {}).get("hourly_budget", 6)),
+    )
+    trader_limits = BudgetLimits(daily=int(a.get("trader", {}).get("daily_budget", 20)))
+
+    def scout_fn(candidate):
+        return analyze_candidate(
+            candidate, state.journal, state.run_id, limits=scout_limits,
+            knowledge=knowledge_for_candidate(candidate),
+        ).verdict
+
+    def trader_fn(candidate, scout_verdict):
+        return decide(
+            candidate, scout_verdict, state.journal, state.run_id,
+            limits=trader_limits,
+        ).decision
+
+    card_sink = None
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat = os.getenv("TELEGRAM_CHAT_ID", "")
+    if token and chat:
+        from oskar.core.telegram_out import TelegramSender, render_chart
+
+        sender = TelegramSender(token, chat)
+        ttl_min = profile_settings.approval_ttl_seconds // 60
+
+        def card_sink(candidate, verdict, scout_verdict):  # noqa: F811
+            png = None
+            try:
+                df = cache.get(candidate.symbol, candidate.timeframe, 200)
+                png = render_chart(df, candidate)
+            except Exception:  # noqa: BLE001 - карточка без графика лучше отсутствия
+                pass
+            sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict)
+    else:
+        print("escalation cards OFF: telegram not configured")
+
+    from oskar.core.bootstrap import load_caps
+
+    return Escalator(
+        state, load_caps(), profile_settings.limits,
+        scout_fn=scout_fn, trader_fn=trader_fn, resolve_fn=resolve_prices,
+        approval_ttl_seconds=profile_settings.approval_ttl_seconds,
+        card_sink=card_sink,
+        equity_fn=lambda: runner.equity_usd,
+    )
+
+
 def _make_equity_fn():
     """Equity с биржи (VST) при наличии ключей; None-фоллбек внутри runner'а."""
     import os
@@ -77,7 +159,6 @@ def main() -> int:
     from oskar.core.state import RuntimeState
     from oskar.data.candles import CandleCache
     from oskar.data.client import MarketDataClient, make_bingx_public_exchange
-    from oskar.journal.db import connect
     from oskar.ops.caps_guard import verify_caps
 
     logging.basicConfig(
@@ -94,7 +175,7 @@ def main() -> int:
         print(f"REFUSING TO START: {e}")
         return 3
 
-    journal = connect(REPO_ROOT / "data" / "oskar.db")
+    journal = _connect_journal()
     state = RuntimeState(journal=journal)
 
     caps = load_caps()
@@ -113,6 +194,7 @@ def main() -> int:
         tick_seconds=float(profile.scan_interval_seconds),
         equity_fn=_make_equity_fn(),
     )
+    cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache)
     runner.start_thread()
 
     app = build_app(state, shadow=runner)

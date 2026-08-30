@@ -6,6 +6,22 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-30 — эскалация к LLM: промпты Scout/Trader, Escalator, карточки с обоснованием
+
+`agents/prompts/{scout,trader}.md` — роль-карты: Scout обязан построить bull/bear/rebuttal (вердикт take только при закрытом bear_case; напоминание об overconfidence v1 прямо в промпте; STATS_MANIFEST-чистота покрыта тестом); Trader — гейткипер с вето, выбирает опции ПО ID, критерии Герчик-стиля («стоп за структурой, не под лоем толпы»).
+
+`agents/{scout,trader}.py` — бюджет ДО вызова, полный промпт+ответ в analysis_log, выход валидируется контрактами (confidence>75 = ошибка, галлюцинированный id опции = ошибка, ответ про чужой кандидат = ошибка); knowledge_for_candidate — топ-3 заметки библиотеки по типу сетапа через FTS5.
+
+`core/escalation.py` — Escalator: Scout -> Trader -> **полная лестница заново на выбранных ценах** (ст. 2: LLM — селектор, не источник чисел; тест: RR<2 на выбранном TP режется финальной проверкой) -> pending_approvals (TTL fail-closed) -> карточка с графиком и секцией «Тезис/Против/Ответ/conf». Интеграция в ShadowCycle: outcome/cohort-маппинг (scout_pass/trader_decline/pending), scout_json/trade_json в decisions. Журнал v2 (новые исходы), демон при несовпадении схемы архивирует старую БД (допустимо только в shadow-фазе).
+
+Установлен claude CLI 2.1.251 (нативный установщик); auth desktop-приложения с CLI не общий — нужен одноразовый `claude setup-token` от Ивана. До авторизации демон работает в чистом shadow (эскалация выключается сама при отсутствии CLI/логина).
+
+### Тесты
+- test_scout_trader (8), test_escalation (6). Итого 186.
+
+### Затронутые файлы
+CREATE: src/oskar/agents/{scout,trader}.py, src/oskar/agents/prompts/{scout,trader}.md, src/oskar/core/escalation.py, tests/unit/{test_scout_trader,test_escalation}.py; MODIFY: src/oskar/core/{cycle,daemon,telegram_out}.py, src/oskar/journal/db.py
+
 ## 2026-08-30 — Фаза 2 собрана: Hermes+Telegram живые; демон в shadow-режиме
 
 **Канал управления работает целиком**: Hermes установлен (финально — через задачу планировщика вне песочницы, после трех съеденных виртуализацией попыток), Nous Portal OAuth подтвержден Иваном (device-код), gateway подключен к @OSKAR_agnt_bot (allowlist = только Иван), модель nousresearch/hermes-4-405b через Nous-подписку. Сквозной тест пройден: «статус» Ивана -> gateway -> Hermes -> ответ в Telegram. Gateway живет в песочнице сессии (решение Ивана: сеть здесь ходит через VPN-туннель, у планировщика — нет); минус: умирает с перезапуском Claude — перезапускается вручную/мной.

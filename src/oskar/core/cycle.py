@@ -62,6 +62,7 @@ class ShadowCycle:
         profile: ProfileLimits,
         config: CycleConfig | None = None,
         card_sink=None,  # Callable[[SetupCandidate, RiskVerdict], None] | None
+        escalator=None,  # Callable[[SetupCandidate], EscalationResult] | None (Фаза 2)
     ):
         self._cache = cache
         self._state = state
@@ -69,6 +70,7 @@ class ShadowCycle:
         self._profile = profile
         self._cfg = config or CycleConfig()
         self._card_sink = card_sink
+        self._escalator = escalator
         self._last_bar: dict[str, int] = {}  # symbol -> bar_index последнего кандидата
 
     def run_once(self, symbols: list[str], equity_usd: float) -> CycleReport:
@@ -125,27 +127,40 @@ class ShadowCycle:
         if verdict.passed:
             report.risk_passed += 1
 
+        outcome = "risk_rejected" if not verdict.passed else "scout_pass"
+        detail = "shadow_mode" if self._card_sink is None else "live_pending"
+        cohort = "risk_rejected" if not verdict.passed else "shadow"
+        scout_json = trade_json = None
+
+        if verdict.passed and self._escalator is not None:
+            esc = self._escalator(candidate)
+            outcome = esc.outcome if esc.outcome != "error" else "error"
+            detail = esc.detail or "escalated"
+            scout_json, trade_json = esc.scout_json, esc.trade_json
+            cohort = {
+                "scout_pass": "scout_pass",
+                "trader_decline": "trader_decline",
+                "risk_rejected": "risk_rejected",
+                "pending": "shadow",
+                "error": "shadow",
+            }[esc.outcome]
+
         j = self._state.journal
         j.execute(
             "INSERT OR IGNORE INTO decisions (run_id, decision_id, candidate_json, "
-            "risk_json, outcome, outcome_detail) VALUES (?,?,?,?,?,?)",
+            "scout_json, trade_json, risk_json, outcome, outcome_detail) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
                 self._state.run_id, candidate.id, candidate.model_dump_json(),
-                verdict.model_dump_json(),
-                "risk_rejected" if not verdict.passed else "scout_pass",
-                "shadow_mode" if self._card_sink is None else "live_pending",
+                scout_json, trade_json, verdict.model_dump_json(), outcome, detail,
             ),
         )
         j.execute(
             "INSERT OR IGNORE INTO counterfactuals (decision_id, cohort, candidate_json, "
             "entry_price, sl_price, tp_price) VALUES (?,?,?,?,?,?)",
-            (
-                candidate.id,
-                "shadow" if verdict.passed else "risk_rejected",
-                candidate.model_dump_json(), entry, sl, tp,
-            ),
+            (candidate.id, cohort, candidate.model_dump_json(), entry, sl, tp),
         )
-        if verdict.passed and self._card_sink is not None:
+        if verdict.passed and self._card_sink is not None and self._escalator is None:
             expires = (
                 datetime.now(UTC) + timedelta(seconds=self._cfg.approval_ttl_seconds)
             ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"

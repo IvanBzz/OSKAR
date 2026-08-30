@@ -52,8 +52,9 @@ class TelegramSender:
         verdict: RiskVerdict,
         chart_png: bytes | None,
         ttl_minutes: int,
+        scout_verdict=None,
     ) -> SentMessage:
-        text = render_card_text(candidate, verdict, ttl_minutes)
+        text = render_card_text(candidate, verdict, ttl_minutes, scout_verdict)
         keyboard = {
             "inline_keyboard": [
                 [
@@ -97,7 +98,16 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
-def render_card_text(candidate: SetupCandidate, verdict: RiskVerdict, ttl_minutes: int) -> str:
+def _clip(text: str, limit: int = 220) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def render_card_text(
+    candidate: SetupCandidate,
+    verdict: RiskVerdict,
+    ttl_minutes: int,
+    scout_verdict=None,
+) -> str:
     """Компактная карточка: вся суть решения в одном экране телефона."""
     c = verdict.computed
     direction = "SHORT" if candidate.direction == "short" else "LONG"
@@ -124,6 +134,12 @@ def render_card_text(candidate: SetupCandidate, verdict: RiskVerdict, ttl_minute
         ctx.append("sweep")
     if ctx:
         lines.append(" | ".join(ctx))
+    if scout_verdict is not None:
+        lines.append("")
+        lines.append(f"Тезис: {_clip(scout_verdict.bull_case)}")
+        lines.append(f"Против: {_clip(scout_verdict.bear_case)}")
+        lines.append(f"Ответ: {_clip(scout_verdict.bear_rebuttal)}")
+        lines.append(f"conf {scout_verdict.confidence}")
     lines.append(f"trend {f.trend_mtf or '?'} | RSI {f.rsi or '?'} | TTL {ttl_minutes} min")
     return "\n".join(lines)
 
