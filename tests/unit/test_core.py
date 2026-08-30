@@ -223,6 +223,46 @@ def test_card_sink_failure_does_not_break_cycle(state):
         assert n >= 1
 
 
+def test_best_passing_combo_finds_viable_menu_option(state):
+    """Живой урок (12/17 отказов): дефолтная комбинация файлит R:R, но лимитный
+    вход с дальним тейком проходит — гейт обязан найти проходную комбинацию."""
+    from datetime import UTC, datetime
+
+    from oskar.contracts.schemas import (
+        FvgInfo,
+        ObInfo,
+        PriceOption,
+        SetupCandidate,
+        SetupFeatures,
+    )
+    from oskar.core.cycle import best_passing_combo
+
+    tf = "15m"
+    cand = SetupCandidate(
+        id="T-1-short", ts=datetime.now(UTC), symbol="SOL/USDT:USDT",
+        direction="short", setup_type="confluence", timeframe=tf, score=70,
+        features=SetupFeatures(
+            rsi=55.0, trend_mtf="bearish",
+            fvg=FvgInfo(top=102.0, bottom=101.0, mitigated=False, timeframe=tf),
+            ob=ObInfo(top=103.0, bottom=102.0, tested=False, timeframe=tf),
+        ),
+        # market 100 + SL 101.5 + TP 97.5: rr=(2.5-0.16)/1.5=1.56 < 2.0 (файл)
+        # limit 101.8 + SL 103.0 + TP 97.5: rr=(4.3-0.163)/1.2=3.45 (проход)
+        entry_options=[PriceOption(id="e-market", kind="market", price=100.0),
+                       PriceOption(id="e-fvg", kind="limit_fvg_edge", price=101.8)],
+        sl_options=[PriceOption(id="s-swing", kind="swing_high", price=101.5),
+                    PriceOption(id="s-ob", kind="ob_high", price=103.0)],
+        tp_options=[PriceOption(id="t-liq", kind="liquidity_pool", price=97.5)],
+    )
+    verdict, entry, sl, tp = best_passing_combo(
+        cand, CAPS, ProfileLimits(sl_dist_pct_min=0.5, sl_dist_pct_max=3.0, max_leverage=8),
+        confidence=68, equity_usd=1000.0,
+    )
+    assert verdict.passed
+    assert (entry, sl) == (101.8, 103.0)  # лучшая по R:R комбинация, не дефолтная
+    assert verdict.computed.rr_fee_adjusted > 3.0
+
+
 def test_shadow_cycle_symbol_error_isolated(state):
     class BrokenCache:
         def get(self, *a):

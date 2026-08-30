@@ -29,6 +29,44 @@ def _iso_to_ms(iso: str) -> float:
     return datetime.fromisoformat(iso).timestamp() * 1000.0
 
 
+def best_passing_combo(candidate, caps, profile, *, confidence, equity_usd,
+                       safe_mode=False, paused=False):
+    """Перебор всех комбинаций меню через лестницу; лучшая проходная по R:R.
+
+    Гейт эскалации по ОДНОЙ дефолтной комбинации несправедливо строг (живой
+    датасет: 12/17 кандидатов срезаны по R:R на market-входе с первым TP, при
+    том что лимитка от FVG и тейк 2R прошли бы). Trader существует для выбора
+    комбинации — гейт обязан проверять достижимость, а не один вариант.
+
+    Возвращает (verdict, entry, sl, tp): проходной вердикт лучшей комбинации,
+    либо вердикт дефолтной (первой) комбинации, если не проходит ни одна.
+    """
+
+    def run(e, s, t):
+        return evaluate(
+            RiskInput(candidate=candidate, entry=e.price, sl=s.price, tp=t.price,
+                      confidence=confidence, equity_usd=equity_usd,
+                      safe_mode=safe_mode, paused=paused),
+            caps, profile,
+        )
+
+    best = None  # (rr, verdict, e, s, t)
+    default = None
+    for e in candidate.entry_options:
+        for s in candidate.sl_options:
+            for t in candidate.tp_options:
+                v = run(e, s, t)
+                if default is None:
+                    default = (v, e, s, t)
+                if v.passed and (best is None or v.computed.rr_fee_adjusted > best[0]):
+                    best = (v.computed.rr_fee_adjusted, v, e, s, t)
+    if best is not None:
+        _, v, e, s, t = best
+        return v, e.price, s.price, t.price
+    v, e, s, t = default
+    return v, e.price, s.price, t.price
+
+
 @dataclass
 class CycleConfig:
     signal_timeframe: str = "15m"
@@ -114,15 +152,10 @@ class ShadowCycle:
         report.candidates += 1
         self._last_bar[symbol] = snapshot.bar_index
 
-        entry = next(o for o in candidate.entry_options if o.kind == "market").price
-        sl = candidate.sl_options[0].price
-        tp = candidate.tp_options[0].price
-        verdict = evaluate(
-            RiskInput(
-                candidate=candidate, entry=entry, sl=sl, tp=tp,
-                confidence=SHADOW_CONFIDENCE, equity_usd=equity_usd,
-            ),
-            self._caps, self._profile,
+        verdict, entry, sl, tp = best_passing_combo(
+            candidate, self._caps, self._profile,
+            confidence=SHADOW_CONFIDENCE, equity_usd=equity_usd,
+            safe_mode=self._state.safe_mode, paused=self._state.paused,
         )
         if verdict.passed:
             report.risk_passed += 1
