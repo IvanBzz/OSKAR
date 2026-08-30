@@ -6,6 +6,15 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-26 — скиллы Hermes: oskar-control и oskar-approvals; установка Hermes запущена
+
+`skills/oskar-control` — /status /pending /pause /resume /panic через локальный API (скрипт на stdlib, venv-независим); правило panic по ст. 6: исполнять немедленно по любой формулировке, не переспрашивая. `skills/oskar-approvals` — маппинг callback-кнопок `oskar:approve|reject|snooze:<id>` в POST API; кнопка = подтверждение, 409 = TTL истек (не воскрешаем), запрет approve по собственной инициативе агента.
+
+Официальный установщик Hermes (242KB) скачан и просмотрен перед запуском: хосты легитимны (python.org/nodejs/git/astral/github), schtasks — управление собственным автостартом gateway, Invoke-Expression — опциональный CUA-драйвер (пропускаем: -SkipComputerUse). Запущен с -NonInteractive -SkipSetup.
+
+### Затронутые файлы
+CREATE: skills/oskar-control/{SKILL.md,scripts/oskarctl.py}, skills/oskar-approvals/{SKILL.md,scripts/approve.py}
+
 ## 2026-08-26 — TradeDecision v2: право вето Trader'а; решение по критику
 
 Решение с Иваном (заметка: критик — сначала наблюдатель...): (1) вето Trader'а внедряется сразу — TradeDecision v2 с `verdict: execute|decline`, model_validator принуждает консистентность (execute = все опции выбраны, без decline_reason; decline = причина >= 20 символов, без опций); (2) LLM-критик — только log-only, право вето лишь после сравнения когорт по PF; (3) параллельные дебаты отклонены при подписочной экономике. Схема пере-экспортирована, версия в реестре 2.
