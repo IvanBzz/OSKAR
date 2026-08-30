@@ -58,6 +58,10 @@ class MarketDataClient:
         self._sleep = sleep
         self._universe: list[str] | None = None
         self._universe_at: float = -UNIVERSE_TTL_SEC
+        # Символы, давшие биржевую (не сетевую) ошибку на klines: мертвые листинги.
+        # Повторные запросы к ним копят счетчик нарушений BingX (>10 x 109415 за
+        # 15 мин = бан эндпоинта, поймано вживую) — глушим до конца процесса.
+        self.dead_symbols: set[str] = set()
 
     def _with_retry(self, fn, *args, **kwargs):
         last: Exception | None = None
@@ -79,7 +83,14 @@ class MarketDataClient:
         и колонкой ts (миллисекунды открытия бара).
         """
         sym = canonical(symbol)
-        raw = self._with_retry(self._ex.fetch_ohlcv, sym, timeframe, limit=limit + 1)
+        if sym in self.dead_symbols:
+            raise RuntimeError(f"{sym} is blacklisted (prior exchange error on klines)")
+        try:
+            raw = self._with_retry(self._ex.fetch_ohlcv, sym, timeframe, limit=limit + 1)
+        except Exception as e:  # noqa: BLE001
+            if not _retryable(e):  # биржевая ошибка = мертвый символ, в черный список
+                self.dead_symbols.add(sym)
+            raise
         if not raw or len(raw) < 2:
             raise RuntimeError(f"not enough candles for {sym} {timeframe}: got {len(raw or [])}")
         df = pd.DataFrame(raw, columns=OHLCV_COLUMNS)

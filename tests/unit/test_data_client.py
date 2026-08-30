@@ -80,19 +80,33 @@ class ExchangeError(Exception):
     """Имитация ccxt.ExchangeError (не сетевая)."""
 
 
-def test_exchange_errors_not_retried():
-    """Биржевые ошибки не долбим повторами: ретраи на ошибочные коды копят
-    счетчик нарушений BingX и ведут к бану API (109429 — пойман вживую)."""
+def test_exchange_errors_not_retried_and_blacklisted():
+    """Биржевые ошибки не долбим повторами И заносим символ в черный список:
+    повторы к мертвым листингам копят счетчик BingX -> бан (>10 x 109415
+    за 15 мин, поймано вживую дважды)."""
 
     class FailingExchange(FakeExchange):
-        def fetch_ohlcv(self, symbol, timeframe, limit):
+        def fetch_ohlcv(self, symbol, timeframe="1m", since=None, limit=None):
             self.ohlcv_calls += 1
             raise ExchangeError("bingx 109415 invalid something")
 
     ex = FailingExchange()
+    client = make_client(ex)
     with pytest.raises(ExchangeError):
-        make_client(ex).fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 100)
+        client.fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 100)
     assert ex.ohlcv_calls == 1  # ровно одна попытка, без ретраев
+    with pytest.raises(RuntimeError, match="blacklisted"):
+        client.fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 100)
+    assert ex.ohlcv_calls == 1  # повторный запрос до биржи НЕ дошел
+
+
+def test_network_errors_not_blacklisted():
+    """Сетевой сбой — не приговор символу: после ретраев он остается живым."""
+    ex = FakeExchange(fail_times=10)
+    client = make_client(ex)
+    with pytest.raises(ConnectionError):
+        client.fetch_closed_ohlcv("SOL/USDT:USDT", "15m", 100)
+    assert "SOL/USDT:USDT" not in client.dead_symbols
 
 
 def test_universe_filters_and_caches():

@@ -57,6 +57,7 @@ class ShadowRunner:
         self.equity_usd: float = DEFAULT_EQUITY_USD
         self.ticks: int = 0
         self.last_report: dict = {}
+        self._seen_cycle_errors: set[str] = set()  # дедуп шума (AGT-кейс: одна и та же ошибка каждый тик)
         self._err_streak = 0
         self._top_at = -REFRESH_TOP_SEC
         self._resolve_at = 0.0
@@ -83,6 +84,7 @@ class ShadowRunner:
                 )
                 self.watchlist = [q.symbol for q in top]
                 self._top_at = now
+                self._seen_cycle_errors.clear()  # новый вотчлист — ошибки можно повторить
                 logger.info("watchlist refreshed: %d symbols", len(self.watchlist))
 
             report = self._cycle.run_once(self.watchlist, self.equity_usd)
@@ -95,7 +97,9 @@ class ShadowRunner:
             if report.candidates:
                 logger.info("tick %d: %s", self.ticks, self.last_report)
             for e in report.errors:
-                logger.warning("cycle error: %s", e)
+                if e not in self._seen_cycle_errors:
+                    self._seen_cycle_errors.add(e)
+                    logger.warning("cycle error (далее молчу до смены вотчлиста): %s", e)
 
             if now - self._resolve_at >= RESOLVE_SEC:
                 for symbol in set(self.watchlist):
