@@ -1,6 +1,6 @@
 {
   "additionalProperties": false,
-  "description": "Trader выбирает опции ПО ID из SetupCandidate. Свободных чисел нет —\nопечатка модели физически не может стать кривым ордером (ст. 2).",
+  "description": "Trader выбирает опции ПО ID из SetupCandidate. Свободных чисел нет —\nопечатка модели физически не может стать кривым ордером (ст. 2).\n\nv2: право вето (решение 2026-08-26) — verdict=decline с обязательной\nпричиной. Trader = гейткипер исполнения, не только выбор опций.",
   "properties": {
     "candidate_id": {
       "title": "Candidate Id",
@@ -10,9 +10,29 @@
       "title": "Decision Id",
       "type": "string"
     },
+    "decline_reason": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Decline Reason"
+    },
     "entry_option_id": {
-      "title": "Entry Option Id",
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Entry Option Id"
     },
     "model": {
       "title": "Model",
@@ -28,22 +48,46 @@
       "type": "string"
     },
     "schema_version": {
-      "const": 1,
-      "default": 1,
+      "const": 2,
+      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },
     "sl_option_id": {
-      "title": "Sl Option Id",
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Sl Option Id"
     },
     "tp_option_id": {
-      "title": "Tp Option Id",
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Tp Option Id"
     },
     "ts": {
       "format": "date-time",
       "title": "Ts",
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "execute",
+        "decline"
+      ],
+      "title": "Verdict",
       "type": "string"
     }
   },
@@ -51,9 +95,7 @@
     "decision_id",
     "ts",
     "candidate_id",
-    "entry_option_id",
-    "sl_option_id",
-    "tp_option_id",
+    "verdict",
     "rationale",
     "model",
     "prompt_sha"

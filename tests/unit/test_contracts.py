@@ -78,6 +78,46 @@ def test_empty_option_lists_rejected():
         make_candidate(entry_options=[])
 
 
+def make_trade_decision(**overrides):
+    from oskar.contracts.schemas import TradeDecision
+
+    base = dict(
+        decision_id="d1", ts=datetime.now(UTC), candidate_id="sc-001",
+        verdict="execute", entry_option_id="e-market", sl_option_id="s-swing",
+        tp_option_id="t-liq", rationale="вход от края FVG, стоп за свингом",
+        model="fable", prompt_sha="x" * 64,
+    )
+    base.update(overrides)
+    return TradeDecision(**base)
+
+
+def test_trade_decision_execute_roundtrip():
+    d = make_trade_decision()
+    from oskar.contracts.schemas import TradeDecision
+
+    assert TradeDecision.model_validate_json(d.model_dump_json()) == d
+    assert d.schema_version == 2
+
+
+def test_trade_decision_decline_requires_reason():
+    """v2: вето Trader'а — decline обязан объяснить, execute обязан выбрать."""
+    ok = make_trade_decision(
+        verdict="decline", entry_option_id=None, sl_option_id=None,
+        tp_option_id=None,
+        decline_reason="вход технически кривой: до пула ликвидности полшага",
+    )
+    assert ok.verdict == "decline"
+    with pytest.raises(ValidationError, match="decline_reason"):
+        make_trade_decision(
+            verdict="decline", entry_option_id=None, sl_option_id=None,
+            tp_option_id=None,
+        )
+    with pytest.raises(ValidationError, match="option ids"):
+        make_trade_decision(verdict="decline", decline_reason="причина достаточной длины тут")
+    with pytest.raises(ValidationError, match="option ids"):
+        make_trade_decision(entry_option_id=None)
+
+
 def test_version_registry_matches_models():
     import oskar.contracts as contracts
 

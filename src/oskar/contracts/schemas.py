@@ -12,7 +12,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Direction = Literal["long", "short"]
 SetupType = Literal["fvg", "ob", "liquidity_sweep", "bos", "choch", "confluence"]
@@ -131,18 +131,37 @@ class ScoutReport(_Contract):
 
 class TradeDecision(_Contract):
     """Trader выбирает опции ПО ID из SetupCandidate. Свободных чисел нет —
-    опечатка модели физически не может стать кривым ордером (ст. 2)."""
+    опечатка модели физически не может стать кривым ордером (ст. 2).
 
-    schema_version: Literal[1] = 1
+    v2: право вето (решение 2026-08-26) — verdict=decline с обязательной
+    причиной. Trader = гейткипер исполнения, не только выбор опций."""
+
+    schema_version: Literal[2] = 2
     decision_id: str
     ts: datetime
     candidate_id: str
-    entry_option_id: str
-    sl_option_id: str
-    tp_option_id: str
+    verdict: Literal["execute", "decline"]
+    entry_option_id: str | None = None
+    sl_option_id: str | None = None
+    tp_option_id: str | None = None
     rationale: str = Field(min_length=10)
+    decline_reason: str | None = None
     model: str
     prompt_sha: str
+
+    @model_validator(mode="after")
+    def _verdict_consistency(self) -> "TradeDecision":
+        if self.verdict == "execute":
+            if not (self.entry_option_id and self.sl_option_id and self.tp_option_id):
+                raise ValueError("execute requires entry/sl/tp option ids")
+            if self.decline_reason:
+                raise ValueError("decline_reason is only valid with verdict=decline")
+        else:
+            if self.entry_option_id or self.sl_option_id or self.tp_option_id:
+                raise ValueError("decline must not carry option ids")
+            if not self.decline_reason or len(self.decline_reason) < 20:
+                raise ValueError("decline requires decline_reason (>= 20 chars)")
+        return self
 
 
 # ---------------------------------------------------------------------- risk
