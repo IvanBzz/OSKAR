@@ -6,6 +6,13 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-08-27 — установка Hermes передана оператору: scripts/setup_hermes.ps1
+
+Три попытки установить Hermes из агентской сессии разбились о MSIX-виртуализацию песочницы Claude Desktop (детали в debugging-заметке): split-brain путей, частичная переустановка без кода, полностью виртуализированное дерево при работающем exe. Решение: `scripts/setup_hermes.ps1` — однокомандная установка из терминала Ивана (официальный установщик + телеграм-конфиг из OSKAR\.env + скиллы oskar-*; секреты в git не попадают — скрипт читает их из .env на лету). Виртуализированные обломки агентских установок вычищены.
+
+### Затронутые файлы
+CREATE: scripts/setup_hermes.ps1; MODIFY: vault/knowledge/debugging/MSIX*.md
+
 ## 2026-08-26 — скиллы Hermes: oskar-control и oskar-approvals; установка Hermes запущена
 
 `skills/oskar-control` — /status /pending /pause /resume /panic через локальный API (скрипт на stdlib, venv-независим); правило panic по ст. 6: исполнять немедленно по любой формулировке, не переспрашивая. `skills/oskar-approvals` — маппинг callback-кнопок `oskar:approve|reject|snooze:<id>` в POST API; кнопка = подтверждение, 409 = TTL истек (не воскрешаем), запрет approve по собственной инициативе агента.
