@@ -53,17 +53,10 @@ class TelegramSender:
         chart_png: bytes | None,
         ttl_minutes: int,
         scout_verdict=None,
+        plan=None,
     ) -> SentMessage:
         text = render_card_text(candidate, verdict, ttl_minutes, scout_verdict)
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "Approve", "callback_data": f"oskar:approve:{candidate.id}"},
-                    {"text": "Reject", "callback_data": f"oskar:reject:{candidate.id}"},
-                ],
-                [{"text": "Snooze 15m", "callback_data": f"oskar:snooze:{candidate.id}"}],
-            ]
-        }
+        keyboard = {"inline_keyboard": build_keyboard(candidate.id, plan)}
         if chart_png is not None:
             r = self._http.post(
                 f"{self._base}/sendPhoto",
@@ -100,6 +93,28 @@ def _json(obj: Any) -> str:
 
 def _clip(text: str, limit: int = 220) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def build_keyboard(decision_id: str, plan=None) -> list[list[dict]]:
+    """Кнопки карточки: одно нажатие = система делает всё сама.
+
+    ⚡ Маркет — вход сейчас; ⏳ Лимит <цена> — отложенный ордер по найденному
+    уровню (FVG/OB). Обе ставят SL и TP тем же действием.
+    callback_data <= 64 байт (лимит Telegram): 'oskar:market:<id>'.
+    """
+    rows: list[list[dict]] = [[
+        {"text": "⚡ Маркет", "callback_data": f"oskar:market:{decision_id}"[:64]},
+    ]]
+    if plan is not None and getattr(plan, "entry_limit", None):
+        rows[0].append({
+            "text": f"⏳ Лимит {plan.entry_limit:.6g}",
+            "callback_data": f"oskar:limit:{decision_id}"[:64],
+        })
+    rows.append([
+        {"text": "❌ Пропустить", "callback_data": f"oskar:reject:{decision_id}"[:64]},
+        {"text": "💤 15 мин", "callback_data": f"oskar:snooze:{decision_id}"[:64]},
+    ])
+    return rows
 
 
 def render_card_text(

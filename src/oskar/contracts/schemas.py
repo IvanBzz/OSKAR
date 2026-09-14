@@ -200,6 +200,31 @@ class RiskVerdict(_Contract):
 # ----------------------------------------------------------------- execution
 
 
+class ExecutionPlan(_Contract):
+    """Готовый к исполнению план — всё посчитано ДО показа карточки.
+
+    Нажатие кнопки не запускает расчетов: цены, qty и леверидж уже прошли
+    лестницу (ст. 2). Кнопка выбирает лишь СПОСОБ входа: market сейчас или
+    limit по найденному уровню (пожелание Ивана — «одной кнопкой»).
+    """
+
+    schema_version: Literal[1] = 1
+    candidate_id: str
+    symbol: str  # канонический
+    side: Direction
+    entry_market: float = Field(gt=0)
+    entry_limit: float | None = None  # уровень FVG/OB, если он в меню
+    entry_limit_note: str = ""
+    sl: float = Field(gt=0)
+    tp: float = Field(gt=0)
+    qty: float = Field(gt=0)
+    leverage: float = Field(ge=1)
+    risk_usd: float = Field(ge=0)
+    rr_fee_adjusted: float
+    timeframe: Timeframe
+    tldr: str = ""
+
+
 class OrderRef(_Contract):
     exchange_id: str
     client_order_id: str

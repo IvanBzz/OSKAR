@@ -77,11 +77,15 @@ class PaperAdapter(ExchangeAdapter):
         return PlacedOrder(str(next(self._ids)), client_order_id, entry_type.upper(), "closed")
 
     def place_sl(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
-        self._positions[(canonical(symbol), side)].sl = stop_price
+        pos = self._positions.get((canonical(symbol), side))
+        if pos is not None:  # лимитка еще не исполнилась — условный ордер просто висит
+            pos.sl = stop_price
         return PlacedOrder(str(next(self._ids)), client_order_id, "STOP_MARKET", "open")
 
     def place_tp(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
-        self._positions[(canonical(symbol), side)].tp = stop_price
+        pos = self._positions.get((canonical(symbol), side))
+        if pos is not None:
+            pos.tp = stop_price
         return PlacedOrder(str(next(self._ids)), client_order_id, "TAKE_PROFIT_MARKET", "open")
 
     def cancel_all(self, symbol: str) -> int:

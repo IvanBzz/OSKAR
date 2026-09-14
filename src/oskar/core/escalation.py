@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from oskar.agents.budget import BudgetExceeded
-from oskar.contracts.schemas import SetupCandidate, SetupVerdict, TradeDecision
+from oskar.contracts.schemas import (
+    ExecutionPlan,
+    RiskVerdict,
+    SetupCandidate,
+    SetupVerdict,
+    TradeDecision,
+)
 from oskar.core.state import RuntimeState
 from oskar.risk.ladder import Caps, ProfileLimits, RiskInput, evaluate
 
@@ -99,18 +105,68 @@ class Escalator:
             return EscalationResult(outcome="risk_rejected", scout_json=sj,
                                     trade_json=tj, detail=f"final_ladder: {failed}")
 
+        plan = build_plan(candidate, verdict, scout_verdict, entry, sl, tp, entry_type)
         expires = (datetime.now(UTC) + timedelta(seconds=self._ttl)).strftime(
             "%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
         j = self._state.journal
         j.execute(
             "INSERT OR IGNORE INTO pending_approvals (decision_id, card_json, expires_at) "
             "VALUES (?,?,?)",
-            (candidate.id, candidate.model_dump_json(), expires),
+            (candidate.id, plan.model_dump_json(), expires),
         )
         j.commit()
         if self._card_sink is not None:
             try:
-                self._card_sink(candidate, verdict, scout_verdict)
+                self._card_sink(candidate, verdict, scout_verdict, plan)
             except Exception as e:  # noqa: BLE001 - TTL fail-closed прикроет
                 logger.error("card sink failed for %s: %s", candidate.id, e)
         return EscalationResult(outcome="pending", scout_json=sj, trade_json=tj)
+
+
+def build_plan(
+    candidate: SetupCandidate,
+    verdict: RiskVerdict,
+    scout_verdict: SetupVerdict,
+    entry: float,
+    sl: float,
+    tp: float,
+    entry_type: str,
+) -> ExecutionPlan:
+    """План исполнения: посчитанные цифры + лимитный уровень из меню.
+
+    Лимитный уровень берем из выбора Trader'а, если он выбрал лимитку;
+    иначе — лучшая лимитная опция меню (край FVG/OB), чтобы кнопка «лимит»
+    была доступна даже когда Trader выбрал вход по рынку.
+    """
+    limit_price = entry if entry_type == "limit" else None
+    limit_note = ""
+    if limit_price is None:
+        for o in candidate.entry_options:
+            if o.kind != "market":
+                limit_price, limit_note = o.price, o.note
+                break
+    else:
+        limit_note = next(
+            (o.note for o in candidate.entry_options if o.price == entry and o.kind != "market"),
+            "",
+        )
+    market_price = next(
+        (o.price for o in candidate.entry_options if o.kind == "market"), entry
+    )
+    c = verdict.computed
+    return ExecutionPlan(
+        candidate_id=candidate.id,
+        symbol=candidate.symbol,
+        side=candidate.direction,
+        entry_market=market_price,
+        entry_limit=limit_price,
+        entry_limit_note=limit_note,
+        sl=sl,
+        tp=tp,
+        qty=c.qty,
+        leverage=c.leverage,
+        risk_usd=c.risk_usd,
+        rr_fee_adjusted=c.rr_fee_adjusted,
+        timeframe=candidate.timeframe,
+        tldr=getattr(scout_verdict, "tldr", "") or "",
+    )

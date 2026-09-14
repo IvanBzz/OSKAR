@@ -79,6 +79,7 @@ def test_send_text():
 
 
 def test_card_buttons_callback_data():
+    """Без плана — только маркет (лимитного уровня система не нашла)."""
     sender, tr = make_sender()
     sender.send_setup_card(candidate(), verdict(), chart_png=None, ttl_minutes=20)
     import json
@@ -87,7 +88,7 @@ def test_card_buttons_callback_data():
     buttons = body["reply_markup"]["inline_keyboard"]
     flat = [b["callback_data"] for row in buttons for b in row]
     assert flat == [
-        "oskar:approve:SOLUSDTUSDT-100-short",
+        "oskar:market:SOLUSDTUSDT-100-short",
         "oskar:reject:SOLUSDTUSDT-100-short",
         "oskar:snooze:SOLUSDTUSDT-100-short",
     ]

@@ -21,7 +21,16 @@ from oskar.core.state import RuntimeState
 logger = logging.getLogger("oskar.buttons")
 
 API = "https://api.telegram.org"
-VERB_ANSWERS = {"approve": "Взято ✅", "reject": "Пропущено ❌", "snooze": "Отложено 💤"}
+# market/limit = approve + исполнение выбранным способом (одно нажатие делает всё)
+EXECUTING_VERBS = {"market": "market", "limit": "limit"}
+VERB_ACTIONS = {
+    "market": "approve", "limit": "approve", "approve": "approve",
+    "reject": "reject", "snooze": "snooze",
+}
+VERB_ANSWERS = {
+    "market": "Беру по рынку ⚡", "limit": "Лимитка выставлена ⏳",
+    "approve": "Взято ✅", "reject": "Пропущено ❌", "snooze": "Отложено 💤",
+}
 
 
 class ButtonPoller:
@@ -31,7 +40,7 @@ class ButtonPoller:
         allowed_chat_id: str,
         state: RuntimeState,
         client: httpx.Client | None = None,
-        on_resolution=None,  # (decision_id, resolution) -> None; исполнение (Фаза 2 finale)
+        on_resolution=None,  # (decision_id, mode) -> ExecutionOutcome | None
     ):
         if not token or not allowed_chat_id:
             raise ValueError("signals bot token and chat id are required")
@@ -79,25 +88,43 @@ class ButtonPoller:
             return  # без answer — чужим не отвечаем
 
         parts = data.split(":", 2)
-        if len(parts) != 3 or parts[0] != "oskar" or parts[1] not in VERB_ANSWERS:
+        if len(parts) != 3 or parts[0] != "oskar" or parts[1] not in VERB_ACTIONS:
             self._answer(cb_id, "не понял кнопку")
             return
         verb, decision_id = parts[1], parts[2]
 
         out = resolve_approval(
-            self._state.journal, decision_id, verb,
+            self._state.journal, decision_id, VERB_ACTIONS[verb],
             paused=self._state.paused, safe_mode=self._state.safe_mode,
         )
-        answer = VERB_ANSWERS[verb] if out.ok else out.message
-        self._answer(cb_id, answer)
+        if not out.ok:
+            self._answer(cb_id, out.message)
+            logger.info("button %s %s rejected: %s", verb, decision_id, out.message)
+            return
 
-        if out.ok and verb != "snooze":
-            self._finalize_card(msg, VERB_ANSWERS[verb])
-        if out.ok and self._on_resolution is not None and out.resolution in ("approved", "rejected"):
+        answer = VERB_ANSWERS[verb]
+        # market/limit: одно нажатие ставит вход + SL + TP
+        if verb in EXECUTING_VERBS and self._on_resolution is not None:
             try:
-                self._on_resolution(decision_id, out.resolution)
+                result = self._on_resolution(decision_id, EXECUTING_VERBS[verb])
+                if result is not None:
+                    answer = result.message if result.ok else f"не исполнено: {result.message}"
+                    if not result.ok:  # откат решения: карточка остается живой
+                        self._state.journal.execute(
+                            "UPDATE pending_approvals SET resolution=NULL, resolved_at=NULL "
+                            "WHERE decision_id=?", (decision_id,),
+                        )
+                        self._state.journal.commit()
+                        self._answer(cb_id, answer)
+                        logger.error("execution failed for %s: %s", decision_id, result.message)
+                        return
             except Exception as e:  # noqa: BLE001 - исполнение не роняет поллер
                 logger.error("on_resolution failed for %s: %s", decision_id, e)
+                answer = f"ошибка исполнения: {e}"
+
+        self._answer(cb_id, answer)
+        if verb != "snooze":
+            self._finalize_card(msg, answer)
         logger.info("button %s %s -> %s", verb, decision_id, answer)
 
     # --------------------------------------------------------------- helpers

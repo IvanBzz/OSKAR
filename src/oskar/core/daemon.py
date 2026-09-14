@@ -103,14 +103,14 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
         sender = TelegramSender(token, chat)
         ttl_min = profile_settings.approval_ttl_seconds // 60
 
-        def card_sink(candidate, verdict, scout_verdict):  # noqa: F811
+        def card_sink(candidate, verdict, scout_verdict, plan=None):  # noqa: F811
             png = None
             try:
                 df = cache.get(candidate.symbol, candidate.timeframe, 200)
                 png = render_chart(df, candidate)
             except Exception:  # noqa: BLE001 - карточка без графика лучше отсутствия
                 pass
-            sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict)
+            sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan)
     else:
         print("escalation cards OFF: telegram not configured")
 
@@ -123,6 +123,25 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
         card_sink=card_sink,
         equity_fn=lambda: runner.equity_usd,
     )
+
+
+def _make_executor(state, settings):
+    """Исполнитель по кнопке. Режим из settings.mode: paper -> VST sandbox."""
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+    key, secret = os.getenv("BINGX_API_KEY", ""), os.getenv("BINGX_API_SECRET", "")
+    if not key or not secret:
+        return None
+    sandbox = bool(settings.get("exchange", {}).get("sandbox", True))
+    from oskar.core.executor import ExecutionService
+    from oskar.data.client import make_bingx_exchange
+    from oskar.execution.bingx import BingXAdapter
+
+    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=sandbox))
+    return ExecutionService(adapter, state.journal, state.run_id)
 
 
 def _make_equity_fn():
@@ -209,9 +228,14 @@ def main() -> int:
     if signals_token and chat_id:
         from oskar.core.telegram_buttons import ButtonPoller
 
-        poller = ButtonPoller(signals_token, chat_id, state)
+        executor = _make_executor(state, settings)
+        poller = ButtonPoller(
+            signals_token, chat_id, state,
+            on_resolution=(executor.execute if executor is not None else None),
+        )
         poller.start_thread()
-        print("button poller: ON (signals bot)")
+        print(f"button poller: ON (signals bot), execution: "
+              f"{'ON' if executor is not None else 'OFF (no keys)'}")
 
     app = build_app(state, shadow=runner)
     print(

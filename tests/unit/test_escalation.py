@@ -87,7 +87,10 @@ def make(tmp_path, scout, trader, cards=None):
         state, CAPS, PROFILE,
         scout_fn=scout, trader_fn=trader, resolve_fn=resolve_fn,
         approval_ttl_seconds=1200,
-        card_sink=(lambda c, v, s: cards.append((c.id, s.confidence))) if cards is not None else None,
+        card_sink=(
+            (lambda c, v, s, p=None: cards.append((c.id, s.confidence, p)))
+            if cards is not None else None
+        ),
         equity_fn=lambda: 1000.0,
     )
     return esc, state
@@ -98,11 +101,19 @@ def test_full_path_to_pending_with_card(tmp_path):
     esc, state = make(tmp_path, lambda c: sv(), lambda c, v: td(), cards)
     res = esc(candidate())
     assert res.outcome == "pending"
-    assert cards == [("SOLUSDTUSDT-100-short", 68)]
+    assert len(cards) == 1
+    card_id, conf, plan = cards[0]
+    assert (card_id, conf) == ("SOLUSDTUSDT-100-short", 68)
+    # в pending лежит готовый план исполнения, не сырой кандидат
+    from oskar.contracts.schemas import ExecutionPlan
+
     row = state.journal.execute(
-        "SELECT decision_id, expires_at FROM pending_approvals"
+        "SELECT decision_id, card_json, expires_at FROM pending_approvals"
     ).fetchone()
     assert row["decision_id"] == "SOLUSDTUSDT-100-short"
+    stored = ExecutionPlan.model_validate_json(row["card_json"])
+    assert stored == plan
+    assert stored.qty > 0 and stored.leverage >= 1 and stored.sl == 101.5
     assert json.loads(res.scout_json)["verdict"] == "take"
     assert json.loads(res.trade_json)["verdict"] == "execute"
 

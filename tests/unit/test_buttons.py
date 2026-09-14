@@ -96,11 +96,12 @@ def make_poller(tmp_path, updates, on_resolution=None):
     return poller, state, fake
 
 
-def test_approve_button_resolves_and_answers(tmp_path):
-    resolutions = []
+def test_market_button_resolves_and_executes(tmp_path):
+    """Кнопка «Маркет» = approve + исполнение одним нажатием."""
+    calls = []
     poller, state, fake = make_poller(
-        tmp_path, [callback_update("oskar:approve:d1")],
-        on_resolution=lambda d, r: resolutions.append((d, r)),
+        tmp_path, [callback_update("oskar:market:d1")],
+        on_resolution=lambda d, mode: calls.append((d, mode)),
     )
     add_pending(state.journal, "d1")
     assert poller.poll_once(timeout=0) == 1
@@ -109,13 +110,27 @@ def test_approve_button_resolves_and_answers(tmp_path):
         "SELECT resolution FROM pending_approvals WHERE decision_id='d1'"
     ).fetchone()
     assert row["resolution"] == "approved"
-    assert resolutions == [("d1", "approved")]
+    assert calls == [("d1", "market")]  # исполнителю передан способ входа
 
     paths = [p for p, _ in fake.calls]
     assert "answerCallbackQuery" in paths
     assert "editMessageCaption" in paths  # кнопки убраны, статус дописан
-    answer = next(b for p, b in fake.calls if p == "answerCallbackQuery")
-    assert "✅" in answer["text"]
+
+
+def test_plain_approve_does_not_execute(tmp_path):
+    """Голый approve (через API/Hermes) решение фиксирует, но ордер не ставит —
+    способ входа выбирается только кнопкой Маркет/Лимит."""
+    calls = []
+    poller, state, fake = make_poller(
+        tmp_path, [callback_update("oskar:approve:d1")],
+        on_resolution=lambda d, mode: calls.append((d, mode)),
+    )
+    add_pending(state.journal, "d1")
+    poller.poll_once(timeout=0)
+    row = state.journal.execute(
+        "SELECT resolution FROM pending_approvals WHERE decision_id='d1'"
+    ).fetchone()
+    assert row["resolution"] == "approved" and calls == []
 
 
 def test_foreign_chat_ignored_silently(tmp_path):

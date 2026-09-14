@@ -10,6 +10,7 @@ CONTRACT_VERSIONS: dict[str, int] = {
     "ScoutReport": 2,  # v2: SetupVerdict.tldr — выжимка для карточки
     "TradeDecision": 2,  # v2: право вето Trader'а (verdict execute|decline)
     "RiskVerdict": 1,
+    "ExecutionPlan": 1,
     "ExecutionReport": 1,
     "Lesson": 1,
     "Proposal": 1,
