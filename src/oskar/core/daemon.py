@@ -168,6 +168,9 @@ def _make_equity_fn():
 
 
 def main() -> int:
+    from oskar._io import force_utf8_stdio
+
+    force_utf8_stdio()
     import logging
 
     from oskar.core.api import build_app

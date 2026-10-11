@@ -10,6 +10,9 @@ from oskar.ops.caps_guard import caps_hash, pinned_hash, verify_caps
 
 
 def main() -> int:
+    from oskar._io import force_utf8_stdio
+
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(prog="oskar", description="OSKAR control CLI")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("caps-verify", help="verify caps.yaml against CONSTITUTION.md pin")

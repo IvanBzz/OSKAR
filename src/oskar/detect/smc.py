@@ -26,11 +26,17 @@
 пересчитывает каждый префикс заново.
 """
 
+import contextlib
+import io
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
-from smartmoneyconcepts import smc
+
+# Библиотека печатает баннер с эмодзи при импорте: под cp1251-stdout (Windows,
+# редирект в файл) это UnicodeEncodeError и падение демона на старте. Глушим.
+with contextlib.redirect_stdout(io.StringIO()):
+    from smartmoneyconcepts import smc
 
 DETECTOR_VERSION = f"smartmoneyconcepts=={smc.__version__}+oskar.smc=1"
 
