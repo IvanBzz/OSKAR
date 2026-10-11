@@ -41,6 +41,8 @@ def build_app(state: RuntimeState, shadow=None) -> FastAPI:
                 "watchlist": len(shadow.watchlist),
                 "ticks": shadow.ticks,
                 "equity_usd": round(shadow.equity_usd, 2),
+                "equity_source": shadow.equity_source,
+                "equity_at": shadow.equity_at,
                 "last_report": shadow.last_report,
             }
         return payload

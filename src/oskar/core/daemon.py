@@ -232,10 +232,12 @@ def main() -> int:
         from oskar.core.telegram_buttons import ButtonPoller
 
         executor = _make_executor(state, settings)
-        poller = ButtonPoller(
-            signals_token, chat_id, state,
-            on_resolution=(executor.execute if executor is not None else None),
-        )
+        on_resolution = None
+        if executor is not None:
+            from oskar.core.executor import equity_guarded
+
+            on_resolution = equity_guarded(executor.execute, lambda: runner.equity_source)
+        poller = ButtonPoller(signals_token, chat_id, state, on_resolution=on_resolution)
         poller.start_thread()
         print(f"button poller: ON (signals bot), execution: "
               f"{'ON' if executor is not None else 'OFF (no keys)'}")

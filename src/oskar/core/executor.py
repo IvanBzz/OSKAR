@@ -116,3 +116,24 @@ class ExecutionService:
             True, f"{label}: {plan.symbol} {plan.side} qty {qty:g}, плечо {plan.leverage:g}x",
             client_order_id=client_order_id, entry_type=mode,
         )
+
+
+def equity_guarded(execute_fn, equity_source_fn):
+    """Обертка исполнения: без свежего equity с биржи ордера не ставим (ст. 1).
+
+    Протухший ключ, бан, сеть — любой сбой приватного API делает сайзинг
+    выдуманным; план посчитан на equity, которого может не быть. Кнопка
+    честно отвечает причиной, карточка остается живой.
+    """
+
+    def guarded(decision_id: str, mode: str) -> ExecutionOutcome:
+        source = equity_source_fn()
+        if source != "exchange":
+            return ExecutionOutcome(
+                False,
+                f"equity с биржи недоступен (источник: {source}) — исполнение "
+                "заблокировано. Проверь API-ключ BingX.",
+            )
+        return execute_fn(decision_id, mode)
+
+    return guarded

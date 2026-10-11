@@ -55,6 +55,13 @@ class ShadowRunner:
 
         self.watchlist: list[str] = []
         self.equity_usd: float = DEFAULT_EQUITY_USD
+        # Откуда equity: exchange | persisted (последнее известное с биржи,
+        # пережило рестарт) | default. Исполнение разрешено ТОЛЬКО при exchange
+        # (ст. 1: биржа — единственная правда; сайзинг на выдуманном equity —
+        # класс бага «журнал врет»). Ключ протух -> демон это видит, а не маскирует.
+        self.equity_source: str = "default"
+        self.equity_at: str | None = None
+        self._load_persisted_equity()
         self.ticks: int = 0
         self.last_report: dict = {}
         self._seen_cycle_errors: set[str] = set()  # дедуп шума (AGT-кейс: одна и та же ошибка каждый тик)
@@ -63,6 +70,31 @@ class ShadowRunner:
         self._resolve_at = 0.0
         self._equity_at = -EQUITY_SEC
         self._stop = threading.Event()
+
+    # ---------------------------------------------------------------- equity
+
+    def _load_persisted_equity(self) -> None:
+        try:
+            row = self._state.journal.execute(
+                "SELECT key, value FROM meta WHERE key IN ('equity_last','equity_last_at')"
+            ).fetchall()
+            kv = {r[0]: r[1] for r in row}
+            if "equity_last" in kv:
+                self.equity_usd = float(kv["equity_last"])
+                self.equity_at = kv.get("equity_last_at")
+                self.equity_source = "persisted"
+        except Exception as e:  # noqa: BLE001 - журнал без meta: остаемся на default
+            logger.warning("persisted equity unavailable: %s", e)
+
+    def _persist_equity(self, value: float) -> None:
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        j = self._state.journal
+        j.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('equity_last', ?)", (str(value),))
+        j.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('equity_last_at', ?)", (now,))
+        j.commit()
+        self.equity_at = now
 
     # ------------------------------------------------------------------ tick
 
@@ -74,6 +106,16 @@ class ShadowRunner:
                 eq = self._equity_fn()
                 if eq is not None and eq > 0:
                     self.equity_usd = eq
+                    self.equity_source = "exchange"
+                    self._persist_equity(eq)
+                else:
+                    if self.equity_source == "exchange":
+                        self.equity_source = "persisted"  # биржа молчит: значение устарело
+                    logger.warning(
+                        "equity fetch FAILED - using %s value %.2f "
+                        "(execution blocked until exchange answers)",
+                        self.equity_source, self.equity_usd,
+                    )
                 self._equity_at = now
 
             if now - self._top_at >= REFRESH_TOP_SEC:
