@@ -45,6 +45,9 @@ def build_app(state: RuntimeState, shadow=None) -> FastAPI:
                 "equity_at": shadow.equity_at,
                 "last_report": shadow.last_report,
             }
+            # здоровье данных: universe/отрезанное, черный список, cooldown kline-API
+            health = getattr(shadow, "data_health", None)
+            payload["data"] = health() if callable(health) else {}
         return payload
 
     @app.get("/pending")
