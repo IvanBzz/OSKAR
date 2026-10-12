@@ -31,6 +31,25 @@ VERB_ANSWERS = {
     "market": "Беру по рынку ⚡", "limit": "Лимитка выставлена ⏳",
     "approve": "Взято ✅", "reject": "Пропущено ❌", "snooze": "Отложено 💤",
 }
+# Самопроверка цепочки Telegram -> поллер -> ответ: без решений, журнала и биржи.
+PING_VERB = "ping"
+PING_ANSWER = "Кнопки работают ✅"
+
+
+def send_ping_card(token: str, chat_id: str, client: httpx.Client | None = None) -> bool:
+    """Карточка с одной кнопкой; нажатие должно вернуть PING_ANSWER всплывашкой."""
+    http = client or httpx.Client(timeout=15)
+    r = http.post(
+        f"{API}/bot{token}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": "🔧 Самопроверка кнопок OSKAR. Нажми кнопку — должно всплыть «Кнопки работают ✅».",
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "✅ Проверить", "callback_data": f"oskar:{PING_VERB}:selftest"},
+            ]]},
+        },
+    )
+    return bool(r.json().get("ok"))
 
 
 class ButtonPoller:
@@ -88,10 +107,19 @@ class ButtonPoller:
             return  # без answer — чужим не отвечаем
 
         parts = data.split(":", 2)
-        if len(parts) != 3 or parts[0] != "oskar" or parts[1] not in VERB_ACTIONS:
+        known = len(parts) == 3 and parts[0] == "oskar" and (
+            parts[1] in VERB_ACTIONS or parts[1] == PING_VERB
+        )
+        if not known:
             self._answer(cb_id, "не понял кнопку")
             return
         verb, decision_id = parts[1], parts[2]
+
+        if verb == PING_VERB:
+            self._answer(cb_id, PING_ANSWER)
+            self._finalize_card(msg, "кнопки проверены ✅")
+            logger.info("button ping ok (%s)", decision_id)
+            return
 
         out = resolve_approval(
             self._state.journal, decision_id, VERB_ACTIONS[verb],

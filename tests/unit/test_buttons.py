@@ -158,6 +158,23 @@ def test_expired_button_answers_failclosed(tmp_path):
     assert row["resolution"] == "expired"
 
 
+def test_ping_button_answers_without_touching_journal(tmp_path):
+    """Самопроверка цепочки: ответ всплывашкой + снятие кнопок, журнал не тронут."""
+    from oskar.core.telegram_buttons import PING_ANSWER, send_ping_card
+
+    poller, state, fake = make_poller(tmp_path, [callback_update("oskar:ping:selftest")])
+    assert poller.poll_once(timeout=0) == 1
+    answer = next(b for p, b in fake.calls if p == "answerCallbackQuery")
+    assert answer["text"] == PING_ANSWER
+    assert "editMessageCaption" in [p for p, _ in fake.calls]
+    assert state.journal.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0] == 0
+
+    # сама карточка: одна кнопка с ping-callback, уходит через sendMessage
+    assert send_ping_card("TOKEN", CHAT, client=httpx.Client(transport=fake))
+    sent = next(b for p, b in fake.calls if p == "sendMessage")
+    assert sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "oskar:ping:selftest"
+
+
 def test_offset_advances(tmp_path):
     poller, state, fake = make_poller(tmp_path, [callback_update("oskar:reject:d1", update_id=555)])
     add_pending(state.journal, "d1")

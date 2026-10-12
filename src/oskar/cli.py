@@ -30,10 +30,18 @@ def main() -> int:
     sync_sub.add_parser("positions", help="open positions on exchange")
     sync_sub.add_parser("diff", help="journal vs exchange discrepancy report")
 
+    sub.add_parser(
+        "buttons-ping",
+        help="send a self-test card via the signals bot (press -> 'buttons work')",
+    )
+
     args = parser.parse_args()
 
     if args.command == "sync":
         return _cmd_sync(args)
+
+    if args.command == "buttons-ping":
+        return _cmd_buttons_ping()
 
     if args.command == "knowledge":
         from oskar.knowledge.index import build_index, search
@@ -63,6 +71,27 @@ def main() -> int:
         print("  Amendment procedure (Art. 4) required. Runtime would enter safe_mode.")
         return 1
     return 0
+
+
+def _cmd_buttons_ping() -> int:
+    """Карточка-самопроверка кнопок: доходит ли нажатие до поллера демона."""
+    import os
+    from pathlib import Path
+
+    from dotenv import load_dotenv
+
+    from oskar.core.telegram_buttons import send_ping_card
+
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+    token, chat = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", ""), os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat:
+        print("ERROR: TELEGRAM_SIGNALS_BOT_TOKEN / TELEGRAM_CHAT_ID not set")
+        return 1
+    if send_ping_card(token, chat):
+        print("ping card sent - press the button; oskard must be running to answer")
+        return 0
+    print("ERROR: telegram refused the message")
+    return 1
 
 
 def _cmd_sync(args) -> int:

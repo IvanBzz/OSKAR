@@ -192,6 +192,10 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # httpx пишет в INFO URL каждого запроса, а URL Telegram содержит токен бота —
+    # в лог нельзя (утечка поймана 2026-10-12 на первом же getUpdates, лог вычищен)
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if not verify_caps():
         print("REFUSING TO START: caps.yaml does not match CONSTITUTION.md pin (Art. 4)")
