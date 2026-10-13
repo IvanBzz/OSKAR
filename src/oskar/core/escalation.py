@@ -21,9 +21,24 @@ from oskar.contracts.schemas import (
     TradeDecision,
 )
 from oskar.core.state import RuntimeState
-from oskar.risk.ladder import Caps, ProfileLimits, RiskInput, evaluate
+from oskar.risk.ladder import Caps, OpenPosition, ProfileLimits, RiskInput, evaluate
 
 logger = logging.getLogger("oskar.escalation")
+
+
+def open_positions_from_journal(journal) -> list[OpenPosition]:
+    """Портфель для лестницы: open + pending (лимитка — зарезервированный риск).
+
+    Без этого escalator видел пустой портфель и max_open_positions /
+    max_total_risk_pct / no_duplicate_position не срабатывали никогда
+    (ревью 2026-10-13). Журнал сверяется с биржей монитором каждую минуту."""
+    rows = journal.execute(
+        "SELECT symbol, side, risk_usd FROM trades WHERE status IN ('open','pending')"
+    ).fetchall()
+    return [
+        OpenPosition(symbol=r["symbol"], side=r["side"], risk_usd=float(r["risk_usd"] or 0.0))
+        for r in rows
+    ]
 
 
 @dataclass(frozen=True)
@@ -118,6 +133,8 @@ class Escalator:
         if self._card_sink is not None:
             try:
                 message_id = self._card_sink(candidate, verdict, scout_verdict, plan)
+                if message_id is False:  # Telegram отверг карточку: решение без карточки = TTL fail-closed
+                    raise RuntimeError("telegram refused the card")
                 if message_id:  # монитор снимет кнопки с карточки по истечении TTL
                     j.execute(
                         "UPDATE pending_approvals SET telegram_message_id=? WHERE decision_id=?",

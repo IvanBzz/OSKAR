@@ -3,12 +3,15 @@
 Ритм (все интервалы — инжектируемые, тесты управляют временем):
 - каждые REFRESH_TOP_SEC (30 мин): universe -> scan -> top-N вотчлист
 - каждые tick_seconds (интервал профиля): ShadowCycle.run_once по вотчлисту
-- каждые RESOLVE_SEC (5 мин): дорешивание counterfactual-исходов
-- каждые EQUITY_SEC (1 час): обновление equity с биржи (fallback: прежнее значение)
+- каждые RESOLVE_SEC (5 мин): дорешивание counterfactual-исходов — по символам
+  с висящими исходами, не по вотчлисту (выпавший из топа символ иначе висел вечно)
+- каждые EQUITY_SEC (1 час): обновление equity с биржи; после сбоя — повтор через
+  EQUITY_RETRY_SEC, а не через час (исполнение заблокировано, пока equity не с биржи)
 
 Устойчивость (правило v1): серия из consecutive_errors подряд неудачных тиков
--> safe_mode + запись в лог. Один упавший символ цикл не валит (это внутри
-ShadowCycle), тут ловятся падения инфраструктуры (сеть, биржа).
+-> safe_mode + уведомление. Считаются сбои ЛОГИКИ и тики, где упали ВСЕ символы;
+сетевой чих (network/transient/cooldown по classify_error) в серию не идет —
+минутный обрыв на границе пересборки вотчлиста уводил в вечный safe_mode.
 
 Cooldown kline-эндпоинта (бан 109429 / бюджет ошибок клиента): цикл и
 пересборка вотчлиста ждут окончания паузы — одна строка в лог, не шторм
@@ -22,14 +25,19 @@ import time
 
 from oskar.core.cycle import ShadowCycle
 from oskar.core.state import RuntimeState
+from oskar.data.client import classify_error
 from oskar.data.scanner import scan
 
 logger = logging.getLogger("oskar.shadow")
 
 REFRESH_TOP_SEC = 1800.0
+REFRESH_RETRY_SEC = 120.0  # пересборка упала по сети — повтор через 2 мин, не через 30
 RESOLVE_SEC = 300.0
 EQUITY_SEC = 3600.0
+EQUITY_RETRY_SEC = 300.0
 DEFAULT_EQUITY_USD = 1000.0
+MAX_RESOLVE_SYMBOLS = 40  # за один проход: висящие исходы дорешиваются порциями
+NET_STREAK_FACTOR = 4  # сетевые сбои: серия в 4 раза длиннее (3 -> 12 тиков = 6 мин при 30с)
 
 
 class ShadowRunner:
@@ -45,6 +53,7 @@ class ShadowRunner:
         tick_seconds: float,
         consecutive_errors_to_safe_mode: int = 3,
         equity_fn=None,  # () -> float | None; None = без биржи (paper equity)
+        notify=None,  # (text) -> None: алерт в Telegram при safe_mode
         clock=time.monotonic,
     ):
         self._cycle = cycle
@@ -56,6 +65,7 @@ class ShadowRunner:
         self._tick_sec = tick_seconds
         self._err_limit = consecutive_errors_to_safe_mode
         self._equity_fn = equity_fn
+        self._notify = notify
         self._clock = clock
 
         self.watchlist: list[str] = []
@@ -72,9 +82,11 @@ class ShadowRunner:
         self._seen_cycle_errors: set[str] = set()  # дедуп шума (AGT-кейс: одна и та же ошибка каждый тик)
         self._cooldown_announced = False
         self._err_streak = 0
+        self._net_streak = 0
         self._top_at = -REFRESH_TOP_SEC
         self._resolve_at = 0.0
         self._equity_at = -EQUITY_SEC
+        self._equity_interval = EQUITY_SEC
         self._stop = threading.Event()
 
     # ---------------------------------------------------------------- equity
@@ -101,6 +113,22 @@ class ShadowRunner:
         j.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('equity_last_at', ?)", (now,))
         j.commit()
         self.equity_at = now
+
+    def _refresh_equity(self) -> None:
+        eq = self._equity_fn()
+        if eq is not None and eq > 0:
+            self.equity_usd = eq
+            self.equity_source = "exchange"
+            self._persist_equity(eq)
+            self._equity_interval = EQUITY_SEC
+            return
+        if self.equity_source == "exchange":
+            self.equity_source = "persisted"  # биржа молчит: значение устарело
+        self._equity_interval = EQUITY_RETRY_SEC
+        logger.warning(
+            "equity fetch FAILED - using %s value %.2f (execution blocked until exchange answers; "
+            "retry in %.0fs)", self.equity_source, self.equity_usd, EQUITY_RETRY_SEC,
+        )
 
     # ------------------------------------------------------------ data health
 
@@ -132,76 +160,111 @@ class ShadowRunner:
         self._seen_cycle_errors.clear()  # новый вотчлист — ошибки можно повторить
         logger.info("watchlist refreshed: %d symbols | %s", len(self.watchlist), summary.as_log())
 
+    def _resolve_symbols(self) -> list[str]:
+        fn = getattr(self._cycle, "unresolved_symbols", None)
+        if callable(fn):
+            try:
+                return list(fn())[:MAX_RESOLVE_SYMBOLS]
+            except Exception as e:  # noqa: BLE001 - журнал: падаем на вотчлист
+                logger.warning("unresolved_symbols failed: %s", e)
+        return sorted(set(self.watchlist))
+
     # ------------------------------------------------------------------ tick
+
+    def _fail(self, e: Exception, what: str) -> None:
+        """Сбой инфраструктуры. Логика/все символы — серия из err_limit; сеть/биржа
+        временно — отдельная, в NET_STREAK_FACTOR раз длиннее серия: минутный чих
+        не приговор, но получасовой обрыв — тоже safe_mode."""
+        kind = classify_error(e)
+        if kind in ("network", "transient", "cooldown"):
+            self._net_streak += 1
+            limit = self._err_limit * NET_STREAK_FACTOR
+            logger.warning("%s failed (%s, %d/%d): %s", what, kind, self._net_streak, limit, e)
+            if self._net_streak >= limit:
+                self._enter_safe_mode(f"{self._net_streak} consecutive network failures ({what}: {e})")
+            return
+        self._err_streak += 1
+        logger.error("%s failed (%d/%d): %s", what, self._err_streak, self._err_limit, e)
+        if self._err_streak >= self._err_limit:
+            self._enter_safe_mode(f"{self._err_streak} consecutive shadow failures ({what}: {e})")
+
+    def _enter_safe_mode(self, why: str) -> None:
+        if self._state.safe_mode:
+            return
+        self._state.safe_mode = True
+        msg = f"SAFE MODE: {why}"
+        logger.error(msg)
+        if self._notify is not None:
+            try:
+                self._notify("🛑 " + msg)
+            except Exception as ne:  # noqa: BLE001
+                logger.warning("notify failed: %s", ne)
 
     def tick(self) -> None:
         """Один такт. Все падения инфраструктуры ловятся здесь."""
         now = self._clock()
-        try:
-            if now - self._equity_at >= EQUITY_SEC and self._equity_fn is not None:
-                eq = self._equity_fn()
-                if eq is not None and eq > 0:
-                    self.equity_usd = eq
-                    self.equity_source = "exchange"
-                    self._persist_equity(eq)
-                else:
-                    if self.equity_source == "exchange":
-                        self.equity_source = "persisted"  # биржа молчит: значение устарело
-                    logger.warning(
-                        "equity fetch FAILED - using %s value %.2f "
-                        "(execution blocked until exchange answers)",
-                        self.equity_source, self.equity_usd,
-                    )
-                self._equity_at = now
+        if now - self._equity_at >= self._equity_interval and self._equity_fn is not None:
+            try:
+                self._refresh_equity()
+            except Exception as e:  # noqa: BLE001 - equity_fn сам глотает сеть; это журнал
+                logger.warning("equity refresh failed: %s", e)
+            self._equity_at = now
 
-            cooldown = self._cooldown_remaining()
-            if now - self._top_at >= REFRESH_TOP_SEC:
-                if cooldown > 0:
-                    logger.warning("watchlist refresh postponed: kline API cooldown %.0fs", cooldown)
-                    self._top_at = now - REFRESH_TOP_SEC + cooldown + 1.0
-                else:
-                    self._refresh_watchlist(now)
-                    cooldown = self._cooldown_remaining()  # скан мог нарваться на бан
-
+        cooldown = self._cooldown_remaining()
+        if now - self._top_at >= REFRESH_TOP_SEC:
             if cooldown > 0:
-                if not self._cooldown_announced:
-                    logger.warning(
-                        "cycle skipped: kline API cooldown %.0fs (%s)",
-                        cooldown, getattr(self._client, "cooldown_reason", ""),
-                    )
-                    self._cooldown_announced = True
+                logger.warning("watchlist refresh postponed: kline API cooldown %.0fs", cooldown)
+                self._top_at = now - REFRESH_TOP_SEC + cooldown + 1.0
             else:
-                self._cooldown_announced = False
-                report = self._cycle.run_once(self.watchlist, self.equity_usd)
-                self.ticks += 1
-                self.last_report = {
-                    "scanned": report.scanned, "scored": report.scored,
-                    "candidates": report.candidates, "risk_passed": report.risk_passed,
-                    "errors": len(report.errors),
-                }
-                if report.candidates:
-                    logger.info("tick %d: %s", self.ticks, self.last_report)
-                for e in report.errors:
-                    if e not in self._seen_cycle_errors:
-                        self._seen_cycle_errors.add(e)
-                        logger.warning("cycle error (далее молчу до смены вотчлиста): %s", e)
+                try:
+                    self._refresh_watchlist(now)
+                except Exception as e:  # noqa: BLE001
+                    self._fail(e, "watchlist refresh")
+                    self._top_at = now - REFRESH_TOP_SEC + REFRESH_RETRY_SEC
+                    return
+                cooldown = self._cooldown_remaining()  # скан мог нарваться на бан
 
-                if now - self._resolve_at >= RESOLVE_SEC:
-                    for symbol in set(self.watchlist):
-                        try:
-                            self._cycle.resolve_counterfactuals(symbol)
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning("resolve %s: %s", symbol, e)
-                    self._resolve_at = now
+        if cooldown > 0:
+            if not self._cooldown_announced:
+                logger.warning(
+                    "cycle skipped: kline API cooldown %.0fs (%s)",
+                    cooldown, getattr(self._client, "cooldown_reason", ""),
+                )
+                self._cooldown_announced = True
+            return
+        self._cooldown_announced = False
 
-            self._err_streak = 0
-        except Exception as e:  # noqa: BLE001 - инфраструктура (сеть/биржа)
-            self._err_streak += 1
-            logger.error("shadow tick failed (%d/%d): %s",
-                         self._err_streak, self._err_limit, e)
-            if self._err_streak >= self._err_limit:
-                self._state.safe_mode = True
-                logger.error("SAFE MODE: %d consecutive shadow failures", self._err_streak)
+        try:
+            report = self._cycle.run_once(self.watchlist, self.equity_usd)
+        except Exception as e:  # noqa: BLE001 - инфраструктура (сеть/биржа/логика)
+            self._fail(e, "cycle")
+            return
+        self.ticks += 1
+        self.last_report = {
+            "scanned": report.scanned, "scored": report.scored,
+            "candidates": report.candidates, "risk_passed": report.risk_passed,
+            "errors": len(report.errors),
+        }
+        if report.candidates:
+            logger.info("tick %d: %s", self.ticks, self.last_report)
+        for e in report.errors:
+            if e not in self._seen_cycle_errors:
+                self._seen_cycle_errors.add(e)
+                logger.warning("cycle error (далее молчу до смены вотчлиста): %s", e)
+        if report.scanned and len(report.errors) >= report.scanned:
+            self._fail(RuntimeError(f"all {report.scanned} symbols failed"), "cycle")
+            return
+
+        if now - self._resolve_at >= RESOLVE_SEC:
+            for symbol in self._resolve_symbols():
+                try:
+                    self._cycle.resolve_counterfactuals(symbol)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("resolve %s: %s", symbol, e)
+            self._resolve_at = now
+
+        self._err_streak = 0
+        self._net_streak = 0
 
     # ---------------------------------------------------------------- thread
 

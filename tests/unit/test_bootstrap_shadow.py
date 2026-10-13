@@ -54,8 +54,10 @@ class FakeCycle:
         self.runs = []
 
     def run_once(self, symbols, equity):
-        if self.fail:
+        if self.fail == "network":
             raise ConnectionError("exchange down")
+        if self.fail:
+            raise RuntimeError("cycle logic broke")
         self.runs.append((list(symbols), equity))
 
         class R:
@@ -133,6 +135,20 @@ def test_error_streak_triggers_safe_mode(tmp_path):
     for _ in range(3):
         runner.tick()
     assert state.safe_mode  # 3 подряд — правило v1
+
+
+def test_network_blip_needs_longer_streak(tmp_path):
+    """Минутный обрыв сети на границе пересборки уводил в вечный safe_mode
+    (ревью 2026-10-13): сеть считается отдельной, в 4 раза длиннее серией."""
+    from oskar.core.shadow_runner import NET_STREAK_FACTOR
+
+    runner, cycle, state, t = make_runner(tmp_path, fail="network")
+    for _ in range(3):
+        runner.tick()
+    assert not state.safe_mode  # 3 сетевых — еще не приговор
+    for _ in range(3 * NET_STREAK_FACTOR - 3):
+        runner.tick()
+    assert state.safe_mode  # а 12 подряд — уже обрыв, не чих
 
 
 def test_single_error_does_not_trigger(tmp_path):

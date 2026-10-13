@@ -67,7 +67,9 @@ def test_market_execution_places_entry_sl_tp(tmp_path):
     assert row["client_order_id"].startswith("OSKAR-r1-")
 
     positions = adapter.positions()
-    assert len(positions) == 1 and positions[0].qty == pytest.approx(2.7429)
+    # qty ограничена риском плана от фактической цены входа: 1.22 / |100 - 103.5|
+    # (фикстура несет qty 2.7429 — исполнитель ей не верит, ревью Codex 2026-10-13)
+    assert len(positions) == 1 and positions[0].qty == pytest.approx(1.22 / 3.5, rel=1e-4)
 
     dec = j.execute(
         "SELECT outcome, outcome_detail FROM decisions WHERE decision_id=?", (p.candidate_id,)

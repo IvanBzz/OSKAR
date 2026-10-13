@@ -100,9 +100,10 @@ def classify_error(e: Exception) -> str:
         return "cooldown"
     if code in TRANSIENT_CODES:
         return "transient"
-    if code is None and any(
-        base.__name__ in {"OperationFailed", "RateLimitExceeded"} for base in type(e).__mro__
-    ):
+    # ccxt типизирует серверные сбои (100500 и т.п.) как OperationFailed — это
+    # не вина символа независимо от кода (ревью 2026-10-13: 6 ответов 5xx за скан
+    # хоронили 6 здоровых символов и уводили в 15-минутную паузу)
+    if any(base.__name__ in {"OperationFailed", "RateLimitExceeded"} for base in type(e).__mro__):
         return "transient"
     return "symbol"
 
@@ -151,13 +152,15 @@ class MarketDataClient:
         return len(self._symbol_errors)
 
     def health(self) -> dict:
-        """Срез для /status: видно, почему вотчлист пуст или данные стоят."""
-        self._purge_dead(self._clock())
+        """Срез для /status: видно, почему вотчлист пуст или данные стоят.
+        Только чтение: вызывается из потока API параллельно сканеру."""
+        now = self._clock()
+        alive_dead = sum(1 for until in list(self.dead_symbols.values()) if until > now)
         remaining = self.cooldown_remaining()
         return {
             "universe": len(self._universe or []),
             "universe_excluded": dict(self.universe_excluded),
-            "dead_symbols": len(self.dead_symbols),
+            "dead_symbols": alive_dead,
             "errors_15m": self.errors_in_window(),
             "cooldown_sec": int(remaining),
             "cooldown_reason": self.cooldown_reason if remaining > 0 else "",
@@ -246,6 +249,15 @@ class MarketDataClient:
         return df.astype(
             {"open": float, "high": float, "low": float, "close": float, "volume": float}
         )
+
+    def last_price(self, symbol: str) -> float:
+        """Последняя цена по тикеру (другой эндпоинт — бан klines его не касается).
+        Нужна исполнению: проверить, что план не устарел между карточкой и кнопкой."""
+        ticker = self._with_retry(self._ex.fetch_ticker, canonical(symbol))
+        px = ticker.get("last") or ticker.get("close")
+        if not px:
+            raise RuntimeError(f"no last price for {symbol}")
+        return float(px)
 
     def _exclusion_reason(self, m: dict) -> str | None:
         info = m.get("info") or {}

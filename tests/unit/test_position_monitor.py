@@ -96,19 +96,20 @@ def make_monitor(tmp_path, *, now=None, max_loss_hold=3 * 3600, limit_ttl=3600):
     clock = [now or T0]
     notes: list[str] = []
     expired: list[tuple] = []
+    state = RuntimeState(journal=j)
     mon = PositionMonitor(
         ex, j, max_loss_hold_seconds=max_loss_hold, limit_entry_ttl_seconds=limit_ttl,
         notify=notes.append, on_card_expired=lambda d, m: expired.append((d, m)),
-        now_fn=lambda: clock[0],
+        state=state, now_fn=lambda: clock[0],
     )
-    return mon, j, ex, clock, notes, expired
+    return mon, j, ex, clock, notes, expired, state
 
 
 # --------------------------------------------------------------------- sweeper
 
 
 def test_sweeper_expires_stale_cards_and_removes_buttons(tmp_path):
-    mon, j, ex, clock, notes, expired = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, expired, state = make_monitor(tmp_path)
     j.execute(
         "INSERT INTO pending_approvals (decision_id, card_json, expires_at, telegram_message_id) "
         "VALUES ('old', '{}', ?, '77')", (_iso(T0 - timedelta(minutes=5)),),
@@ -128,7 +129,7 @@ def test_sweeper_expires_stale_cards_and_removes_buttons(tmp_path):
 
 
 def test_pending_limit_filled_becomes_open(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "p1", status="pending", entry=99.0)
     ex.by_cid["OSKAR-r1-p1"] = OrderState("e1", "filled", 2.0, 99.5, fee=0.05)
     rep = mon.tick()
@@ -138,7 +139,7 @@ def test_pending_limit_filled_becomes_open(tmp_path):
 
 
 def test_pending_limit_cancelled_after_ttl_with_protection(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path, limit_ttl=3600)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path, limit_ttl=3600)
     add_trade(j, "old", status="pending", opened_at=T0 - timedelta(hours=2))
     add_trade(j, "young", status="pending", opened_at=T0 - timedelta(minutes=10))
     ex.by_cid["OSKAR-r1-old"] = OrderState("e-old", "open")
@@ -153,7 +154,7 @@ def test_pending_limit_cancelled_after_ttl_with_protection(tmp_path):
 
 
 def test_pending_limit_removed_by_exchange(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "p1", status="pending")
     ex.by_cid["OSKAR-r1-p1"] = OrderState("e1", "canceled")
     mon.tick()
@@ -165,7 +166,7 @@ def test_pending_limit_removed_by_exchange(tmp_path):
 
 
 def test_sl_hit_closes_long_with_pnl_and_cancels_tp(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "d1", entry=100.0, qty=2.0, sl=98.0)
     ex.orders["d1-sl"] = OrderState("d1-sl", "filled", 2.0, 98.0, fee=0.1)
     ex.orders["d1-tp"] = OrderState("d1-tp", "open")
@@ -180,7 +181,7 @@ def test_sl_hit_closes_long_with_pnl_and_cancels_tp(tmp_path):
 
 
 def test_tp_hit_closes_short_with_positive_pnl(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "s1", side="short", entry=100.0, qty=2.0, sl=103.0, tp=95.0)
     ex.orders["s1-sl"] = OrderState("s1-sl", "open")
     ex.orders["s1-tp"] = OrderState("s1-tp", "filled", 2.0, 95.0)
@@ -191,20 +192,22 @@ def test_tp_hit_closes_short_with_positive_pnl(tmp_path):
 
 
 def test_position_gone_without_fills_is_manual_close(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "m1")
     ex.orders["m1-sl"] = OrderState("m1-sl", "open")
     ex.orders["m1-tp"] = OrderState("m1-tp", "open")
     ex.pos = []  # позиции на бирже нет
     mon.tick()
+    assert trade(j, "m1")["status"] == "open" and ex.cancelled == []  # один тик — не приговор
+    mon.tick()  # подтверждено вторым тиком
     t = trade(j, "m1")
     assert t["status"] == "closed" and t["close_reason"] == "manual"
-    assert t["exit_price"] is None and t["realized_pnl"] is None
+    assert t["exit_price"] is None and t["realized_pnl"] is None and t["reconciled"] == 0
     assert set(ex.cancelled) == {"m1-sl", "m1-tp"}
 
 
 def test_duration_stop_closes_only_old_losers(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path, max_loss_hold=3 * 3600)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path, max_loss_hold=3 * 3600)
     old = T0 - timedelta(hours=4)
     add_trade(j, "loser", symbol="A/USDT:USDT", opened_at=old)
     add_trade(j, "winner", symbol="B/USDT:USDT", opened_at=old)
@@ -230,21 +233,25 @@ def test_duration_stop_closes_only_old_losers(tmp_path):
 
 
 def test_reconcile_reports_mismatch_once_and_clears(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     ex.pos = [PositionInfo("X/USDT:USDT", "short", 5.0, 10.0, 0.0)]  # в журнале такой нет
     mon.tick()
+    assert notes == [] and not state.safe_mode  # один сомнительный ответ — не расхождение
     mon.tick()
-    assert sum("reconcile" in n for n in notes) == 1  # не спамим каждый тик
+    mon.tick()
+    assert sum("reconcile" in n for n in notes) == 1  # подтверждено, но не спамим каждый тик
+    assert state.safe_mode  # неизвестное состояние счета = новых входов нет
     ex.pos = []
     rep = mon.tick()
     assert rep.mismatches == []
     ex.pos = [PositionInfo("X/USDT:USDT", "short", 5.0, 10.0, 0.0)]
     mon.tick()
+    mon.tick()
     assert sum("reconcile" in n for n in notes) == 2  # вернулось — сообщили снова
 
 
 def test_qty_mismatch_within_tolerance_is_quiet(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "q1", qty=2.0)
     ex.orders["q1-sl"] = OrderState("q1-sl", "open")
     ex.orders["q1-tp"] = OrderState("q1-tp", "open")
@@ -257,7 +264,7 @@ def test_qty_mismatch_within_tolerance_is_quiet(tmp_path):
 
 
 def test_error_in_one_trade_does_not_block_others(tmp_path):
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "bad", symbol="BAD/USDT:USDT")
     add_trade(j, "good", symbol="GOOD/USDT:USDT")
     ex.fail_symbols = {"BAD/USDT:USDT"}
@@ -274,13 +281,12 @@ def test_status_endpoint_exposes_trades_and_monitor(tmp_path):
 
     from oskar.core.api import build_app
 
-    mon, j, ex, clock, notes, _ = make_monitor(tmp_path)
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "d1")
     ex.orders["d1-sl"] = OrderState("d1-sl", "open")
     ex.orders["d1-tp"] = OrderState("d1-tp", "open")
     ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 1.0)]
     mon.tick()
-    state = RuntimeState(journal=j)
     payload = TestClient(build_app(state, monitor=mon)).get("/status").json()
     assert payload["trades"]["open"] == 1 and payload["trades"]["monitor"]["ticks"] == 1
 

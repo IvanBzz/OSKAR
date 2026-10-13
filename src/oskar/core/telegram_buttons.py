@@ -10,6 +10,7 @@
 игнорируется без ответа.
 """
 
+import html
 import logging
 import threading
 
@@ -17,6 +18,7 @@ import httpx
 
 from oskar.core.approvals import resolve_approval
 from oskar.core.state import RuntimeState
+from oskar.journal.db import transaction
 
 logger = logging.getLogger("oskar.buttons")
 
@@ -61,11 +63,13 @@ class ButtonPoller:
         state: RuntimeState,
         client: httpx.Client | None = None,
         on_resolution=None,  # (decision_id, mode) -> ExecutionOutcome | None
+        allowed_user_ids: set[str] | None = None,  # по умолчанию = chat id (личный чат Ивана)
     ):
         if not token or not allowed_chat_id:
             raise ValueError("signals bot token and chat id are required")
         self._base = f"{API}/bot{token}"
         self._chat = str(allowed_chat_id)
+        self._users = {str(u) for u in (allowed_user_ids or {allowed_chat_id})}
         self._state = state
         self._http = client or httpx.Client(timeout=35)
         self._on_resolution = on_resolution
@@ -107,10 +111,12 @@ class ButtonPoller:
         cb_id = cb.get("id", "")
         msg = cb.get("message") or {}
         chat_id = str((msg.get("chat") or {}).get("id", ""))
+        from_id = str((cb.get("from") or {}).get("id", ""))
         data = cb.get("data", "")
 
-        if chat_id != self._chat:
-            logger.warning("callback from foreign chat %s ignored", chat_id)
+        # allowlist и по чату, и по нажавшему: в группе кнопку мог бы нажать любой участник
+        if chat_id != self._chat or from_id not in self._users:
+            logger.warning("callback from foreign chat/user %s/%s ignored", chat_id, from_id)
             return  # без answer — чужим не отвечаем
 
         parts = data.split(":", 2)
@@ -138,18 +144,29 @@ class ButtonPoller:
             return
 
         answer = VERB_ANSWERS[verb]
+        if verb in EXECUTING_VERBS and self._on_resolution is None:
+            # исполнитель не подключен (нет ключей биржи): «Беру по рынку» было бы ложью
+            answer = "исполнение выключено (нет ключей биржи) — approve записан, ордер НЕ поставлен"
+            logger.warning("button %s %s: executor not wired, approve only", verb, decision_id)
         # market/limit: одно нажатие ставит вход + SL + TP
         if verb in EXECUTING_VERBS and self._on_resolution is not None:
             try:
                 result = self._on_resolution(decision_id, EXECUTING_VERBS[verb])
                 if result is not None:
                     answer = result.message if result.ok else f"не исполнено: {result.message}"
-                    if not result.ok:  # откат решения: карточка остается живой
-                        self._state.journal.execute(
-                            "UPDATE pending_approvals SET resolution=NULL, resolved_at=NULL "
-                            "WHERE decision_id=?", (decision_id,),
-                        )
-                        self._state.journal.commit()
+                    if not result.ok and getattr(result, "entry_sent", False):
+                        # вход УЖЕ на бирже: решение остается approved, карточка закрывается
+                        # с предупреждением — повторное нажатие дало бы вторую позицию (класс v1)
+                        self._answer(cb_id, answer)
+                        self._finalize_card(msg, answer)
+                        logger.critical("execution degraded for %s: %s", decision_id, result.message)
+                        return
+                    if not result.ok:  # до биржи ничего не дошло: откат, карточка живая
+                        with transaction(self._state.journal):
+                            self._state.journal.execute(
+                                "UPDATE pending_approvals SET resolution=NULL, resolved_at=NULL "
+                                "WHERE decision_id=?", (decision_id,),
+                            )
                         self._answer(cb_id, answer)
                         logger.error("execution failed for %s: %s", decision_id, result.message)
                         return
@@ -177,11 +194,13 @@ class ButtonPoller:
         """Убрать кнопки и дописать статус в подпись карточки."""
         try:
             message_id = msg.get("message_id")
+            # Telegram возвращает подпись уже БЕЗ разметки: перед повторной отправкой
+            # в parse_mode=HTML экранируем и ее, и статус (текст биржи/модели — не разметка)
             caption = msg.get("caption") or msg.get("text") or ""
             body = {
                 "chat_id": self._chat,
                 "message_id": message_id,
-                "caption": f"{caption}\n\n<b>{status}</b>",
+                "caption": f"{html.escape(caption)}\n\n<b>{html.escape(status[:300])}</b>",
                 "parse_mode": "HTML",
             }
             endpoint = "editMessageCaption" if msg.get("caption") is not None else "editMessageText"

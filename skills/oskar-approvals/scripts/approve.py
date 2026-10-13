@@ -1,10 +1,24 @@
 """Доставка решения Ивана демону oskard. Только stdlib."""
 
+import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 BASE = "http://127.0.0.1:8321"
+
+
+def api_token() -> str:
+    """Токен демона: env OSKAR_API_TOKEN или data/oskard.token (пишет oskard при старте)."""
+    tok = os.getenv("OSKAR_API_TOKEN", "")
+    if tok:
+        return tok
+    path = Path(__file__).resolve().parents[3] / "data" / "oskard.token"
+    try:
+        return path.read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
 
 
 def main() -> int:
@@ -13,7 +27,8 @@ def main() -> int:
         return 2
     action, decision_id = sys.argv[1], sys.argv[2]
     req = urllib.request.Request(
-        f"{BASE}/decisions/{decision_id}/{action}", method="POST", data=b""
+        f"{BASE}/decisions/{decision_id}/{action}", method="POST", data=b"",
+        headers={"X-Oskar-Token": api_token()},
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:

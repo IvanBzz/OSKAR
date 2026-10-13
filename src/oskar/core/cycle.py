@@ -23,6 +23,7 @@ from oskar.detect.smc import DEFAULT_CONFIG, SmcConfig, analyze
 from oskar.risk.ladder import Caps, ProfileLimits, RiskInput, evaluate
 
 SHADOW_CONFIDENCE = 68  # фиксированная confidence shadow-режима (в границах [60..75])
+EXPIRED_FLAT_BARS = 48  # counterfactual без исхода за 48 баров (12ч на 15м) -> expired_flat
 
 
 def _iso_to_ms(iso: str) -> float:
@@ -129,8 +130,12 @@ class ShadowCycle:
         df = self._cache.get(symbol, cfg.signal_timeframe, cfg.candles_limit)
         snapshot = analyze(df, cfg.smc)
 
+        # Ключ бара — таймстамп открытия: bar_index скользящего окна всегда 299
+        # (кулдаун «299-299<2» не истекал никогда, id решений совпадали)
+        bar_ts = int(df["ts"].iloc[-1])
+        bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 0
         if symbol in self._last_bar:
-            if snapshot.bar_index - self._last_bar[symbol] < cfg.cooldown_bars:
+            if bar_ts - self._last_bar[symbol] < cfg.cooldown_bars * bar_ms:
                 return
 
         per_tf: dict[str, IndicatorSet] = {cfg.signal_timeframe: compute(df)}
@@ -146,11 +151,13 @@ class ShadowCycle:
         if opp.score < cfg.min_score:
             return
 
-        candidate = build_candidate(symbol, cfg.signal_timeframe, snapshot, ind, opp, mtf)
+        candidate = build_candidate(
+            symbol, cfg.signal_timeframe, snapshot, ind, opp, mtf, bar_ts=bar_ts
+        )
         if candidate is None:
             return
         report.candidates += 1
-        self._last_bar[symbol] = snapshot.bar_index
+        self._last_bar[symbol] = bar_ts
 
         verdict, entry, sl, tp = best_passing_combo(
             candidate, self._caps, self._profile,
@@ -210,8 +217,19 @@ class ShadowCycle:
             return
         j.commit()
 
+    def unresolved_symbols(self) -> list[str]:
+        """Символы с висящими counterfactuals — дорешивать надо их, а не вотчлист
+        (символ выпал из топа -> исход не записывался никогда; 32/82 висели с августа)."""
+        rows = self._state.journal.execute(
+            "SELECT DISTINCT json_extract(candidate_json, '$.symbol') AS symbol "
+            "FROM counterfactuals WHERE hypothetical_outcome IS NULL"
+        ).fetchall()
+        return sorted(r["symbol"] for r in rows if r["symbol"])
+
     def resolve_counterfactuals(self, symbol: str) -> int:
-        """Дорешивает висящие counterfactuals символа по свежим закрытым свечам."""
+        """Дорешивает висящие counterfactuals символа по свежим закрытым свечам.
+
+        Ни SL, ни TP за EXPIRED_FLAT_BARS баров -> expired_flat (сетап протух)."""
         j = self._state.journal
         rows = j.execute(
             "SELECT id, decision_id, candidate_json, entry_price, sl_price, tp_price "
@@ -226,12 +244,26 @@ class ShadowCycle:
             if cand["symbol"] != symbol:
                 continue
             direction = cand["direction"]
-            # только бары, ОТКРЫВШИЕСЯ ПОСЛЕ создания кандидата (анти-look-ahead)
+            # только бары, ОТКРЫВШИЕСЯ ПОСЛЕ создания кандидата (анти-look-ahead) и
+            # в пределах горизонта: старые уровни против сегодняшних цен — не исход
             created_ms = _iso_to_ms(cand["ts"])
-            future = df[df["ts"] > created_ms]
+            bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 900_000
+            horizon_ms = created_ms + EXPIRED_FLAT_BARS * bar_ms
+            future = df[(df["ts"] > created_ms) & (df["ts"] <= horizon_ms)]
+            # лимитный вход сначала должен быть ДОСТИГНУТ: иначе TP засчитывался
+            # сетапу, в который никто бы не вошел (Codex 2026-10-13: limit 90, бар 98-106 -> tp_hit)
+            market_px = next(
+                (o["price"] for o in cand.get("entry_options", []) if o.get("kind") == "market"), None
+            )
+            entered = market_px is None or abs(float(r["entry_price"]) - float(market_px)) < 1e-12
             outcome = None
             for i in range(len(future)):
                 hi, lo = float(future["high"].iloc[i]), float(future["low"].iloc[i])
+                if not entered:
+                    touched = lo <= r["entry_price"] if direction == "long" else hi >= r["entry_price"]
+                    if not touched:
+                        continue
+                    entered = True
                 if direction == "long":
                     sl_hit, tp_hit = lo <= r["sl_price"], hi >= r["tp_price"]
                 else:
@@ -242,6 +274,8 @@ class ShadowCycle:
                 if tp_hit:
                     outcome = "tp_hit"
                     break
+            if outcome is None and int(df["ts"].iloc[-1]) >= horizon_ms:
+                outcome = "expired_flat"  # горизонт прошел без касания SL/TP (или без данных)
             if outcome is not None:
                 j.execute(
                     "UPDATE counterfactuals SET hypothetical_outcome=?, "

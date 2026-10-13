@@ -10,6 +10,7 @@
 ccxt-объект инжектится; тесты проверяют построение параметров на фейке.
 """
 
+import math
 from typing import Any
 
 from oskar.data.symbols import canonical
@@ -62,14 +63,22 @@ class BingXAdapter(ExchangeAdapter):
 
     # ------------------------------------------------------------ contract
 
+    def _ensure_markets(self) -> None:
+        # свежий ccxt без load_markets падает на amount_to_precision («markets not
+        # loaded») — первое же нажатие кнопки умирало бы (поймано ревью Codex 2026-10-13)
+        if not getattr(self._ex, "markets", None) and hasattr(self._ex, "load_markets"):
+            self._ex.load_markets()
+
     def normalize_qty(self, symbol: str, qty: float) -> float:
+        self._ensure_markets()
         sym = canonical(symbol)
         return float(self._ex.amount_to_precision(sym, qty))
 
     def set_leverage(self, symbol: str, leverage: float, side: Side) -> None:
-        self._ex.set_leverage(
-            leverage, canonical(symbol), params={"side": _POSITION_SIDE[side]}
-        )
+        # BingX принимает целое плечо; лестница дает дробное (4.4x) — округляем
+        # ВНИЗ (меньше плечо = больше маржа = безопаснее), минимум 1x
+        lev = max(1, int(math.floor(leverage)))
+        self._ex.set_leverage(lev, canonical(symbol), params={"side": _POSITION_SIDE[side]})
 
     def place_entry(
         self,
@@ -107,6 +116,13 @@ class BingXAdapter(ExchangeAdapter):
     ) -> PlacedOrder:
         if stop_price <= 0:
             raise ValueError("stop_price must be positive")
+        sym = canonical(symbol)
+        # stopPrice в params уходит мимо price_to_precision ccxt (extend перетирает
+        # округленное значение сырым float) -> отказ по тик-сайзу -> вход без защиты.
+        # Округляем сами (Claudexor deep-scan 2026-10-13).
+        if hasattr(self._ex, "price_to_precision"):
+            self._ensure_markets()
+            stop_price = float(self._ex.price_to_precision(sym, stop_price))
         params = self._guard_params({
             "positionSide": _POSITION_SIDE[side],
             "stopPrice": stop_price,
@@ -229,7 +245,7 @@ class BingXAdapter(ExchangeAdapter):
 
     def cancel_order(self, symbol: str, exchange_id: str) -> bool:
         if not exchange_id:
-            return True
+            return False  # нечего отменять по пустому id — это НЕ успех (иначе снимали защиту «после отмены»)
         try:
             self._ex.cancel_order(exchange_id, canonical(symbol))
         except Exception as e:  # noqa: BLE001 - «уже нет» = цель достигнута

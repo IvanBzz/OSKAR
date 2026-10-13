@@ -41,6 +41,7 @@ def build_candidate(
     ind: IndicatorSet,
     opp: Opportunity,
     mtf_trend: str,
+    bar_ts: int | None = None,  # ms открытия последней закрытой свечи — ключ id
 ) -> SetupCandidate | None:
     """None, если структур не хватает на осмысленное меню (нет SL-якоря)."""
     price = ind.close
@@ -132,8 +133,13 @@ def build_candidate(
     )
 
     setup_type = _setup_type(fvg, ob, swept)
+    # Ключ бара: таймстамп открытия, если дан. bar_index в скользящем окне
+    # фиксированной длины ВСЕГДА 299 -> все кандидаты символа/направления
+    # получали один id (INSERT OR IGNORE молча терял решения, кулдаун не
+    # истекал никогда; поймано ревью 2026-10-13: 82/82 решений с «-299-»).
+    bar_key = snapshot.bar_index if bar_ts is None else bar_ts
     return SetupCandidate(
-        id=f"{symbol.replace('/', '').replace(':', '')}-{snapshot.bar_index}-{direction}",
+        id=f"{symbol.replace('/', '').replace(':', '')}-{bar_key}-{direction}",
         ts=datetime.now(UTC),
         symbol=symbol,
         direction=direction,

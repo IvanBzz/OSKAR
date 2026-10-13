@@ -1,9 +1,11 @@
 """Управление oskard через локальный API. Только stdlib — venv-независим."""
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 BASE = "http://127.0.0.1:8321"
 COMMANDS = {
@@ -12,7 +14,20 @@ COMMANDS = {
     "pause": ("POST", "/pause"),
     "resume": ("POST", "/resume"),
     "panic": ("POST", "/panic"),
+    "panic-reset": ("POST", "/panic/reset"),
 }
+
+
+def api_token() -> str:
+    """Токен демона: env OSKAR_API_TOKEN или data/oskard.token (пишет oskard при старте)."""
+    tok = os.getenv("OSKAR_API_TOKEN", "")
+    if tok:
+        return tok
+    path = Path(__file__).resolve().parents[3] / "data" / "oskard.token"
+    try:
+        return path.read_text(encoding="ascii").strip()
+    except OSError:
+        return ""
 
 
 def main() -> int:
@@ -20,7 +35,7 @@ def main() -> int:
         print(f"usage: oskarctl.py [{'|'.join(COMMANDS)}]")
         return 2
     method, path = COMMANDS[sys.argv[1]]
-    req = urllib.request.Request(BASE + path, method=method)
+    req = urllib.request.Request(BASE + path, method=method, headers={"X-Oskar-Token": api_token()})
     if method == "POST":
         req.data = b""
     try:

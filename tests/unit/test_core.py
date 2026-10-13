@@ -85,7 +85,8 @@ def test_pause_blocks_approvals(client, state):
 
 def test_panic_and_no_auto_resume(client, state):
     r = client.post("/panic").json()
-    assert r == {"panic": True, "safe_mode": True, "paused": True}
+    assert r["panic"] and r["safe_mode"] and r["paused"]
+    assert r["exchange"] is None  # монитора в этом тесте нет — биржа не трогалась
     # после panic /resume отказывает — только ручной сброс оператором (ст. 6.3)
     assert client.post("/resume").status_code == 423
 

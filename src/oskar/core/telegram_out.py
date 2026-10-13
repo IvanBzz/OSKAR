@@ -9,6 +9,7 @@
 127.0.0.1:8321/decisions/{id}/....
 """
 
+import html
 import io
 from dataclasses import dataclass
 from typing import Any
@@ -66,7 +67,7 @@ class TelegramSender:
         scout_verdict=None,
         plan=None,
     ) -> SentMessage:
-        text = render_card_text(candidate, verdict, ttl_minutes, scout_verdict)
+        text = render_card_text(candidate, verdict, ttl_minutes, scout_verdict, plan)
         keyboard = {"inline_keyboard": build_keyboard(candidate.id, plan)}
         if chart_png is not None:
             r = self._http.post(
@@ -128,11 +129,22 @@ def build_keyboard(decision_id: str, plan=None) -> list[list[dict]]:
     return rows
 
 
+def _card_levels(candidate: SetupCandidate, plan=None) -> tuple[float, float, float]:
+    """Цены карточки — из ИСПОЛНЯЕМОГО плана, если он есть: Trader мог выбрать
+    не первые SL/TP из меню, а оператор должен видеть то, что реально уйдет на
+    биржу (ревью Codex 2026-10-13). Без плана — первые опции кандидата."""
+    if plan is not None:
+        return float(plan.entry_market), float(plan.sl), float(plan.tp)
+    entry = next(o for o in candidate.entry_options if o.kind == "market")
+    return entry.price, candidate.sl_options[0].price, candidate.tp_options[0].price
+
+
 def render_card_text(
     candidate: SetupCandidate,
     verdict: RiskVerdict,
     ttl_minutes: int,
     scout_verdict=None,
+    plan=None,
 ) -> str:
     """Карточка-выжимка (фидбек Ивана): решение за 5 секунд с телефона.
 
@@ -142,14 +154,12 @@ def render_card_text(
     c = verdict.computed
     arrow = "🔻" if candidate.direction == "short" else "🔺"
     direction = "SHORT" if candidate.direction == "short" else "LONG"
-    entry = next(o for o in candidate.entry_options if o.kind == "market")
-    sl = candidate.sl_options[0]
-    tp = candidate.tp_options[0]
-    sl_pct = abs(sl.price - entry.price) / entry.price * 100
+    entry_px, sl_px, tp_px = _card_levels(candidate, plan)
+    sl_pct = abs(sl_px - entry_px) / entry_px * 100
 
     lines = [
-        f"{arrow} <b>{to_display(candidate.symbol)} {direction}</b> · {candidate.timeframe}",
-        f"вход {entry.price:.6g} → стоп {sl.price:.6g} ({sl_pct:.1f}%) → цель {tp.price:.6g}",
+        f"{arrow} <b>{html.escape(to_display(candidate.symbol))} {direction}</b> · {candidate.timeframe}",
+        f"вход {entry_px:.6g} → стоп {sl_px:.6g} ({sl_pct:.1f}%) → цель {tp_px:.6g}",
     ]
     stats = []
     if c is not None:
@@ -164,12 +174,12 @@ def render_card_text(
     if scout_verdict is not None:
         tldr = getattr(scout_verdict, "tldr", "") or _clip(scout_verdict.bull_case, 140)
         lines.append("")
-        lines.append(_clip(tldr, 160))
+        lines.append(html.escape(_clip(tldr, 160)))  # текст модели в parse_mode=HTML — только экранированный
     return "\n".join(lines)
 
 
-def render_chart(df, candidate: SetupCandidate) -> bytes:
-    """PNG: свечи + зоны FVG/OB + линии entry/SL/TP (mplfinance)."""
+def render_chart(df, candidate: SetupCandidate, plan=None) -> bytes:
+    """PNG: свечи + зоны FVG/OB + линии entry/SL/TP (mplfinance) — уровни плана."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -181,9 +191,7 @@ def render_chart(df, candidate: SetupCandidate) -> bytes:
     plot_df = plot_df[["open", "high", "low", "close", "volume"]]
     plot_df.columns = ["Open", "High", "Low", "Close", "Volume"]
 
-    entry = next(o for o in candidate.entry_options if o.kind == "market").price
-    sl = candidate.sl_options[0].price
-    tp = candidate.tp_options[0].price
+    entry, sl, tp = _card_levels(candidate, plan)
 
     hlines = dict(
         hlines=[entry, sl, tp],

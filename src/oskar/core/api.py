@@ -3,22 +3,44 @@
 Панель для Hermes-скиллов (oskar-control, oskar-approvals) и CLI. Никакой
 торговой логики здесь: approve/reject меняют pending_approvals; исполнение
 подхватывает цикл (Фаза 2). Истекший TTL необратим — fail-closed.
+
+Защита (ревью 2026-10-13): loopback не защищает от страницы в браузере на той
+же машине — POST без preflight мог снять паузу или нажать panic/approve.
+С api_token каждый запрос обязан нести X-Oskar-Token, Host ограничен
+loopback-именами, автодокументация выключена.
 """
 
+import secrets
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from oskar import __version__
 from oskar.core.state import RuntimeState
+
+PANIC_META_KEY = "panic_engaged"
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def build_app(state: RuntimeState, shadow=None, monitor=None) -> FastAPI:
-    app = FastAPI(title="oskard", version=__version__)
+def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | None = None) -> FastAPI:
+    hardened = bool(api_token)
+
+    def require_token(x_oskar_token: str = Header(default="")):
+        if hardened and not secrets.compare_digest(x_oskar_token, api_token):
+            raise HTTPException(401, "missing or invalid X-Oskar-Token")
+
+    app = FastAPI(
+        title="oskard", version=__version__,
+        dependencies=[Depends(require_token)],
+        docs_url=None if hardened else "/docs",
+        redoc_url=None, openapi_url=None if hardened else "/openapi.json",
+    )
+    if hardened:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
 
     @app.get("/status")
     def status():
@@ -34,6 +56,7 @@ def build_app(state: RuntimeState, shadow=None, monitor=None) -> FastAPI:
             "version": __version__,
             "paused": state.paused,
             "safe_mode": state.safe_mode,
+            "panic_at": state.panic_at,
             "uptime_sec": state.uptime_sec,
             "pending_approvals": open_pending,
             "decisions_total": decisions,
@@ -108,7 +131,36 @@ def build_app(state: RuntimeState, shadow=None, monitor=None) -> FastAPI:
 
     @app.post("/panic")
     def panic():
-        state.panic()  # ст. 6: ничто не смеет задержать
-        return {"panic": True, "safe_mode": True, "paused": True}
+        state.panic()  # ст. 6: флаги ПЕРВЫМИ, ничто не смеет задержать
+        result = {"panic": True, "safe_mode": True, "paused": True, "exchange": None}
+        try:  # флаг переживает рестарт — восстановление только явной командой
+            state.journal.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (PANIC_META_KEY, _now_iso())
+            )
+            state.journal.commit()
+        except Exception as e:  # noqa: BLE001 - флаги уже стоят
+            result["persist_error"] = str(e)
+        if monitor is not None:
+            try:
+                result["exchange"] = monitor.panic_flatten()  # отмена ордеров + закрытие позиций
+            except Exception as e:  # noqa: BLE001 - биржа недоступна: оператор видит это в ответе
+                result["exchange"] = {"error": str(e)}
+        return result
+
+    @app.post("/panic/reset")
+    def panic_reset():
+        """Ст. 6 п. 3: только явной командой оператора. Снимает panic и safe_mode,
+        пауза остается — resume отдельным решением."""
+        state.panic_at = None
+        state.safe_mode = False
+        state.journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_META_KEY,))
+        state.journal.commit()
+        return {"panic": False, "safe_mode": False, "paused": state.paused}
 
     return app
+
+
+def panic_engaged(journal) -> str | None:
+    """Момент последнего panic, если он не был сброшен оператором (переживает рестарт)."""
+    row = journal.execute("SELECT value FROM meta WHERE key = ?", (PANIC_META_KEY,)).fetchone()
+    return row[0] if row else None

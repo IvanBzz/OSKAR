@@ -114,7 +114,11 @@ def _cmd_sync(args) -> int:
     if not key or not secret:
         print("ERROR: BINGX_API_KEY / BINGX_API_SECRET not set (see .env.example)")
         return 1
-    view = make_bingx_view(key, secret, sandbox=True)
+    from oskar.core.bootstrap import load_settings
+
+    # та же среда, что у демона (settings.exchange.sandbox), а не зашитый VST
+    sandbox = bool(load_settings().get("exchange", {}).get("sandbox", True))
+    view = make_bingx_view(key, secret, sandbox=sandbox)
 
     if args.sync_command == "balance":
         b = snapshot_balance(view)

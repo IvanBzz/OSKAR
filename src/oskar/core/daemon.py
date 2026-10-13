@@ -38,9 +38,53 @@ def check_port_free(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
         s.close()
 
 
+def acquire_instance_lock(path: Path):
+    """Файловый замок на ВСЁ время жизни процесса (пробный бинд порта оставлял
+    окно гонки: сокет закрыт, потоки стартуют, uvicorn биндится позже).
+    Возвращает открытый дескриптор — держать до выхода."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a+")  # noqa: SIM115 - живет до конца процесса
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        fh.close()
+        raise SingleInstanceError(
+            f"lock {path} is held - another oskard instance is running. "
+            "NEVER run two instances on one account (v1 lesson: doubled ADA position)."
+        ) from e
+    return fh
+
+
+def live_trades_in(db_path: Path) -> int:
+    """Сколько open/pending сделок в журнале на диске (read-only; 0, если таблицы нет)."""
+    import sqlite3
+
+    if not db_path.exists():
+        return 0
+    try:
+        conn = sqlite3.connect(f"file:{db_path.as_posix()}?mode=ro", uri=True)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE status IN ('open','pending')"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
 def _connect_journal():
-    """Журнал; при несовпадении версии схемы — архив старого и чистый старт
-    (допустимо ТОЛЬКО в shadow-фазе: реальных сделок в базе нет)."""
+    """Журнал; при несовпадении версии схемы — архив старого и чистый старт.
+    Допустимо ТОЛЬКО без живых сделок: с open/pending в базе отказываемся
+    стартовать (иначе теряются order id и управление позициями). None = отказ."""
     from oskar.journal.archive import archive_journal
     from oskar.journal.db import connect
 
@@ -48,11 +92,16 @@ def _connect_journal():
     try:
         return connect(db_path)
     except RuntimeError as e:
+        live = live_trades_in(db_path)
+        if live:
+            print(f"REFUSING TO START: journal schema mismatch ({e}) with {live} live trade(s) "
+                  "- migrate the journal, do not wipe it", flush=True)
+            return None
         snap = archive_journal(db_path)
         for suffix in ("", "-wal", "-shm"):
             p = db_path.parent / (db_path.name + suffix)
             p.unlink(missing_ok=True)
-        print(f"journal schema mismatch ({e}); old journal archived to {snap}")
+        print(f"journal schema mismatch ({e}); old journal archived to {snap}", flush=True)
         return connect(db_path)
 
 
@@ -107,27 +156,40 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
             png = None
             try:
                 df = cache.get(candidate.symbol, candidate.timeframe, 200)
-                png = render_chart(df, candidate)
+                png = render_chart(df, candidate, plan)
             except Exception:  # noqa: BLE001 - карточка без графика лучше отсутствия
                 pass
+            sent = sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan)
+            if not sent.ok:
+                return False  # эскалатор увидит отказ Telegram, а не промолчит
             # message_id -> pending_approvals: монитор снимет кнопки по истечении TTL
-            return sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan).message_id
+            return sent.message_id
     else:
         print("escalation cards OFF: telegram not configured")
 
     from oskar.core.bootstrap import load_caps
+    from oskar.core.escalation import open_positions_from_journal
 
     return Escalator(
         state, load_caps(), profile_settings.limits,
         scout_fn=scout_fn, trader_fn=trader_fn, resolve_fn=resolve_prices,
         approval_ttl_seconds=profile_settings.approval_ttl_seconds,
         card_sink=card_sink,
+        # портфель для лестницы: без него max_open_positions/total_risk/дубли
+        # не срабатывали никогда (ревью 2026-10-13)
+        open_positions_fn=lambda: open_positions_from_journal(state.journal),
         equity_fn=lambda: runner.equity_usd,
     )
 
 
-def _make_executor(state, settings):
-    """Исполнитель по кнопке. Режим из settings.mode: paper -> VST sandbox."""
+def _sandbox(settings) -> bool:
+    return bool(settings.get("exchange", {}).get("sandbox", True))
+
+
+def _make_executor(state, settings, caps, client):
+    """Исполнитель по кнопке. Среда (VST/реал) — из settings.exchange.sandbox,
+    та же, что у equity и монитора. Цена для проверки «план не устарел» — с
+    публичного тикера; лимит позиций — из капсов."""
     import os
 
     from dotenv import load_dotenv
@@ -136,13 +198,19 @@ def _make_executor(state, settings):
     key, secret = os.getenv("BINGX_API_KEY", ""), os.getenv("BINGX_API_SECRET", "")
     if not key or not secret:
         return None
-    sandbox = bool(settings.get("exchange", {}).get("sandbox", True))
     from oskar.core.executor import ExecutionService
     from oskar.data.client import make_bingx_exchange
     from oskar.execution.bingx import BingXAdapter
 
-    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=sandbox))
-    return ExecutionService(adapter, state.journal, state.run_id)
+    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=_sandbox(settings)))
+    try:
+        adapter._ensure_markets()  # первое нажатие не должно ждать load_markets
+    except Exception as e:  # noqa: BLE001 - подгрузится при первом ордере
+        print(f"WARNING: markets preload failed: {e}", flush=True)
+    return ExecutionService(
+        adapter, state.journal, state.run_id,
+        price_fn=client.last_price, max_open_positions=caps.max_open_positions,
+    )
 
 
 def _make_monitor(state, settings, profile, token: str, chat_id: str):
@@ -156,12 +224,11 @@ def _make_monitor(state, settings, profile, token: str, chat_id: str):
     key, secret = os.getenv("BINGX_API_KEY", ""), os.getenv("BINGX_API_SECRET", "")
     if not key or not secret:
         return None
-    sandbox = bool(settings.get("exchange", {}).get("sandbox", True))
     from oskar.core.position_monitor import PositionMonitor
     from oskar.data.client import make_bingx_exchange
     from oskar.execution.bingx import BingXAdapter
 
-    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=sandbox))
+    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=_sandbox(settings)))
     notify = on_expired = None
     if token and chat_id:
         from oskar.core.telegram_out import TelegramSender
@@ -177,12 +244,14 @@ def _make_monitor(state, settings, profile, token: str, chat_id: str):
         adapter, state.journal,
         max_loss_hold_seconds=profile.max_loss_hold_seconds,
         limit_entry_ttl_seconds=profile.limit_entry_ttl_seconds,
-        notify=notify, on_card_expired=on_expired,
+        notify=notify, on_card_expired=on_expired, state=state,
     )
 
 
-def _make_equity_fn():
-    """Equity с биржи (VST) при наличии ключей; None-фоллбек внутри runner'а."""
+def _make_equity_fn(settings):
+    """Equity с биржи при наличии ключей; None-фоллбек внутри runner'а.
+    Среда — та же, что у исполнения (раньше sandbox был зашит True: реальные
+    ордера размером от VST-баланса)."""
     import os
 
     from dotenv import load_dotenv
@@ -193,7 +262,7 @@ def _make_equity_fn():
         return None
     from oskar.sync.exchange_sync import make_bingx_view, snapshot_balance
 
-    view = make_bingx_view(key, secret, sandbox=True)
+    view = make_bingx_view(key, secret, sandbox=_sandbox(settings))
 
     def equity() -> float | None:
         try:
@@ -235,22 +304,54 @@ def main() -> int:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     if not verify_caps():
-        print("REFUSING TO START: caps.yaml does not match CONSTITUTION.md pin (Art. 4)")
+        print("REFUSING TO START: caps.yaml does not match CONSTITUTION.md pin (Art. 4)", flush=True)
         return 2
     try:
+        lock = acquire_instance_lock(REPO_ROOT / "data" / "oskard.lock")  # noqa: F841 - держим до выхода
         check_port_free()
     except SingleInstanceError as e:
-        print(f"REFUSING TO START: {e}")
+        print(f"REFUSING TO START: {e}", flush=True)
         return 3
-
-    journal = _connect_journal()
-    state = RuntimeState(journal=journal)
 
     caps = load_caps()
     profile = load_active_profile()
     settings = load_settings()
     scanner = load_scanner_settings(settings)
     cycle_cfg = build_cycle_config(profile, scanner, settings)
+
+    # одна среда для исполнения, equity и монитора; реал закрыт гейтом Фазы 5
+    mode = str(settings.get("mode", "paper"))
+    if mode == "live":
+        print("REFUSING TO START: mode=live is gated until Phase 5 (PF>=1.3 over 60 trades)", flush=True)
+        return 6
+    if mode == "paper" and not _sandbox(settings):
+        print("REFUSING TO START: mode=paper but exchange.sandbox=false (real orders from a paper run)",
+              flush=True)
+        return 6
+
+    journal = _connect_journal()
+    if journal is None:
+        return 5
+    state = RuntimeState(journal=journal)
+
+    import os
+    import secrets
+
+    from oskar.core.api import panic_engaged
+
+    signals_token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    alert = None
+    alert_token = signals_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+    if alert_token and chat_id:
+        from oskar.core.telegram_out import TelegramSender
+
+        alert = TelegramSender(alert_token, chat_id).send_text
+
+    engaged = panic_engaged(journal)
+    if engaged:
+        state.panic()  # ст. 6 п. 3: после рестарта panic держится до явного сброса
+        print(f"PANIC ENGAGED since {engaged}: trading blocked until POST /panic/reset", flush=True)
 
     client = MarketDataClient(make_bingx_public_exchange())
     cache = CandleCache(client)
@@ -260,46 +361,55 @@ def main() -> int:
         top_n=scanner.full_analysis_top,
         min_quote_volume=scanner.min_hourly_quote_volume_usd,
         tick_seconds=float(profile.scan_interval_seconds),
-        equity_fn=_make_equity_fn(),
+        equity_fn=_make_equity_fn(settings),
+        notify=alert,
     )
     cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache)
     runner.start_thread()
 
-    import os
-
-    signals_token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    poller = None
     if signals_token and chat_id:
         from oskar.core.telegram_buttons import ButtonPoller
 
-        executor = _make_executor(state, settings)
+        executor = _make_executor(state, settings, caps, client)
         on_resolution = None
         if executor is not None:
             from oskar.core.executor import equity_guarded
 
-            on_resolution = equity_guarded(executor.execute, lambda: runner.equity_source)
+            on_resolution = equity_guarded(
+                executor.execute, lambda: runner.equity_source,
+                equity_fn=lambda: runner.equity_usd, plan_fn=executor.plan_for,
+                risk_cap_pct=caps.risk_per_trade_pct,
+            )
         poller = ButtonPoller(signals_token, chat_id, state, on_resolution=on_resolution)
         poller.start_thread()
         print(f"button poller: ON (signals bot), execution: "
-              f"{'ON' if executor is not None else 'OFF (no keys)'}")
+              f"{'ON' if executor is not None else 'OFF (no keys)'}", flush=True)
 
-    monitor = _make_monitor(
-        state, settings, profile, signals_token or os.getenv("TELEGRAM_BOT_TOKEN", ""), chat_id
-    )
+    monitor = _make_monitor(state, settings, profile, alert_token, chat_id)
     if monitor is not None:
         monitor.start_thread()
-    print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}")
+    print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}", flush=True)
 
-    app = build_app(state, shadow=runner, monitor=monitor)
+    # токен API: страница в браузере на этой же машине не должна жать panic/approve
+    api_token = os.getenv("OSKAR_API_TOKEN", "") or secrets.token_hex(16)
+    token_path = REPO_ROOT / "data" / "oskard.token"
+    token_path.write_text(api_token, encoding="ascii")  # читают Hermes-скиллы и CLI
+    app = build_app(state, shadow=runner, monitor=monitor, api_token=api_token)
     print(
         f"oskard starting: run_id={state.run_id} profile={profile.name} "
-        f"mode=shadow api=http://{DEFAULT_HOST}:{DEFAULT_PORT}"
+        f"mode={mode} sandbox={_sandbox(settings)} api=http://{DEFAULT_HOST}:{DEFAULT_PORT} "
+        f"(token in {token_path.name})", flush=True,
     )
 
     import uvicorn
 
     uvicorn.run(app, host=DEFAULT_HOST, port=DEFAULT_PORT, log_level="warning")
     runner.stop()
+    if poller is not None:
+        poller.stop()
+    if monitor is not None:
+        monitor.stop()
     return 0
 
 

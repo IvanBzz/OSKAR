@@ -75,12 +75,13 @@ class FakeBotApi(httpx.BaseTransport):
         return httpx.Response(200, json={"ok": True, "result": {}})
 
 
-def callback_update(data, chat=CHAT, update_id=100):
+def callback_update(data, chat=CHAT, update_id=100, user=None):
     return {
         "update_id": update_id,
         "callback_query": {
             "id": "cb1",
             "data": data,
+            "from": {"id": int(user if user is not None else chat)},
             "message": {"message_id": 7, "chat": {"id": int(chat)}, "caption": "карточка"},
         },
     }

@@ -14,6 +14,8 @@ client_order_id для точной реконсиляции; reconciled-фла�
 """
 
 import sqlite3
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA_VERSION = 2  # v2: исходы trader_decline/pending, cohort trader_decline
@@ -142,11 +144,32 @@ CREATE TABLE IF NOT EXISTS sync_snapshots (
 """
 
 
+WRITE_LOCK = threading.RLock()
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    """Многошаговая запись под процесс-wide замком.
+
+    Одно соединение делят 4 потока (runner, кнопки, монитор, API): без замка
+    commit() соседнего потока фиксирует половину чужой последовательности
+    (sqlite3.threadsafety=3 спасает от падений, но не от перемешанных
+    транзакций). Исключение внутри -> rollback, наружу пробрасывается.
+    """
+    with WRITE_LOCK:
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def connect(db_path: Path) -> sqlite3.Connection:
     """Открыть журнал, применить схему, проставить версию.
 
-    check_same_thread=False: демон один, но uvicorn исполняет эндпоинты в
-    worker-потоках; WAL + сериализация записей через commit достаточны.
+    check_same_thread=False: соединение общее для потоков демона; одиночные
+    вызовы сериализует сам sqlite3, многошаговые записи — transaction().
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)

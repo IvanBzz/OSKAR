@@ -37,11 +37,23 @@ def prompt_sha(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
+# Scout/Trader отвечают текстом по данным из промпта: инструменты им не нужны,
+# а унаследованный профиль прав оператора — поверхность для инъекции через
+# текст биржи/модели (ревью 2026-10-13). Запрещаем всё, что читает/пишет/ходит в сеть.
+DISALLOWED_TOOLS = (
+    "Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebFetch,WebSearch,Agent,Task"
+)
+
+
+def restricted_tool_args() -> list[str]:
+    return ["--disallowedTools", DISALLOWED_TOOLS]
+
+
 def default_cmd(model: str | None) -> list[str]:
     exe = shutil.which("claude")
     if exe is None:
         raise AgentCallError("claude CLI not found in PATH")
-    cmd = [exe, "-p", "--output-format", "json"]
+    cmd = [exe, "-p", "--output-format", "json", *restricted_tool_args()]
     if model:
         cmd += ["--model", model]
     return cmd
