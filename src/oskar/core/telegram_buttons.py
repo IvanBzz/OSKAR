@@ -31,6 +31,7 @@ VERB_ANSWERS = {
     "market": "Беру по рынку ⚡", "limit": "Лимитка выставлена ⏳",
     "approve": "Взято ✅", "reject": "Пропущено ❌", "snooze": "Отложено 💤",
 }
+NOT_OK_BACKOFF_SEC = 30.0  # пауза после ответа ok=false (401 отозванный токен, 409, 5xx)
 # Самопроверка цепочки Telegram -> поллер -> ответ: без решений, журнала и биржи.
 PING_VERB = "ping"
 PING_ANSWER = "Кнопки работают ✅"
@@ -69,6 +70,7 @@ class ButtonPoller:
         self._http = client or httpx.Client(timeout=35)
         self._on_resolution = on_resolution
         self._offset = 0
+        self.not_ok_streak = 0
         self._stop = threading.Event()
 
     # ------------------------------------------------------------------ core
@@ -85,8 +87,13 @@ class ButtonPoller:
         )
         payload = r.json()
         if not payload.get("ok"):
-            logger.warning("getUpdates not ok: %s", str(payload)[:200])
-            return 0
+            # 401 (токен отозван) / 409 / 5xx: без паузы это был tight-loop —
+            # 3 запроса за 150 мс и лог на мегабайты (поймано 2026-10-12)
+            self.not_ok_streak += 1
+            if self.not_ok_streak == 1 or self.not_ok_streak % 60 == 0:
+                logger.warning("getUpdates not ok (x%d): %s", self.not_ok_streak, str(payload)[:200])
+            return -1
+        self.not_ok_streak = 0
         handled = 0
         for upd in payload.get("result", []):
             self._offset = max(self._offset, upd["update_id"] + 1)
@@ -190,7 +197,8 @@ class ButtonPoller:
         logger.info("button poller started (signals bot)")
         while not self._stop.is_set():
             try:
-                self.poll_once()
+                if self.poll_once() < 0:
+                    self._stop.wait(NOT_OK_BACKOFF_SEC)
             except Exception as e:  # noqa: BLE001 - сеть: подождать и продолжить
                 logger.warning("poll failed: %s", e)
                 self._stop.wait(5)

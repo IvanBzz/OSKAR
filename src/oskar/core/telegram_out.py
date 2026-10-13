@@ -35,6 +35,17 @@ class TelegramSender:
         self._chat = chat_id
         self._http = client or httpx.Client(timeout=15)
 
+    def remove_buttons(self, message_id: int | str) -> bool:
+        """Снять клавиатуру с карточки (TTL истек): нажимать больше нечего."""
+        r = self._http.post(
+            f"{self._base}/editMessageReplyMarkup",
+            json={
+                "chat_id": self._chat, "message_id": int(message_id),
+                "reply_markup": {"inline_keyboard": []},
+            },
+        )
+        return bool(r.json().get("ok"))
+
     def send_text(self, text: str) -> SentMessage:
         r = self._http.post(
             f"{self._base}/sendMessage",

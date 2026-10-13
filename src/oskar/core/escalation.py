@@ -117,7 +117,13 @@ class Escalator:
         j.commit()
         if self._card_sink is not None:
             try:
-                self._card_sink(candidate, verdict, scout_verdict, plan)
+                message_id = self._card_sink(candidate, verdict, scout_verdict, plan)
+                if message_id:  # монитор снимет кнопки с карточки по истечении TTL
+                    j.execute(
+                        "UPDATE pending_approvals SET telegram_message_id=? WHERE decision_id=?",
+                        (str(message_id), candidate.id),
+                    )
+                    j.commit()
             except Exception as e:  # noqa: BLE001 - TTL fail-closed прикроет
                 logger.error("card sink failed for %s: %s", candidate.id, e)
         return EscalationResult(outcome="pending", scout_json=sj, trade_json=tj)

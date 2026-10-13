@@ -11,6 +11,7 @@ profiles:
     context_timeframes: ["4h", "1d"]     # старшие ТФ для тренда/структуры
     sl_distance_pct: [0.5, 3.0]          # допустимый диапазон стопа от входа
     max_loss_hold_seconds: 10800         # duration-stop: лосер старше 3ч закрывается (урок v1: лосеры жили 3.4x дольше)
+    limit_entry_ttl_seconds: 3600        # лимитка на уровне FVG/OB ждет 4 бара 15м, потом снимается вместе с SL/TP
     approval_ttl_seconds: 1200           # 20 минут на подтверждение карточки, потом reject
     max_leverage: 8                      # <= caps.max_leverage
     scan_interval_seconds: 30
@@ -20,6 +21,7 @@ profiles:
     context_timeframes: ["1d"]
     sl_distance_pct: [1.0, 5.0]
     max_loss_hold_seconds: 43200         # 12 часов
+    limit_entry_ttl_seconds: 14400       # 4 часа
     approval_ttl_seconds: 3600
     max_leverage: 5
     scan_interval_seconds: 120

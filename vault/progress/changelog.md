@@ -6,6 +6,24 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-10-13 — монитор позиций: журнал догоняет биржу
+
+До сих пор сделка после кнопки жила в журнале как `open/pending` навсегда: исполнение лимитки, срабатывание SL/TP, закрытие руками и протухшие карточки никто не отслеживал (в задачах висело с сентября). Теперь `core/position_monitor.py` раз в минуту сверяет журнал с биржей ПО СОСТОЯНИЮ ОРДЕРОВ (ст. 1: биржа — правда; свечи не используются):
+- **sweeper**: pending_approvals с истекшим TTL -> `expired`, с карточки снимаются кнопки (эскалатор теперь сохраняет `telegram_message_id`, `TelegramSender.remove_buttons` делает editMessageReplyMarkup);
+- **лимитный вход**: исполнился -> `open` с ценой/комиссией биржи; снят биржей или старше `limit_entry_ttl_seconds` (новый параметр профиля: 1ч intraday, 4ч swing) -> вход и SL/TP снимаются, `cancelled`, причина в decisions.outcome_detail;
+- **открытая позиция**: исполнен SL -> `closed/sl_hit` + отмена TP (и наоборот), realized_pnl по ценам исполнения минус комиссии биржи; позиции нет и защита не срабатывала -> `manual` (exit/pnl NULL — не выдумываем); **duration-stop**: лосер старше `max_loss_hold_seconds` (3ч) закрывается по рынку -> `duration_timeout`;
+- **reconcile**: позиции биржи vs open-сделки журнала (допуск 1% по qty) — расхождение в лог и в Telegram один раз на ключ.
+- Контракт `ExchangeAdapter` расширен: `order_status(exchange_id | client_order_id)` и `cancel_order` — для BingX (fetch_order; поиск по clientOrderId с фоллбеком по open/closed orders; OrderNotFound = успех) и для Paper (реестр ордеров; mark() переводит SL/TP в filled/canceled).
+- `/status` получил блок `trades` (pending/open/closed/cancelled + последний тик монитора). Уведомления — через сигнального бота: «лимит исполнен», «🛑 стоп … P&L», «⚠️ reconcile».
+
+Поллер кнопок: после отзыва токена (Иван перевыпустил его по моей рекомендации) старый демон крутил getUpdates в tight-loop — 684 строки 401 за минуты. Теперь ok=false -> пауза 30с, лог раз в 60 попыток.
+
+### Тесты
+- test_position_monitor (14): sweeper + снятие кнопок, филл лимитки, TTL лимитки со снятием защиты, снятие биржей, SL/TP с P&L (long/short), закрытие извне, duration-stop только для старых лосеров, reconcile один раз и повтор после возврата, допуск qty, устойчивость к ошибке одной сделки, /status.trades, жизненный цикл ордеров Paper, маппинг статусов BingX + фоллбек по clientOrderId + OrderNotFound. test_buttons +1 (401 backoff). Итого 241.
+
+### Затронутые файлы
+CREATE: src/oskar/core/position_monitor.py, tests/unit/test_position_monitor.py; MODIFY: src/oskar/execution/{base,bingx,paper}.py, src/oskar/core/{daemon,api,escalation,telegram_out,telegram_buttons,bootstrap}.py, config/profiles.yaml, tests/unit/test_buttons.py
+
 ## 2026-10-12 — сигнальный бот подключен; токен в логе; кнопка-самопроверка
 
 Иван переиздал ключ BingX VST и создал второго бота (@oskar_signals_bot). Ключ проверен живым балансом (121.71 VST, `equity_source=exchange` — блокировка исполнения снята). Токен бота проверен getMe/getChat (отличается от основного, чат доступен), демон перезапущен — `button poller started (signals bot)`.

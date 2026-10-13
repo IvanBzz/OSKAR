@@ -37,6 +37,27 @@ class BalanceInfo:
     used: float
 
 
+@dataclass(frozen=True)
+class OrderState:
+    """Состояние ордера ПО ДАННЫМ БИРЖИ (ст. 1): монитор позиций решает по нему,
+    а не по ценам свечей. status: open | filled | canceled | expired | rejected | unknown."""
+
+    exchange_id: str
+    status: str
+    filled_qty: float = 0.0
+    avg_price: float | None = None
+    fee: float | None = None  # комиссия в quote, если биржа отдала
+
+    @property
+    def is_filled(self) -> bool:
+        return self.status == "filled"
+
+    @property
+    def is_gone(self) -> bool:
+        """Ордера больше нет и он не исполнился."""
+        return self.status in ("canceled", "expired", "rejected")
+
+
 class ExchangeAdapter(ABC):
     """Контракт исполнения. Реализации: BingXAdapter (VST/live), PaperAdapter,
     в будущем DexAdapter/Mt5Adapter."""
@@ -84,3 +105,13 @@ class ExchangeAdapter(ABC):
 
     @abstractmethod
     def balance(self) -> BalanceInfo: ...
+
+    @abstractmethod
+    def order_status(
+        self, symbol: str, exchange_id: str = "", client_order_id: str = ""
+    ) -> OrderState:
+        """Состояние ордера по биржевому id или clientOrderId (нужен хотя бы один)."""
+
+    @abstractmethod
+    def cancel_order(self, symbol: str, exchange_id: str) -> bool:
+        """Отмена одного ордера. True = отменен или его уже нет (идемпотентно)."""

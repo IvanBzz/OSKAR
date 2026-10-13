@@ -17,7 +17,7 @@ def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def build_app(state: RuntimeState, shadow=None) -> FastAPI:
+def build_app(state: RuntimeState, shadow=None, monitor=None) -> FastAPI:
     app = FastAPI(title="oskard", version=__version__)
 
     @app.get("/status")
@@ -26,6 +26,9 @@ def build_app(state: RuntimeState, shadow=None) -> FastAPI:
             "SELECT COUNT(*) FROM pending_approvals WHERE resolution IS NULL"
         ).fetchone()[0]
         decisions = state.journal.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+        by_status = dict(state.journal.execute(
+            "SELECT status, COUNT(*) FROM trades GROUP BY status"
+        ).fetchall())
         payload = {
             "run_id": state.run_id,
             "version": __version__,
@@ -34,6 +37,16 @@ def build_app(state: RuntimeState, shadow=None) -> FastAPI:
             "uptime_sec": state.uptime_sec,
             "pending_approvals": open_pending,
             "decisions_total": decisions,
+            "trades": {
+                "pending": by_status.get("pending", 0),
+                "open": by_status.get("open", 0),
+                "closed": by_status.get("closed", 0),
+                "cancelled": by_status.get("cancelled", 0),
+                "monitor": (
+                    {"ticks": monitor.ticks, "last": monitor.last_report}
+                    if monitor is not None else None
+                ),
+            },
         }
         if shadow is not None:
             payload["shadow"] = {

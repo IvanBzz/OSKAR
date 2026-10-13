@@ -175,6 +175,24 @@ def test_ping_button_answers_without_touching_journal(tmp_path):
     assert sent["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "oskar:ping:selftest"
 
 
+def test_not_ok_response_signals_backoff(tmp_path):
+    """401 (отозванный токен) и т.п.: poll_once -> -1, стрик растет, лог не спамит.
+    Регресс 2026-10-12: tight-loop, 3 запроса за 150 мс."""
+
+    class RevokedApi(FakeBotApi):
+        def handle_request(self, request):
+            request.read()
+            self.calls.append((request.url.path.split("/")[-1], {}))
+            return httpx.Response(401, json={"ok": False, "error_code": 401, "description": "Unauthorized"})
+
+    state = RuntimeState(journal=connect(tmp_path / "j.db"))
+    fake = RevokedApi([])
+    poller = ButtonPoller("TOKEN", CHAT, state, client=httpx.Client(transport=fake))
+    assert poller.poll_once(timeout=0) == -1
+    assert poller.poll_once(timeout=0) == -1
+    assert poller.not_ok_streak == 2
+
+
 def test_offset_advances(tmp_path):
     poller, state, fake = make_poller(tmp_path, [callback_update("oskar:reject:d1", update_id=555)])
     add_pending(state.journal, "d1")

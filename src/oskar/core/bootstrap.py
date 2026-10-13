@@ -41,6 +41,8 @@ class ProfileSettings:
     context_timeframes: tuple[str, ...]
     approval_ttl_seconds: int
     scan_interval_seconds: int
+    max_loss_hold_seconds: int  # duration-stop: лосер старше — закрывается
+    limit_entry_ttl_seconds: int  # неисполненная лимитка старше — снимается
 
 
 def load_active_profile() -> ProfileSettings:
@@ -58,6 +60,8 @@ def load_active_profile() -> ProfileSettings:
         context_timeframes=tuple(p["context_timeframes"]),
         approval_ttl_seconds=int(p["approval_ttl_seconds"]),
         scan_interval_seconds=int(p["scan_interval_seconds"]),
+        max_loss_hold_seconds=int(p["max_loss_hold_seconds"]),
+        limit_entry_ttl_seconds=int(p.get("limit_entry_ttl_seconds", 3600)),
     )
 
 

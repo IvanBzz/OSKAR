@@ -16,10 +16,18 @@ from oskar.data.symbols import canonical
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OrderState,
     PlacedOrder,
     PositionInfo,
     Side,
 )
+
+# ccxt unified status -> OrderState.status
+_ORDER_STATUS = {
+    "open": "open", "closed": "filled", "filled": "filled",
+    "canceled": "canceled", "cancelled": "canceled",
+    "expired": "expired", "rejected": "rejected",
+}
 
 _POSITION_SIDE = {"long": "LONG", "short": "SHORT"}
 _ENTRY_ORDER_SIDE = {"long": "buy", "short": "sell"}
@@ -178,3 +186,54 @@ class BingXAdapter(ExchangeAdapter):
             free=float(entry.get("free") or 0.0),
             used=float(entry.get("used") or 0.0),
         )
+
+    # ------------------------------------------------------- order lifecycle
+
+    @staticmethod
+    def _order_state(raw: dict) -> OrderState:
+        status = str(raw.get("status") or "").lower()
+        fee = raw.get("fee") or {}
+        fee_cost = fee.get("cost") if isinstance(fee, dict) else None
+        avg = raw.get("average")
+        return OrderState(
+            exchange_id=str(raw.get("id") or ""),
+            status=_ORDER_STATUS.get(status, status or "unknown"),
+            filled_qty=float(raw.get("filled") or 0.0),
+            avg_price=float(avg) if avg else None,
+            fee=float(fee_cost) if fee_cost is not None else None,
+        )
+
+    def _find_by_client_id(self, sym: str, client_order_id: str) -> dict:
+        try:
+            return self._ex.fetch_order(None, sym, {"clientOrderId": client_order_id})
+        except Exception:  # noqa: BLE001 - не все версии ccxt ищут по clientOrderId
+            pass
+        for fetch in (self._ex.fetch_open_orders, self._ex.fetch_closed_orders):
+            for o in fetch(sym):
+                if str(o.get("clientOrderId") or "") == client_order_id:
+                    return o
+        raise RuntimeError(f"order {client_order_id} not found on exchange for {sym}")
+
+    def order_status(
+        self, symbol: str, exchange_id: str = "", client_order_id: str = ""
+    ) -> OrderState:
+        if not exchange_id and not client_order_id:
+            raise ValueError("order_status needs exchange_id or client_order_id")
+        sym = canonical(symbol)
+        raw = (
+            self._ex.fetch_order(exchange_id, sym)
+            if exchange_id
+            else self._find_by_client_id(sym, client_order_id)
+        )
+        return self._order_state(raw)
+
+    def cancel_order(self, symbol: str, exchange_id: str) -> bool:
+        if not exchange_id:
+            return True
+        try:
+            self._ex.cancel_order(exchange_id, canonical(symbol))
+        except Exception as e:  # noqa: BLE001 - «уже нет» = цель достигнута
+            if any(b.__name__ in ("OrderNotFound", "InvalidOrder") for b in type(e).__mro__):
+                return True
+            raise
+        return True

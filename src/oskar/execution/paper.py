@@ -4,6 +4,9 @@
 SL/TP хранятся как защитные уровни; mark(symbol, high, low) прогоняет бар и
 закрывает позицию при касании (SL первым при коллизии — консервативно, как в
 реплее). Инжектируемый price_fn — тесты управляют ценой.
+
+Ордера регистрируются по id с тем же контрактом order_status/cancel_order,
+что у биржи: монитор позиций работает с paper так же, как с BingX.
 """
 
 import itertools
@@ -13,6 +16,7 @@ from oskar.data.symbols import canonical
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OrderState,
     PlacedOrder,
     PositionInfo,
     Side,
@@ -27,6 +31,19 @@ class _PaperPosition:
     sl: float | None = None
     tp: float | None = None
     client_order_id: str = ""
+    sl_order_id: str = ""
+    tp_order_id: str = ""
+
+
+@dataclass
+class _PaperOrder:
+    symbol: str
+    side: Side
+    kind: str  # entry | sl | tp | close
+    status: str  # open | filled | canceled
+    client_order_id: str = ""
+    avg_price: float | None = None
+    qty: float = 0.0
 
 
 @dataclass
@@ -44,8 +61,24 @@ class PaperAdapter(ExchangeAdapter):
         self._balance = start_balance
         self._precision = qty_precision
         self._positions: dict[tuple[str, Side], _PaperPosition] = {}
+        self._orders: dict[str, _PaperOrder] = {}
         self._fills: list[PaperFill] = []
         self._ids = itertools.count(1)
+
+    def _register(
+        self, symbol: str, side: Side, kind: str, status: str,
+        client_order_id: str = "", price: float | None = None, qty: float = 0.0,
+    ) -> str:
+        oid = str(next(self._ids))
+        self._orders[oid] = _PaperOrder(symbol, side, kind, status, client_order_id, price, qty)
+        return oid
+
+    def _set_status(self, oid: str, status: str, price: float | None = None) -> None:
+        o = self._orders.get(oid)
+        if o is not None and o.status == "open":
+            o.status = status
+            if price is not None:
+                o.avg_price = price
 
     # ------------------------------------------------------------ contract
 
@@ -74,19 +107,24 @@ class PaperAdapter(ExchangeAdapter):
             side=side, qty=qty, entry_price=fill_price, client_order_id=client_order_id
         )
         self._fills.append(PaperFill(sym, side, qty, fill_price, "entry"))
-        return PlacedOrder(str(next(self._ids)), client_order_id, entry_type.upper(), "closed")
+        oid = self._register(sym, side, "entry", "filled", client_order_id, fill_price, qty)
+        return PlacedOrder(oid, client_order_id, entry_type.upper(), "closed")
 
     def place_sl(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
-        pos = self._positions.get((canonical(symbol), side))
+        sym = canonical(symbol)
+        oid = self._register(sym, side, "sl", "open", client_order_id, stop_price)
+        pos = self._positions.get((sym, side))
         if pos is not None:  # лимитка еще не исполнилась — условный ордер просто висит
-            pos.sl = stop_price
-        return PlacedOrder(str(next(self._ids)), client_order_id, "STOP_MARKET", "open")
+            pos.sl, pos.sl_order_id = stop_price, oid
+        return PlacedOrder(oid, client_order_id, "STOP_MARKET", "open")
 
     def place_tp(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
-        pos = self._positions.get((canonical(symbol), side))
+        sym = canonical(symbol)
+        oid = self._register(sym, side, "tp", "open", client_order_id, stop_price)
+        pos = self._positions.get((sym, side))
         if pos is not None:
-            pos.tp = stop_price
-        return PlacedOrder(str(next(self._ids)), client_order_id, "TAKE_PROFIT_MARKET", "open")
+            pos.tp, pos.tp_order_id = stop_price, oid
+        return PlacedOrder(oid, client_order_id, "TAKE_PROFIT_MARKET", "open")
 
     def cancel_all(self, symbol: str) -> int:
         sym = canonical(symbol)
@@ -94,8 +132,40 @@ class PaperAdapter(ExchangeAdapter):
         for key in [k for k in self._positions if k[0] == sym]:
             pos = self._positions[key]
             n += int(pos.sl is not None) + int(pos.tp is not None)
+            self._set_status(pos.sl_order_id, "canceled")
+            self._set_status(pos.tp_order_id, "canceled")
             pos.sl = pos.tp = None
         return n
+
+    def cancel_order(self, symbol: str, exchange_id: str) -> bool:
+        o = self._orders.get(exchange_id)
+        if o is None or o.status != "open":
+            return True  # нет или уже не открыт — цель достигнута
+        o.status = "canceled"
+        pos = self._positions.get((o.symbol, o.side))
+        if pos is not None:
+            if o.kind == "sl" and pos.sl_order_id == exchange_id:
+                pos.sl = None
+            if o.kind == "tp" and pos.tp_order_id == exchange_id:
+                pos.tp = None
+        return True
+
+    def order_status(
+        self, symbol: str, exchange_id: str = "", client_order_id: str = ""
+    ) -> OrderState:
+        o = self._orders.get(exchange_id) if exchange_id else None
+        if o is None and client_order_id:
+            matches = [(k, v) for k, v in self._orders.items() if v.client_order_id == client_order_id]
+            if matches:
+                exchange_id, o = matches[-1]
+        if o is None:
+            raise RuntimeError(f"paper: unknown order {exchange_id or client_order_id}")
+        filled = o.status == "filled"
+        return OrderState(
+            exchange_id=exchange_id, status=o.status,
+            filled_qty=o.qty if filled else 0.0,
+            avg_price=o.avg_price if filled else None,
+        )
 
     def close_position(self, symbol: str, side: Side) -> PlacedOrder | None:
         sym = canonical(symbol)
@@ -104,7 +174,10 @@ class PaperAdapter(ExchangeAdapter):
             return None
         price = self._price(sym)
         self._settle(sym, pos, price, "manual_close")
-        return PlacedOrder(str(next(self._ids)), "", "MARKET", "closed")
+        self._set_status(pos.sl_order_id, "canceled")
+        self._set_status(pos.tp_order_id, "canceled")
+        oid = self._register(sym, side, "close", "filled", "", price, pos.qty)
+        return PlacedOrder(oid, "", "MARKET", "closed")
 
     def positions(self) -> list[PositionInfo]:
         out = []
@@ -138,8 +211,12 @@ class PaperAdapter(ExchangeAdapter):
                 tp_hit = pos.tp is not None and low <= pos.tp
             if sl_hit:
                 settled.append(self._settle(sym, self._positions.pop(key), pos.sl, "sl_hit"))
+                self._set_status(pos.sl_order_id, "filled", pos.sl)
+                self._set_status(pos.tp_order_id, "canceled")
             elif tp_hit:
                 settled.append(self._settle(sym, self._positions.pop(key), pos.tp, "tp_hit"))
+                self._set_status(pos.tp_order_id, "filled", pos.tp)
+                self._set_status(pos.sl_order_id, "canceled")
         return settled
 
     def _settle(self, sym: str, pos: _PaperPosition, price: float, reason: str) -> PaperFill:

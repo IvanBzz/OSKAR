@@ -110,7 +110,8 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
                 png = render_chart(df, candidate)
             except Exception:  # noqa: BLE001 - карточка без графика лучше отсутствия
                 pass
-            sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan)
+            # message_id -> pending_approvals: монитор снимет кнопки по истечении TTL
+            return sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan).message_id
     else:
         print("escalation cards OFF: telegram not configured")
 
@@ -142,6 +143,42 @@ def _make_executor(state, settings):
 
     adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=sandbox))
     return ExecutionService(adapter, state.journal, state.run_id)
+
+
+def _make_monitor(state, settings, profile, token: str, chat_id: str):
+    """Монитор позиций: свой ccxt-экземпляр (не делим сессию с кнопками),
+    уведомления через сигнального бота. None без ключей биржи."""
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv(REPO_ROOT / ".env")
+    key, secret = os.getenv("BINGX_API_KEY", ""), os.getenv("BINGX_API_SECRET", "")
+    if not key or not secret:
+        return None
+    sandbox = bool(settings.get("exchange", {}).get("sandbox", True))
+    from oskar.core.position_monitor import PositionMonitor
+    from oskar.data.client import make_bingx_exchange
+    from oskar.execution.bingx import BingXAdapter
+
+    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=sandbox))
+    notify = on_expired = None
+    if token and chat_id:
+        from oskar.core.telegram_out import TelegramSender
+
+        sender = TelegramSender(token, chat_id)
+        notify = sender.send_text
+
+        def on_expired(decision_id, message_id):
+            if message_id:
+                sender.remove_buttons(message_id)
+
+    return PositionMonitor(
+        adapter, state.journal,
+        max_loss_hold_seconds=profile.max_loss_hold_seconds,
+        limit_entry_ttl_seconds=profile.limit_entry_ttl_seconds,
+        notify=notify, on_card_expired=on_expired,
+    )
 
 
 def _make_equity_fn():
@@ -246,7 +283,14 @@ def main() -> int:
         print(f"button poller: ON (signals bot), execution: "
               f"{'ON' if executor is not None else 'OFF (no keys)'}")
 
-    app = build_app(state, shadow=runner)
+    monitor = _make_monitor(
+        state, settings, profile, signals_token or os.getenv("TELEGRAM_BOT_TOKEN", ""), chat_id
+    )
+    if monitor is not None:
+        monitor.start_thread()
+    print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}")
+
+    app = build_app(state, shadow=runner, monitor=monitor)
     print(
         f"oskard starting: run_id={state.run_id} profile={profile.name} "
         f"mode=shadow api=http://{DEFAULT_HOST}:{DEFAULT_PORT}"
