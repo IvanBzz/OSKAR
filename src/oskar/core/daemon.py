@@ -337,8 +337,11 @@ def main() -> int:
     import os
     import secrets
 
+    from dotenv import load_dotenv
+
     from oskar.core.api import panic_engaged
 
+    load_dotenv(REPO_ROOT / ".env")  # ДО чтения Telegram-переменных: иначе поллер и алерты молча OFF
     signals_token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     alert = None
