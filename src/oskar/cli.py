@@ -16,6 +16,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="oskar", description="OSKAR control CLI")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("caps-verify", help="verify caps.yaml against CONSTITUTION.md pin")
+    _add_daemon_api_parsers(sub)  # ст. 6: panic / panic-reset / status через API демона
 
     p_know = sub.add_parser("knowledge", help="knowledge index operations")
     know_sub = p_know.add_subparsers(dest="know_command", required=True)
@@ -36,6 +37,9 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    if args.command in DAEMON_API_COMMANDS:
+        return _cmd_daemon_api(args.command)
 
     if args.command == "sync":
         return _cmd_sync(args)
@@ -92,6 +96,148 @@ def _cmd_buttons_ping() -> int:
         return 0
     print("ERROR: telegram refused the message")
     return 1
+
+
+# ------------------------------------------------------------------ oskard API
+# Ст. 6 (ревью 2026-10-13): panic обещан и из CLI, а был только API. Ниже — тонкий
+# клиент локального API демона: stdlib urllib и без bootstrap (он тянет pandas ~4 с),
+# panic из терминала должен уходить за доли секунды.
+
+DAEMON_API_COMMANDS = {
+    "panic": ("POST", "/panic", 60.0),  # снятие ордеров/закрытие позиций на бирже — до минуты
+    "panic-reset": ("POST", "/panic/reset", 10.0),
+    "status": ("GET", "/status", 10.0),
+}
+
+
+def _add_daemon_api_parsers(sub) -> None:
+    sub.add_parser("panic", help="EMERGENCY STOP (Art. 6): cancel entries, close positions, safe_mode")
+    sub.add_parser("panic-reset", help="lift panic: explicit operator command only (Art. 6.3); pause stays")
+    sub.add_parser("status", help="oskard state via the local API")
+
+
+def _ascii(value) -> str:
+    """cp1251-консоль: только ASCII (кириллица ошибок биржи -> \\u-escape, а не кракозябры)."""
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _daemon_api_base() -> str:
+    """Адрес API — из settings.api, как у демона; сбой чтения конфига -> 127.0.0.1:8321:
+    panic не имеет права упасть на YAML."""
+    from oskar.core.daemon import DEFAULT_HOST, DEFAULT_PORT, REPO_ROOT, api_endpoint
+
+    try:
+        import yaml
+
+        settings = yaml.safe_load((REPO_ROOT / "config" / "settings.yaml").read_text(encoding="utf-8"))
+        host, port = api_endpoint(settings or {})
+    except Exception:  # noqa: BLE001
+        host, port = DEFAULT_HOST, DEFAULT_PORT
+    return f"http://{host}:{port}"
+
+
+def _daemon_token_file():
+    from oskar.core.daemon import REPO_ROOT
+
+    return REPO_ROOT / "data" / "oskard.token"
+
+
+def _daemon_api_tokens() -> list[str]:
+    """X-Oskar-Token: env OSKAR_API_TOKEN, затем data/oskard.token (пишет oskard при старте),
+    как в skills/oskar-control/scripts/oskarctl.py. Берем оба: устаревший env не должен
+    сорвать panic (401 -> пробуем токен из файла)."""
+    import os
+
+    tokens = []
+    env_token = os.getenv("OSKAR_API_TOKEN", "").strip()
+    if env_token:
+        tokens.append(env_token)
+    try:
+        file_token = _daemon_token_file().read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        file_token = ""
+    if file_token and file_token not in tokens:
+        tokens.append(file_token)
+    return tokens or [""]
+
+
+def _daemon_api_call(method: str, path: str, timeout: float) -> tuple[int, object]:
+    """(HTTP-код, JSON или текст). Код 0 — демон не ответил (нет соединения / таймаут)."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    base = _daemon_api_base()
+    # loopback мимо системного/env-прокси (VPN): иначе panic уходил бы в прокси, а не в демон
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    status, body = 0, f"{base}: no tokens"
+    for token in _daemon_api_tokens():
+        req = urllib.request.Request(base + path, method=method, headers={"X-Oskar-Token": token})
+        if method == "POST":
+            req.data = b""
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read()
+                try:
+                    return resp.status, json.loads(raw)
+                except ValueError:
+                    return resp.status, raw.decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            status, body = e.code, e.read().decode("utf-8", errors="replace")
+            if e.code != 401:
+                break  # 401 — пробуем следующий токен; прочие коды — окончательный ответ
+        except OSError as e:  # URLError (отказ соединения), таймаут чтения
+            return 0, f"{base}: {getattr(e, 'reason', e)}"
+    return status, body
+
+
+def _cmd_daemon_api(command: str) -> int:
+    import json
+
+    method, path, timeout = DAEMON_API_COMMANDS[command]
+    status, body = _daemon_api_call(method, path, timeout)
+    if status == 0:
+        print(f"OSKARD NOT RUNNING? no answer from {_ascii(body)}")
+        if command == "panic":
+            print("PANIC NOT APPLIED by oskard: cancel orders / close positions in the BingX UI now")
+        return 1
+    if status != 200 or not isinstance(body, dict):
+        print(f"HTTP {status}: {_ascii(body)[:300]}")
+        if status == 401:
+            print("token rejected: check OSKAR_API_TOKEN / data/oskard.token")
+        return 1
+    if command == "panic":
+        return _print_panic(body)
+    if command == "panic-reset":
+        print(f"panic reset: safe_mode={body.get('safe_mode')} paused={body.get('paused')} "
+              "(pause stays - resume is a separate explicit decision)")
+        return 0
+    print(json.dumps(body, ensure_ascii=True, indent=2))
+    return 0
+
+
+def _print_panic(result: dict) -> int:
+    """Сводка panic; код 1, если биржа сделала не всё или флаг не записан."""
+    print("PANIC ENGAGED: safe_mode + pause, new entries blocked until `oskar panic-reset`")
+    ok = True
+    exchange = result.get("exchange")
+    if exchange is None:
+        print("exchange: NOT touched - oskard has no position monitor (no exchange keys)")
+    elif "error" in exchange:
+        ok = False
+        print(f"exchange: ERROR {_ascii(exchange['error'])} - check positions in the BingX UI")
+    else:
+        errors = exchange.get("errors") or []
+        print(f"exchange: cancelled={exchange.get('cancelled', 0)} closed={exchange.get('closed', 0)} "
+              f"errors={len(errors)}")
+        for err in errors:
+            ok = False
+            print(f"  error: {_ascii(err)}")
+    if result.get("persist_error"):
+        ok = False
+        print(f"WARNING: panic flag not persisted ({_ascii(result['persist_error'])}) "
+              "- a restart would lift it")
+    return 0 if ok else 1
 
 
 def _cmd_sync(args) -> int:

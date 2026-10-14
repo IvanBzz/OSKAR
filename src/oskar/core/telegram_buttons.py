@@ -8,15 +8,23 @@
 
 Безопасность: реагируем ТОЛЬКО на нажатия из allowlist-чата; всё прочее
 игнорируется без ответа.
+
+Текстовые команды (ст. 6, ревью 2026-10-13): конституция обещает Telegram
+`/panic`, а поллер запрашивал только callback_query — сообщение до демона не
+доходило. Теперь тот же long-poll берет и `message`. От allowlist-автора в
+allowlist-чате (та же проверка, что у кнопок) исполняются `/panic` — сразу,
+первым в пачке — и `/status`; всё прочее молча игнорируется.
 """
 
 import html
 import logging
 import threading
+import time
 
 import httpx
 
 from oskar.core.approvals import resolve_approval
+from oskar.core.emergency import engage_panic
 from oskar.core.state import RuntimeState
 from oskar.journal.db import transaction
 
@@ -37,6 +45,81 @@ NOT_OK_BACKOFF_SEC = 30.0  # пауза после ответа ok=false (401 о
 # Самопроверка цепочки Telegram -> поллер -> ответ: без решений, журнала и биржи.
 PING_VERB = "ping"
 PING_ANSWER = "Кнопки работают ✅"
+# message — для текстовых команд (/panic, /status); без него Telegram их не отдает
+ALLOWED_UPDATES = '["callback_query","message"]'
+PANIC_COMMAND = "panic"
+STATUS_COMMAND = "status"
+STALE_COMMAND_SEC = 60  # /panic старше — ждал в очереди Telegram, пока демон лежал
+
+
+def parse_command(text: str) -> str | None:
+    """'/panic', '/panic@OskarSignalsBot', '/PANIC сейчас' -> 'panic'; не команда -> None."""
+    words = (text or "").strip().split(maxsplit=1)
+    if not words or not words[0].startswith("/"):
+        return None
+    return words[0][1:].split("@", 1)[0].lower() or None
+
+
+def _esc(value, limit: int = 160) -> str:
+    """Динамический текст (биржа, исключения, журнал) в HTML-сообщение: обрезка, затем экранирование."""
+    text = str(value)
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return html.escape(text)
+
+
+def panic_reply(result: dict, waited_sec: float = 0.0) -> str:
+    """Короткая сводка panic для Telegram (HTML): что снято, что закрыто, что упало."""
+    lines = ["🚨 <b>PANIC</b>: торговля остановлена (safe_mode + пауза)."]
+    exchange = result.get("exchange")
+    if exchange is None:
+        lines.append("Биржа НЕ тронута: монитор позиций не подключен (нет ключей биржи).")
+    elif "error" in exchange:
+        lines.append(f"Биржа: ОШИБКА — {_esc(exchange['error'])}. Проверь позиции на бирже вручную!")
+    else:
+        errors = exchange.get("errors") or []
+        lines.append(
+            f"Снято входов: {_esc(exchange.get('cancelled', 0))}, "
+            f"закрыто позиций: {_esc(exchange.get('closed', 0))}, ошибок: {len(errors)}."
+        )
+        lines += [f"⚠️ {_esc(e)}" for e in errors[:3]]
+        if len(errors) > 3:
+            lines.append(f"…и еще {len(errors) - 3}")
+    if result.get("persist_error"):
+        lines.append(
+            f"⚠️ флаг не записан в журнал ({_esc(result['persist_error'])}): "
+            "после рестарта panic не восстановится."
+        )
+    if waited_sec >= STALE_COMMAND_SEC:
+        lines.append(f"Команда ждала {int(waited_sec // 60)} мин — демон был недоступен.")
+    lines.append("Снять — только явной командой оператора: oskar panic-reset.")
+    return "\n".join(lines)
+
+
+def status_line(state: RuntimeState, runner=None) -> str:
+    """Одна строка для /status: режим, позиции, карточки, equity. Журнал — только чтение."""
+    if state.panic_at is not None:
+        mode = "PANIC с " + time.strftime("%H:%M UTC", time.gmtime(state.panic_at))
+    elif state.safe_mode:
+        mode = "SAFE MODE" + (", пауза" if state.paused else "")
+    else:
+        mode = "пауза" if state.paused else "работает"
+    parts = [f"OSKAR {state.run_id}: {mode}"]
+    try:
+        live = dict(state.journal.execute(
+            "SELECT status, COUNT(*) FROM trades WHERE status IN ('open','pending') GROUP BY status"
+        ).fetchall())
+        cards = state.journal.execute(
+            "SELECT COUNT(*) FROM pending_approvals WHERE resolution IS NULL"
+        ).fetchone()[0]
+        parts.append(f"позиций {live.get('open', 0)}, лимиток {live.get('pending', 0)}, карточек {cards}")
+    except Exception as e:  # noqa: BLE001 - статус не падает из-за журнала
+        parts.append(f"журнал недоступен ({type(e).__name__})")
+    if runner is not None:
+        parts.append(f"equity ${runner.equity_usd:.2f} ({runner.equity_source})")
+    up = state.uptime_sec
+    parts.append(f"аптайм {up // 3600}ч{up % 3600 // 60:02d}м")
+    return " · ".join(parts)
 
 
 def send_ping_card(token: str, chat_id: str, client: httpx.Client | None = None) -> bool:
@@ -64,6 +147,8 @@ class ButtonPoller:
         client: httpx.Client | None = None,
         on_resolution=None,  # (decision_id, mode) -> ExecutionOutcome | None
         allowed_user_ids: set[str] | None = None,  # по умолчанию = chat id (личный чат Ивана)
+        on_panic=None,  # () -> dict (ответ engage_panic); демон передает engage_panic(state, monitor)
+        on_status=None,  # () -> str: одна строка для /status
     ):
         if not token or not allowed_chat_id:
             raise ValueError("signals bot token and chat id are required")
@@ -73,6 +158,10 @@ class ButtonPoller:
         self._state = state
         self._http = client or httpx.Client(timeout=35)
         self._on_resolution = on_resolution
+        # /panic без подключенного обработчика все равно исполняется: флаги + meta;
+        # биржу трогает только engage_panic с монитором (его передает демон)
+        self._on_panic = on_panic or (lambda: engage_panic(state))
+        self._on_status = on_status or (lambda: status_line(state))
         self._offset = 0
         self.not_ok_streak = 0
         self._stop = threading.Event()
@@ -80,13 +169,13 @@ class ButtonPoller:
     # ------------------------------------------------------------------ core
 
     def poll_once(self, timeout: int = 25) -> int:
-        """Один цикл getUpdates. Возвращает число обработанных callback'ов."""
+        """Один цикл getUpdates. Возвращает число обработанных апдейтов (нажатия + сообщения)."""
         r = self._http.get(
             f"{self._base}/getUpdates",
             params={
                 "timeout": timeout,
                 "offset": self._offset,
-                "allowed_updates": '["callback_query"]',
+                "allowed_updates": ALLOWED_UPDATES,
             },
         )
         payload = r.json()
@@ -98,14 +187,74 @@ class ButtonPoller:
                 logger.warning("getUpdates not ok (x%d): %s", self.not_ok_streak, str(payload)[:200])
             return -1
         self.not_ok_streak = 0
+        # ст. 6: /panic из пачки — первым. Нажатие «Маркет» из той же пачки (типично после
+        # простоя демона) иначе успело бы поставить ордер; после panic его отвергнет safe_mode.
+        # sorted устойчив: остальные апдейты идут в порядке Telegram.
+        updates = sorted(payload.get("result", []), key=lambda u: not self._is_panic(u))
         handled = 0
-        for upd in payload.get("result", []):
+        for upd in updates:
+            # offset — до обработки и для любого типа апдейта: упавший обработчик не крутит
+            # апдейт по кругу, /panic не исполняется дважды
             self._offset = max(self._offset, upd["update_id"] + 1)
-            cb = upd.get("callback_query")
-            if cb:
-                self._handle_callback(cb)
+            try:
+                if upd.get("callback_query"):
+                    self._handle_callback(upd["callback_query"])
+                elif upd.get("message"):
+                    self._handle_message(upd["message"])
+                else:
+                    continue
                 handled += 1
+            except Exception as e:  # noqa: BLE001 - один апдейт не роняет пачку (в ней может быть /panic)
+                logger.error("update %s failed: %s", upd.get("update_id"), e)
         return handled
+
+    def _allowed(self, msg: dict) -> bool:
+        """Allowlist сообщения: и чат, и автор (в группе писать может любой участник)."""
+        chat_id = str((msg.get("chat") or {}).get("id", ""))
+        from_id = str((msg.get("from") or {}).get("id", ""))
+        return chat_id == self._chat and from_id in self._users
+
+    def _is_panic(self, upd: dict) -> bool:
+        try:
+            msg = upd.get("message")
+            return bool(msg) and self._allowed(msg) and parse_command(msg.get("text") or "") == PANIC_COMMAND
+        except Exception:  # noqa: BLE001 - кривой апдейт не должен заклинить сортировку всей пачки
+            return False
+
+    def _handle_message(self, msg: dict) -> None:
+        if not self._allowed(msg):
+            logger.warning(
+                "message from foreign chat/user %s/%s ignored",
+                (msg.get("chat") or {}).get("id"), (msg.get("from") or {}).get("id"),
+            )
+            return  # чужим не отвечаем
+        command = parse_command(msg.get("text") or "")
+        if command == PANIC_COMMAND:
+            self._reply(self._run_panic(msg))
+        elif command == STATUS_COMMAND:
+            self._reply(self._run_status())
+        # не команда / неизвестная команда — молча
+
+    def _run_panic(self, msg: dict) -> str:
+        self._state.panic()  # флаги — сразу, даже если обработчик ниже сломан (ст. 6 п. 2)
+        try:
+            result = self._on_panic() or {}
+        except Exception as e:  # noqa: BLE001 - флаги уже стоят; оператор должен узнать о сбое
+            logger.critical("PANIC via Telegram: handler failed: %s", e)
+            return (
+                "🚨 <b>PANIC</b>: торговля остановлена (safe_mode + пауза), но снятие ордеров "
+                f"упало: {_esc(e)}. Проверь биржу вручную!"
+            )
+        logger.warning("PANIC via Telegram: %s", result)
+        waited = time.time() - float(msg.get("date") or time.time())
+        return panic_reply(result, waited)
+
+    def _run_status(self) -> str:
+        try:
+            line = str(self._on_status())
+        except Exception as e:  # noqa: BLE001 - статус не роняет поллер
+            line = f"статус недоступен: {e}"
+        return _esc(line, 400)
 
     def _handle_callback(self, cb: dict) -> None:
         cb_id = cb.get("id", "")
@@ -189,6 +338,18 @@ class ButtonPoller:
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("answerCallbackQuery failed: %s", e)
+
+    def _reply(self, text: str) -> None:
+        """Ответ на команду в allowlist-чат (HTML; динамика уже экранирована)."""
+        try:
+            r = self._http.post(
+                f"{self._base}/sendMessage",
+                json={"chat_id": self._chat, "text": text, "parse_mode": "HTML"},
+            )
+            if not r.json().get("ok"):
+                logger.warning("command reply refused: %s", str(r.json())[:200])
+        except Exception as e:  # noqa: BLE001 - ответ вторичен, команда уже исполнена
+            logger.warning("command reply failed: %s", e)
 
     def _finalize_card(self, msg: dict, status: str) -> None:
         """Убрать кнопки и дописать статус в подпись карточки."""

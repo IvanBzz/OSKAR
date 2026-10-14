@@ -8,22 +8,24 @@
 же машине — POST без preflight мог снять паузу или нажать panic/approve.
 С api_token каждый запрос обязан нести X-Oskar-Token, Host ограничен
 loopback-именами, автодокументация выключена.
+
+panic / panic-reset — тонкие обертки над core/emergency.py: та же функция
+обслуживает Telegram `/panic` и CLI `oskar panic` (ст. 6, ревью 2026-10-13).
 """
 
 import secrets
-from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from oskar import __version__
+from oskar.core.emergency import (  # noqa: F401 - PANIC_META_KEY/panic_engaged: реэкспорт старых импортов
+    PANIC_META_KEY,
+    engage_panic,
+    panic_engaged,
+    reset_panic,
+)
 from oskar.core.state import RuntimeState
-
-PANIC_META_KEY = "panic_engaged"
-
-
-def _now_iso() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | None = None) -> FastAPI:
@@ -131,36 +133,13 @@ def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | N
 
     @app.post("/panic")
     def panic():
-        state.panic()  # ст. 6: флаги ПЕРВЫМИ, ничто не смеет задержать
-        result = {"panic": True, "safe_mode": True, "paused": True, "exchange": None}
-        try:  # флаг переживает рестарт — восстановление только явной командой
-            state.journal.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (PANIC_META_KEY, _now_iso())
-            )
-            state.journal.commit()
-        except Exception as e:  # noqa: BLE001 - флаги уже стоят
-            result["persist_error"] = str(e)
-        if monitor is not None:
-            try:
-                result["exchange"] = monitor.panic_flatten()  # отмена ордеров + закрытие позиций
-            except Exception as e:  # noqa: BLE001 - биржа недоступна: оператор видит это в ответе
-                result["exchange"] = {"error": str(e)}
-        return result
+        # ст. 6: флаги -> meta -> биржа; та же функция у Telegram /panic и CLI
+        return engage_panic(state, monitor)
 
     @app.post("/panic/reset")
     def panic_reset():
         """Ст. 6 п. 3: только явной командой оператора. Снимает panic и safe_mode,
         пауза остается — resume отдельным решением."""
-        state.panic_at = None
-        state.safe_mode = False
-        state.journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_META_KEY,))
-        state.journal.commit()
-        return {"panic": False, "safe_mode": False, "paused": state.paused}
+        return reset_panic(state)
 
     return app
-
-
-def panic_engaged(journal) -> str | None:
-    """Момент последнего panic, если он не был сброшен оператором (переживает рестарт)."""
-    row = journal.execute("SELECT value FROM meta WHERE key = ?", (PANIC_META_KEY,)).fetchone()
-    return row[0] if row else None

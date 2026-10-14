@@ -1,19 +1,24 @@
 # Рабочие настройки OSKAR (не-конституционные, можно менять обычным коммитом
 # с changelog-записью; конституционные лимиты — в caps.yaml).
+#
+# Дрейф конфига (ревью 2026-10-13): ключ, который не читает код, — ложная ручка.
+# tests/unit/test_settings_drift.py валит сборку на любом нечитаемом ключе, кроме
+# перечисленных в его UNIMPLEMENTED с причиной. Здесь они помечены «не подключен»:
+# их изменение на поведение НЕ влияет.
 
 mode: paper                        # paper (BingX VST) | live — live откроется только через гейт Фазы 5
 
 exchange:
-  id: bingx
+  id: bingx                        # не подключен: код только под BingX
   sandbox: true                    # true = VST (open-api-vst.bingx.com), реальные цены
-  hedge_mode: true                 # BingX VST всегда hedge: positionSide обязателен
-  adjust_for_time_difference: true # Windows clock drift (урок v1)
-  rate_limit_ms: 100
+  hedge_mode: true                 # не подключен: VST всегда hedge, positionSide зашит в адаптере
+  adjust_for_time_difference: true # не подключен: зашит True в фабриках ccxt (Windows clock drift, урок v1)
+  rate_limit_ms: 100               # не подключен: ccxt enableRateLimit с лимитом биржи по умолчанию
   # ключи ТОЛЬКО из .env: BINGX_API_KEY, BINGX_API_SECRET
 
 scanner:
-  universe: swap_usdt              # все активные USDT-перпы (829 на 2026-08-26)
-  quick_filter_top: 100
+  universe: swap_usdt              # не подключен: все активные USDT-перпы зашиты (829 на 2026-08-26)
+  quick_filter_top: 100            # не подключен: scan() идет по всему universe
   full_analysis_top: 20
   min_hourly_quote_volume_usd: 200000  # пол ликвидности (мемкоины с дутыми RSI-очками — мимо)
   min_opportunity_score: 50        # порог эскалации; калибровка shadow-фазы по живой пробе
@@ -26,29 +31,31 @@ detect:
                                    # на топ-10/300 баров, swing=10 — только 2 (слишком медленно)
 
 api:
-  host: 127.0.0.1
-  port: 8321                       # bind = single-instance lock
+  host: 127.0.0.1                  # только loopback (127.0.0.1 | localhost), иначе отказ старта
+  port: 8321                       # bind = single-instance lock; oskar panic/status идут сюда же
 
 telegram:
   # токен и chat_id ТОЛЬКО из .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  send_charts: true
+  send_charts: true                # не подключен: карточка всегда с графиком, если он отрисовался
 
-agents:
+agents:                            # model_cmd не подключен (claude_cli зовет `claude -p` сам),
+                                   # analyst не подключен (агента еще нет); бюджеты scout/trader читаются
   scout:  { model_cmd: "claude -p", daily_budget: 30, hourly_budget: 6 }
   trader: { model_cmd: "claude -p", daily_budget: 20 }
   analyst: { model_cmd: "claude -p", daily_budget: 3 }
   # Sentinel живет в Hermes, бюджет там
 
 safe_mode:
-  consecutive_errors: 3
-  error_cooldown_minutes: 60
-  drawdown_pct: 10                 # этот триггер НЕ снимается автоматически (урок v1)
-  token_budget_floor_pct: 20
+  consecutive_errors: 3            # серия неудачных тиков shadow-потока -> safe_mode
+  error_cooldown_minutes: 60       # НЕ РЕАЛИЗОВАН: safe_mode — защелка, автовыхода нет
+  drawdown_pct: 10                 # НЕ РЕАЛИЗОВАН: триггера по просадке нет (план: не снимается
+                                   # автоматически, урок v1)
+  token_budget_floor_pct: 20       # НЕ РЕАЛИЗОВАН: бюджеты LLM — жесткие daily/hourly лимиты
 
 journal:
-  db_path: data/oskar.db
-  archive_before_run: true         # снепшот в data/archive/ перед каждым большим прогоном
+  db_path: data/oskar.db           # от корня репо; читает демон (oskar sync diff пока зашит на этот путь)
+  archive_before_run: true         # не подключен: архив журнала только при смене его схемы
 
-knowledge:
+knowledge:                         # не подключен: источники и лимит зашиты в knowledge/index.py и Scout
   library_path: vault/library
   max_prompt_tokens: 1500

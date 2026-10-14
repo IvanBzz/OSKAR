@@ -18,16 +18,30 @@ COMMANDS = {
 }
 
 
+def _oskar_home() -> Path:
+    """Корень репозитория OSKAR. Скилл живет копией в hermes/skills — относительный
+    путь там неверен, поэтому деплой кладет рядом oskar_home.txt (setup_hermes.ps1)."""
+    marker = Path(__file__).resolve().parent / "oskar_home.txt"
+    try:
+        return Path(marker.read_text(encoding="utf-8").strip())
+    except OSError:
+        return Path(__file__).resolve().parents[3]
+
+
 def api_token() -> str:
-    """Токен демона: env OSKAR_API_TOKEN или data/oskard.token (пишет oskard при старте)."""
+    """Токен демона: env OSKAR_API_TOKEN или <OSKAR>/data/oskard.token (пишет oskard при старте)."""
     tok = os.getenv("OSKAR_API_TOKEN", "")
     if tok:
         return tok
-    path = Path(__file__).resolve().parents[3] / "data" / "oskard.token"
     try:
-        return path.read_text(encoding="ascii").strip()
+        return (_oskar_home() / "data" / "oskard.token").read_text(encoding="ascii").strip()
     except OSError:
         return ""
+
+
+# Демон на loopback: системный прокси из окружения (HTTP_PROXY) сюда не нужен и может
+# не пропустить запрос к 127.0.0.1 — открываем без прокси (ревью блока D 2026-10-15)
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def main() -> int:
@@ -39,7 +53,7 @@ def main() -> int:
     if method == "POST":
         req.data = b""
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _OPENER.open(req, timeout=10) as resp:
             print(json.dumps(json.loads(resp.read()), ensure_ascii=False, indent=2))
             return 0
     except urllib.error.HTTPError as e:

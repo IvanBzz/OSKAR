@@ -6,6 +6,22 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-10-15 — блок D: panic из Telegram и CLI, ротация логов с вычисткой секретов, дрейф конфига
+
+Блок сделан агентом в отдельном worktree, просмотрен и влит лидом.
+- **Ст. 6 целиком**: конституция обещала panic из Telegram `/panic`, CLI `oskar panic` и API — был только API. Логика вынесена в `core/emergency.py` (флаги -> meta -> биржа; второй panic ждет первый; сброс сначала пишет журнал, потом снимает флаги в памяти). Сигнальный бот принимает текстовые команды `/panic` и `/status` только от allowlist-автора в allowlist-чате; `/panic` в пачке апдейтов исполняется ПЕРВЫМ (нажатие «Маркет» из той же пачки после простоя демона иначе успело бы поставить ордер). CLI: `oskar panic`, `oskar panic-reset`, `oskar status` (мимо системного прокси).
+- **Логи**: `logging_setup.py` — ротация 10 МБ x 5, консоль только WARNING, фильтр вычищает токены ботов, `signature` и API-ключи (в том числе в трейсбеках), uvicorn — через те же фильтры. stdout демона теперь в `data/oskard.stdout.log`.
+- **Остановка**: stop + join потоков при выходе. **Конфиг**: тест дрейфа валит ключи `settings.yaml`, которые код не читает (неподключенные — в allowlist с причиной); подключены `api.host/port` (только loopback), `journal.db_path`, `safe_mode.consecutive_errors`. Пин ccxt отложен: офлайн `uv lock` не обновился (нужна сеть).
+- **Инцидент при проверке**: агент запустил `oskar panic` из своей копии — запрос ушел в живой демон и получил 401 (в копии нет токена). Panic не взведен (проверено по /status и meta). Живая проверка вчерашней защиты API токеном.
+
+**Скиллы Hermes были сломаны с 13 октября** (найдено при слиянии): у Hermes развернуты КОПИИ скиллов от 30 августа — без токена API, который демон требует с 13.10, поэтому «статус» в боте получал 401; к тому же скрипт искал токен относительно своего расположения, а у копии в `hermes/skills` этот путь неверен. Скрипты теперь читают корень OSKAR из `oskar_home.txt` рядом (его пишет `setup_hermes.ps1` при деплое) и ходят к демону без прокси; копии у Hermes обновлены, живая проверка развернутой копии: статус отвечает.
+
+### Тесты
+- test_emergency, test_logging_setup, test_settings_drift, test_daemon_wiring: +32 от агента. Итого 381.
+
+### Затронутые файлы
+CREATE: src/oskar/core/emergency.py, src/oskar/logging_setup.py, tests/unit/{test_emergency,test_logging_setup,test_settings_drift,test_daemon_wiring}.py; MODIFY: src/oskar/core/{api,daemon,telegram_buttons}.py, src/oskar/cli.py, config/settings.yaml, skills/oskar-control/{SKILL.md,scripts/oskarctl.py}, skills/oskar-approvals/scripts/approve.py, scripts/setup_hermes.ps1
+
 ## 2026-10-15 — монитор снимает ордера-сироты OSKAR
 
 Идея из ревью Codex («startup reconciliation»): если процесс упадет между отправкой входа и записью в журнал, вход останется на бирже без сделки и позже откроет позицию мимо журнала; а забытый после закрытия closePosition-стоп закроет СЛЕДУЮЩУЮ позицию по тому же символу. Монитор при старте и раз в 10 мин смотрит все открытые ордера аккаунта (`open_orders_all`) и снимает те, у кого clientOrderId «OSKAR-…», а сделки в журнале нет (база cid `OSKAR-<run>-<hash>` покрывает и `-sl/-tp/-rN`). Ручные ордера Ивана и SL/TP, созданные биржей из прикрепленных параметров (без нашего cid), не трогаются. Сирота-вход — алерт в Telegram.

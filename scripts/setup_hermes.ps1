@@ -55,6 +55,9 @@ Write-Host "[ok] Telegram: токен вписан, allowlist ограничен
 # --- 3. Скиллы OSKAR ---------------------------------------------------------
 foreach ($skill in @("oskar-control", "oskar-approvals")) {
     Copy-Item (Join-Path $RepoRoot "skills\$skill") (Join-Path $HermesHome "skills\") -Recurse -Force
+    # скрипт скилла ищет токен API в <OSKAR>/data/oskard.token — из копии путь не вычислить
+    $marker = Join-Path $HermesHome "skills\$skill\scripts\oskar_home.txt"
+    [System.IO.File]::WriteAllText($marker, $RepoRoot, (New-Object System.Text.UTF8Encoding($false)))
 }
 Write-Host "[ok] скиллы oskar-control и oskar-approvals установлены"
 

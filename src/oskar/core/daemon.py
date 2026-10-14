@@ -2,10 +2,11 @@
 
 Порядок старта (каждый шаг обязателен, отказ = не стартуем):
 1. Проверка капсов против конституции (ст. 4) — mismatch = отказ запуска
-2. Single-instance lock: пробный бинд 127.0.0.1:8321 — занят = второй
-   экземпляр, громкая ошибка (v1: два экземпляра слили ADA в двойную позицию)
-3. Журнал + RuntimeState (run_id)
-4. uvicorn с управляющим API
+2. Single-instance lock: файловый замок + пробный бинд порта API (settings.api,
+   по умолчанию 127.0.0.1:8321) — занят = второй экземпляр, громкая ошибка
+   (v1: два экземпляра слили ADA в двойную позицию)
+3. Журнал (settings.journal.db_path) + RuntimeState (run_id)
+4. uvicorn с управляющим API; при выходе — stop + join фоновых потоков
 
 Торговый цикл (ShadowCycle) в Фазе 1 запускается отдельно/вручную;
 фоновый поток цикла подключается вместе с исполнением в Фазе 2.
@@ -18,10 +19,58 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8321
+DEFAULT_JOURNAL = "data/oskar.db"
+# TrustedHost API пускает только эти имена (core/api.py); иной бинд = panic/approve в сети
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+THREAD_JOIN_TIMEOUT_SEC = 5.0
 
 
 class SingleInstanceError(RuntimeError):
     pass
+
+
+def api_endpoint(settings: dict) -> tuple[str, int]:
+    """Адрес API из settings.api. Ревью 2026-10-13 (дрейф конфига): ключи api.*
+    не читались — адрес был зашит. Только loopback, иначе ValueError = отказ старта."""
+    api = settings.get("api") or {}
+    host = str(api.get("host", DEFAULT_HOST))
+    port = int(api.get("port", DEFAULT_PORT))
+    if host not in LOOPBACK_HOSTS:
+        raise ValueError(
+            f"api.host={host!r} is not loopback ({'/'.join(LOOPBACK_HOSTS)}): "
+            "the control API (panic/approve) must never listen on the network"
+        )
+    if not 0 < port < 65536:
+        raise ValueError(f"api.port={port} is out of range")
+    return host, port
+
+
+def journal_path(settings: dict) -> Path:
+    """journal.db_path из settings.yaml (ревью 2026-10-13: ключ не читался, путь был
+    зашит в _connect_journal). Относительный путь — от корня репо."""
+    return REPO_ROOT / str((settings.get("journal") or {}).get("db_path", DEFAULT_JOURNAL))
+
+
+def stop_and_join(workers, timeout: float = THREAD_JOIN_TIMEOUT_SEC) -> list[str]:
+    """Остановка фоновых потоков при выходе. Ревью 2026-10-13: был только stop() —
+    процесс выходил сразу, daemon-потоки обрывались посреди тика (ордер ушел, запись
+    в журнал — нет). Сначала stop() всем (сворачиваются параллельно), затем join
+    с таймаутом на каждый. workers: пары (объект со stop() | None, Thread | None).
+    Возвращает имена потоков, не уложившихся в таймаут."""
+    alive = [(worker, thread) for worker, thread in workers if worker is not None]
+    for worker, _ in alive:
+        try:
+            worker.stop()
+        except Exception as e:  # noqa: BLE001 - остальные все равно останавливаем
+            print(f"WARNING: stop failed: {e}", flush=True)
+    stuck = []
+    for _, thread in alive:
+        if thread is None:
+            continue
+        thread.join(timeout)
+        if thread.is_alive():
+            stuck.append(thread.name)
+    return stuck
 
 
 def check_port_free(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
@@ -81,14 +130,13 @@ def live_trades_in(db_path: Path) -> int:
         return 0
 
 
-def _connect_journal():
+def _connect_journal(db_path: Path):
     """Журнал; при несовпадении версии схемы — архив старого и чистый старт.
     Допустимо ТОЛЬКО без живых сделок: с open/pending в базе отказываемся
     стартовать (иначе теряются order id и управление позициями). None = отказ."""
     from oskar.journal.archive import archive_journal
     from oskar.journal.db import connect
 
-    db_path = REPO_ROOT / "data" / "oskar.db"
     try:
         return connect(db_path)
     except RuntimeError as e:
@@ -277,8 +325,6 @@ def main() -> int:
     from oskar._io import force_utf8_stdio
 
     force_utf8_stdio()
-    import logging
-
     from oskar.core.api import build_app
     from oskar.core.bootstrap import (
         build_cycle_config,
@@ -292,30 +338,32 @@ def main() -> int:
     from oskar.core.state import RuntimeState
     from oskar.data.candles import CandleCache
     from oskar.data.client import MarketDataClient, make_bingx_public_exchange
+    from oskar.logging_setup import setup_logging
     from oskar.ops.caps_guard import verify_caps
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    # httpx пишет в INFO URL каждого запроса, а URL Telegram содержит токен бота —
-    # в лог нельзя (утечка поймана 2026-10-12 на первом же getUpdates, лог вычищен)
-    for noisy in ("httpx", "httpcore"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Ротация 10 МБ x 5 + вычистка токенов/подписей (ревью 2026-10-13). Запуск теперь
+    # обязан писать stdout/stderr в data/oskard.stdout.log: два писателя на одном файле
+    # ломают ротацию (Windows не переименует файл, открытый редиректом).
+    setup_logging(REPO_ROOT / "data" / "oskard.log")
 
     if not verify_caps():
         print("REFUSING TO START: caps.yaml does not match CONSTITUTION.md pin (Art. 4)", flush=True)
         return 2
+    settings = load_settings()  # до замка: порт API для пробного бинда — из settings.api
+    try:
+        api_host, api_port = api_endpoint(settings)
+    except ValueError as e:
+        print(f"REFUSING TO START: {e}", flush=True)
+        return 6
     try:
         lock = acquire_instance_lock(REPO_ROOT / "data" / "oskard.lock")  # noqa: F841 - держим до выхода
-        check_port_free()
+        check_port_free(api_host, api_port)
     except SingleInstanceError as e:
         print(f"REFUSING TO START: {e}", flush=True)
         return 3
 
     caps = load_caps()
     profile = load_active_profile()
-    settings = load_settings()
     scanner = load_scanner_settings(settings)
     cycle_cfg = build_cycle_config(profile, scanner, settings)
 
@@ -329,7 +377,7 @@ def main() -> int:
               flush=True)
         return 6
 
-    journal = _connect_journal()
+    journal = _connect_journal(journal_path(settings))
     if journal is None:
         return 5
     state = RuntimeState(journal=journal)
@@ -339,7 +387,7 @@ def main() -> int:
 
     from dotenv import load_dotenv
 
-    from oskar.core.api import panic_engaged
+    from oskar.core.emergency import engage_panic, panic_engaged
 
     load_dotenv(REPO_ROOT / ".env")  # ДО чтения Telegram-переменных: иначе поллер и алерты молча OFF
     signals_token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "")
@@ -354,7 +402,8 @@ def main() -> int:
     engaged = panic_engaged(journal)
     if engaged:
         state.panic()  # ст. 6 п. 3: после рестарта panic держится до явного сброса
-        print(f"PANIC ENGAGED since {engaged}: trading blocked until POST /panic/reset", flush=True)
+        print(f"PANIC ENGAGED since {engaged}: trading blocked until `oskar panic-reset` "
+              "(POST /panic/reset)", flush=True)
 
     client = MarketDataClient(make_bingx_public_exchange())
     cache = CandleCache(client)
@@ -364,15 +413,23 @@ def main() -> int:
         top_n=scanner.full_analysis_top,
         min_quote_volume=scanner.min_hourly_quote_volume_usd,
         tick_seconds=float(profile.scan_interval_seconds),
+        # ключ не читался — runner жил на зашитом дефолте того же значения (ревью 2026-10-13)
+        consecutive_errors_to_safe_mode=int((settings.get("safe_mode") or {}).get("consecutive_errors", 3)),
         equity_fn=_make_equity_fn(settings),
         notify=alert,
     )
     cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache)
-    runner.start_thread()
+    runner_thread = runner.start_thread()
 
-    poller = None
+    # Монитор — ДО поллера: Telegram /panic зовет monitor.panic_flatten(), а /panic,
+    # пролежавший в очереди Telegram, поллер исполнит на первом же опросе.
+    monitor = _make_monitor(state, settings, profile, alert_token, chat_id)
+    monitor_thread = monitor.start_thread() if monitor is not None else None
+    print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}", flush=True)
+
+    poller = poller_thread = None
     if signals_token and chat_id:
-        from oskar.core.telegram_buttons import ButtonPoller
+        from oskar.core.telegram_buttons import ButtonPoller, status_line
 
         executor = _make_executor(state, settings, caps, client)
         on_resolution = None
@@ -384,15 +441,15 @@ def main() -> int:
                 equity_fn=lambda: runner.equity_usd, plan_fn=executor.plan_for,
                 risk_cap_pct=caps.risk_per_trade_pct,
             )
-        poller = ButtonPoller(signals_token, chat_id, state, on_resolution=on_resolution)
-        poller.start_thread()
-        print(f"button poller: ON (signals bot), execution: "
+        # ст. 6: Telegram /panic — та же функция, что у API и CLI (флаги -> meta -> биржа)
+        poller = ButtonPoller(
+            signals_token, chat_id, state, on_resolution=on_resolution,
+            on_panic=lambda: engage_panic(state, monitor),
+            on_status=lambda: status_line(state, runner),
+        )
+        poller_thread = poller.start_thread()
+        print(f"button poller: ON (signals bot, /panic /status), execution: "
               f"{'ON' if executor is not None else 'OFF (no keys)'}", flush=True)
-
-    monitor = _make_monitor(state, settings, profile, alert_token, chat_id)
-    if monitor is not None:
-        monitor.start_thread()
-    print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}", flush=True)
 
     # токен API: страница в браузере на этой же машине не должна жать panic/approve
     api_token = os.getenv("OSKAR_API_TOKEN", "") or secrets.token_hex(16)
@@ -401,18 +458,19 @@ def main() -> int:
     app = build_app(state, shadow=runner, monitor=monitor, api_token=api_token)
     print(
         f"oskard starting: run_id={state.run_id} profile={profile.name} "
-        f"mode={mode} sandbox={_sandbox(settings)} api=http://{DEFAULT_HOST}:{DEFAULT_PORT} "
+        f"mode={mode} sandbox={_sandbox(settings)} api=http://{api_host}:{api_port} "
         f"(token in {token_path.name})", flush=True,
     )
 
     import uvicorn
 
-    uvicorn.run(app, host=DEFAULT_HOST, port=DEFAULT_PORT, log_level="warning")
-    runner.stop()
-    if poller is not None:
-        poller.stop()
-    if monitor is not None:
-        monitor.stop()
+    # log_config=None: uvicorn не ставит свои хендлеры в stderr, его WARNING+ идут
+    # через корневые — с ротацией и вычисткой секретов
+    uvicorn.run(app, host=api_host, port=api_port, log_level="warning", log_config=None)
+    stuck = stop_and_join([(runner, runner_thread), (poller, poller_thread), (monitor, monitor_thread)])
+    if stuck:
+        print(f"shutdown: still busy after {THREAD_JOIN_TIMEOUT_SEC:.0f}s: {', '.join(stuck)} "
+              "(daemon threads end with the process)", flush=True)
     return 0
 
 
