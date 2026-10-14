@@ -275,8 +275,10 @@ def _make_monitor(state, settings, profile, token: str, chat_id: str):
     from oskar.core.position_monitor import PositionMonitor
     from oskar.data.client import make_bingx_exchange
     from oskar.execution.bingx import BingXAdapter
+    from oskar.sync.reconcile import ClosedTradeReconciler
 
-    adapter = BingXAdapter(make_bingx_exchange(key, secret, sandbox=_sandbox(settings)))
+    exchange = make_bingx_exchange(key, secret, sandbox=_sandbox(settings))
+    adapter = BingXAdapter(exchange)
     notify = on_expired = None
     if token and chat_id:
         from oskar.core.telegram_out import TelegramSender
@@ -288,11 +290,13 @@ def _make_monitor(state, settings, profile, token: str, chat_id: str):
             if message_id:
                 sender.remove_buttons(message_id)
 
+    # ст. 1 п. 1: закрытые сделки сверяются по филлам биржи — сразу после закрытия и раз в 6 ч
+    reconciler = ClosedTradeReconciler(exchange, state.journal, run_id=state.run_id, notify=notify)
     return PositionMonitor(
         adapter, state.journal,
         max_loss_hold_seconds=profile.max_loss_hold_seconds,
         limit_entry_ttl_seconds=profile.limit_entry_ttl_seconds,
-        notify=notify, on_card_expired=on_expired, state=state,
+        notify=notify, on_card_expired=on_expired, state=state, reconciler=reconciler,
     )
 
 

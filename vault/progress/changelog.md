@@ -6,6 +6,24 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-10-15 — блок C: закрытые сделки сверяются по филлам биржи; вердикты инвариантов ст. 5
+
+Блок сделан агентом в отдельном worktree, просмотрен и влит лидом (конфликт в cli.py с блоком D — обе стороны добавляли подкоманды, оставлены обе).
+- **Сверка закрытых** (ст. 1 п. 1, Claudexor H10, Codex #12): закрытые сделки сверялись сами с собой, у manual/panic P&L не было никогда. `sync/reconcile.py` берет филлы BingX (`fetch_my_trades`) и матчит выход сначала точно — по id SL/TP и clientOrderId (без учета регистра), затем окном: закрывающая сторона + positionSide в [opened−2 мин; closed+5 мин], окно режется соседними сделками того же символа и стороны. exit/комиссии/P&L и `reconciled=1` пишутся только при покрытии qty ±1%; расхождение журнала с биржей сохраняется в diffs (статус corrected) и уходит в Telegram. Прогон = строка `sync_snapshots(kind='reconcile')`. Расписание: сразу после закрытия, повтор раз в 10 мин (до 6 попыток), далее раз в 6 ч; `oskar sync reconcile [--dry-run]`. Подключено лидом в полный тик монитора.
+- **Монитор больше не ставит `reconciled=1` сам**: «сверено» — только по филлам биржи (иначе sl/tp/duration-закрытия сверка не увидела бы никогда, а INV-003 вечно осталась бы без данных).
+- **Ст. 5** (Codex #27): `ops/invariants.py` — метрики INV-001..003 из `config/invariants.yaml`, вердикты green / red / insufficient_data / error (нехватка данных — не green; red на неполном окне — только если граница уже пробита), заметка-вердикт в `vault/runs/`, CLI `oskar invariants` (exit 1 на red/error).
+- Агент проверил, что тесты ловят ошибки: 6 намеренных поломок механизмов — все 6 пойманы.
+
+Проверить на VST (агент): ccxt 4.5.75 берет время филла из `filledTm`, а в примере ответа BingX поле `filledTime` — если время не разберется, филлы выпадут и сделка станет `unmatched` (громко, не молча); отдает ли allFillOrders `side`/`positionSide`.
+
+Остаток ст. 5 (минимальный дизайн агента, в план): `config/validation_ledger.yaml` (commit, класс риска, INV, статус); pre-commit: изменение src/ без нового INV — отказ, иначе запись `committed_not_live_validated`, третье подряд — отказ; статус снимает только `oskar invariants --apply-ledger` при зеленых INV на сделках после деплоя; red — Telegram-алерт раз в 6 ч; авто-revert — только готовый revert-коммит на подтверждение оператору.
+
+### Тесты
+- test_closed_reconcile (26), test_invariants (18) от агента; test_position_monitor +1 (сверка вызывается из полного тика, не из быстрого). Итого 426.
+
+### Затронутые файлы
+CREATE: src/oskar/sync/reconcile.py, src/oskar/ops/invariants.py, tests/unit/{test_closed_reconcile,test_invariants}.py; MODIFY: src/oskar/sync/exchange_sync.py, src/oskar/cli.py, src/oskar/core/{position_monitor,daemon}.py, tests/unit/test_position_monitor.py
+
 ## 2026-10-15 — блок D: panic из Telegram и CLI, ротация логов с вычисткой секретов, дрейф конфига
 
 Блок сделан агентом в отдельном worktree, просмотрен и влит лидом.

@@ -189,7 +189,7 @@ def test_sl_hit_closes_long_with_pnl_and_cancels_tp(tmp_path):
     t = trade(j, "d1")
     assert t["status"] == "closed" and t["close_reason"] == "sl_hit"
     assert t["exit_price"] == 98.0 and abs(t["realized_pnl"] - (-4.0 - 0.1)) < 1e-9
-    assert t["duration_seconds"] == 45 * 60 and t["reconciled"] == 1
+    assert t["duration_seconds"] == 45 * 60 and t["reconciled"] == 0  # «сверено» — только по филлам
     assert ex.cancelled == ["d1-tp"]
     assert rep.closed == [("d1", "sl_hit")] and any("стоп" in n for n in notes)
 
@@ -390,3 +390,18 @@ def test_orphan_oskar_orders_cancelled_known_and_foreign_untouched(tmp_path):
     clock[0] = T0 + timedelta(seconds=ORPHAN_SCAN_SEC - 1)
     mon.tick()
     assert ex.cancelled == []  # до следующего скана не трогаем
+
+
+def test_monitor_ticks_closed_trade_reconciler(tmp_path):
+    """Сверка закрытых по филлам биржи вызывается из полного тика монитора."""
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
+    calls = []
+
+    class Rec:
+        def tick(self, now):
+            calls.append(now)
+
+    mon._reconciler = Rec()
+    mon.tick()
+    mon.tick_pending()  # быстрый проход сверку не дергает
+    assert calls == [T0]

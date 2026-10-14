@@ -10,6 +10,9 @@
 
 diff — детектор qty-бага v1: сверяет qty открытых сделок журнала с
 contracts * contractSize позиций биржи, per-symbol ratio.
+
+ЗАКРЫТЫЕ сделки сверяются по истории филлов в sync/reconcile.py (`oskar sync
+reconcile`); view отдает для этого fetch_my_trades.
 """
 
 import sqlite3
@@ -173,5 +176,13 @@ def make_bingx_view(api_key: str, secret: str, sandbox: bool = True) -> Exchange
 
         def open_orders(self) -> list[dict[str, Any]]:
             return ex.fetch_open_orders()
+
+        def fetch_my_trades(
+            self, symbol: str, since: int | None = None, limit: int | None = None,
+            params: dict | None = None,
+        ) -> list[dict[str, Any]]:
+            # история исполнений для сверки ЗАКРЫТЫХ сделок (sync/reconcile.py, ст. 1 п. 1;
+            # ревью 2026-10-13, Claudexor H10): тоже только чтение
+            return ex.fetch_my_trades(symbol, since, limit, params or {})
 
     return _CcxtView()

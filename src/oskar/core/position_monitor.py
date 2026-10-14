@@ -18,7 +18,7 @@
    поставить; не встает — повтор (109420 сразу после исполнения: позиция еще не
    видна), затем SAFE MODE (голую позицию молча не держим). Позиции нет два тика
    подряд -> по истории биржи: сработал SL/TP -> sl_hit/tp_hit, иначе manual
-   (exit/pnl NULL, reconciled=0); лосер старше max_loss_hold -> рыночное закрытие с
+   (exit/pnl NULL); лосер старше max_loss_hold -> рыночное закрытие с
    ПОДТВЕРЖДЕНИЕМ по позициям -> duration_timeout (урок v1: лосеры жили в 3.4x дольше);
 4. reconcile: позиции биржи vs open-сделки журнала (сумма qty по ключу, допуск 1%) —
    расхождение два тика подряд -> SAFE MODE + Telegram, один раз на ключ.
@@ -108,6 +108,7 @@ class PositionMonitor:
         now_fn=lambda: datetime.now(UTC),
         interval_seconds: float = DEFAULT_INTERVAL_SEC,
         fast_interval_seconds: float = DEFAULT_FAST_INTERVAL_SEC,
+        reconciler=None,  # ClosedTradeReconciler: tick(now) — сверка закрытых по филлам биржи
     ):
         self._ex = adapter
         self._j = journal
@@ -119,6 +120,7 @@ class PositionMonitor:
         self._now = now_fn
         self._interval = interval_seconds
         self._fast_interval = fast_interval_seconds
+        self._reconciler = reconciler
         self._reported_mismatches: set[str] = set()
         self._mismatch_streak: dict[str, int] = {}
         self._missing: dict[str, int] = {}  # decision_id -> тиков подряд без позиции
@@ -139,6 +141,8 @@ class PositionMonitor:
             self._guard(rep, t["decision_id"], lambda t=t: self._check_open(t, rep))
         self._guard(rep, "reconcile", lambda: self._reconcile(rep))
         self._guard(rep, "orphans", lambda: self._scan_orphans(rep))
+        if self._reconciler is not None:
+            self._guard(rep, "closed_reconcile", lambda: self._reconciler.tick(self._now()))
         self.ticks += 1
         self.last_report = rep.as_dict()
         return rep
@@ -431,7 +435,7 @@ class PositionMonitor:
                 return
             self._missing.pop(did, None)
             self._cancel_protection(t)
-            self._close(t, rep, None, "manual", None, reconciled=0)
+            self._close(t, rep, None, "manual", None)
             return
         self._missing.pop(did, None)
 
@@ -466,8 +470,11 @@ class PositionMonitor:
 
     def _close(
         self, t: sqlite3.Row, rep: MonitorReport,
-        exit_price: float | None, reason: str, exit_fee: float | None, reconciled: int = 1,
+        exit_price: float | None, reason: str, exit_fee: float | None,
     ) -> None:
+        """Закрытие по данным монитора. reconciled=0 ВСЕГДА: «сверено» ставит только
+        sync/reconcile.py по филлам биржи (ст. 1 п. 1); иначе sl/tp/duration-закрытия
+        сверка не увидела бы никогда, а INV-003 навсегда осталась бы без данных."""
         now = self._now()
         opened = _parse_iso(t["opened_at"])
         duration = int((now - opened).total_seconds()) if opened else None
@@ -479,8 +486,8 @@ class PositionMonitor:
         with transaction(self._j):
             self._j.execute(
                 "UPDATE trades SET status='closed', exit_price=?, close_reason=?, exit_fees=?, "
-                "realized_pnl=?, closed_at=?, duration_seconds=?, reconciled=? WHERE id=?",
-                (exit_price, reason, exit_fee, pnl, _iso(now), duration, reconciled, t["id"]),
+                "realized_pnl=?, closed_at=?, duration_seconds=?, reconciled=0 WHERE id=?",
+                (exit_price, reason, exit_fee, pnl, _iso(now), duration, t["id"]),
             )
         rep.closed.append((t["decision_id"], reason))
         label = {"sl_hit": "🛑 стоп", "tp_hit": "🎯 тейк", "duration_timeout": "⏱ стоп по времени",
@@ -605,7 +612,7 @@ class PositionMonitor:
                         exit_price, fee = st.avg_price, st.fee
                     except Exception as e:  # noqa: BLE001
                         logger.warning("panic close lookup failed for %s: %s", t["decision_id"], e)
-                self._close(t, rep, exit_price, "panic", fee, reconciled=0)
+                self._close(t, rep, exit_price, "panic", fee)
                 out["closed"] += 1
             except Exception as e:  # noqa: BLE001
                 out["errors"].append(f"{t['decision_id']}: {e}")

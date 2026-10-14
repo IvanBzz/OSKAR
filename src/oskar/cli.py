@@ -30,6 +30,13 @@ def main() -> int:
     sync_sub.add_parser("balance", help="exchange balance snapshot")
     sync_sub.add_parser("positions", help="open positions on exchange")
     sync_sub.add_parser("diff", help="journal vs exchange discrepancy report")
+    p_rec = sync_sub.add_parser(
+        "reconcile", help="closed trades vs exchange fills (Art. 1); writes sync_snapshots"
+    )
+    p_rec.add_argument("--dry-run", action="store_true", help="report only, journal untouched")
+
+    p_inv = sub.add_parser("invariants", help="Art. 5 verdicts from the journal (exit 1 on red)")
+    p_inv.add_argument("--no-note", action="store_true", help="do not write a note to vault/runs/")
 
     sub.add_parser(
         "buttons-ping",
@@ -46,6 +53,9 @@ def main() -> int:
 
     if args.command == "buttons-ping":
         return _cmd_buttons_ping()
+
+    if args.command == "invariants":
+        return _cmd_invariants(args)
 
     if args.command == "knowledge":
         from oskar.knowledge.index import build_index, search
@@ -240,6 +250,15 @@ def _print_panic(result: dict) -> int:
     return 0 if ok else 1
 
 
+def _cmd_invariants(args) -> int:
+    """Ст. 5: вердикты инвариантов по журналу + заметка в vault/runs/ (ревью 2026-10-13, Codex #27)."""
+    from pathlib import Path
+
+    from oskar.ops.invariants import cli_main
+
+    return cli_main(Path(__file__).resolve().parents[2] / "data" / "oskar.db", write_note=not args.no_note)
+
+
 def _cmd_sync(args) -> int:
     import os
     from pathlib import Path
@@ -292,6 +311,11 @@ def _cmd_sync(args) -> int:
             return 0 if d.clean else 1
         finally:
             conn.close()
+    if args.sync_command == "reconcile":
+        # ст. 1 п. 1: закрытые сделки vs филлы биржи (ревью 2026-10-13, Claudexor H10)
+        from oskar.sync.reconcile import cli_reconcile
+
+        return cli_reconcile(view, repo / "data" / "oskar.db", write=not args.dry_run)
     return 0
 
 
