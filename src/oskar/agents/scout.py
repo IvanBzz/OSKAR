@@ -9,7 +9,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from oskar.agents.budget import BudgetLimits, check_budget, log_call
+from oskar.agents.budget import BudgetLimits, CallBudget, check_budget
 from oskar.agents.claude_cli import AgentCallResult, call_claude, extract_json_block
 from oskar.contracts.schemas import SetupCandidate, SetupVerdict
 
@@ -57,11 +57,9 @@ def analyze_candidate(
     """Бросает BudgetExceeded/ScoutError; вызывающий решает деградацию."""
     check_budget(journal, "scout", limits)
     prompt = build_prompt(candidate, market_context, knowledge)
-    call = call_claude(prompt, model=model, cli_cmd=cli_cmd)
-    log_call(
-        journal, run_id=run_id, agent="scout", decision_id=candidate.id,
-        model=call.model, prompt_sha=call.prompt_sha, prompt=prompt,
-        response=call.text, duration_ms=call.duration_ms,
+    call = call_claude(
+        prompt, model=model, cli_cmd=cli_cmd,
+        budget=CallBudget(journal, run_id, "scout", candidate.id, limits),
     )
     try:
         data = extract_json_block(call.text)

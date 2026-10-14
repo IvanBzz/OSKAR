@@ -25,6 +25,7 @@
 import re
 import time
 from collections import Counter, deque
+from email.utils import parsedate_to_datetime
 from typing import Any, Protocol
 
 import pandas as pd
@@ -39,6 +40,7 @@ DEAD_TTL_SEC = 4 * 3600  # мертвый символ переоценивае�
 ERROR_WINDOW_SEC = 900.0  # окно BingX: «over 10 error code:109415 requests within 900000 ms»
 ERROR_BUDGET = 6  # наш потолок — заметно ниже биржевого (10)
 DEFAULT_COOLDOWN_SEC = 900.0  # если retry-after из ответа не распарсился
+RATE_LIMIT_COOLDOWN_SEC = 60.0
 COOLDOWN_MARGIN_SEC = 5.0
 
 COOLDOWN_CODES = frozenset({"109429"})
@@ -50,6 +52,9 @@ RWA_BASE_RE = re.compile(r"^NC(SK|FX|CO|SI)[A-Z0-9]{2,}$")
 
 _CODE_RE = re.compile(r'"code"\s*:\s*"?(\d+)"?')
 _RETRY_AFTER_RE = re.compile(r"retry after time:\s*(\d{10,13})")
+# 429 отдельным числом: не часть цены «0.429» и не хвост кода 109429 (ревью диффа Codex)
+_HTTP_429_RE = re.compile(r"(?<![\d.])429(?![\d.])")
+_RETRY_AFTER_HEADER_RE = re.compile(r"\bretry-after\b[\"']?\s*[:=]\s*[\"']?([^\r\n\"'}]+)", re.I)
 
 
 class ExchangeLike(Protocol):
@@ -66,7 +71,7 @@ class ExchangeLike(Protocol):
 
 
 class ExchangeCooldown(RuntimeError):
-    """Kline-эндпоинт на паузе (бан 109429 или наш бюджет ошибок): до биржи не ходим."""
+    """Kline-эндпоинт на паузе (rate limit, бан 109429 или бюджет ошибок): до биржи не ходим."""
 
     def __init__(self, remaining_sec: float, reason: str):
         self.remaining_sec = remaining_sec
@@ -78,7 +83,7 @@ def _retryable(e: Exception) -> bool:
     """Сетевые сбои — ретраим всегда."""
     if isinstance(e, (ConnectionError, TimeoutError)):
         return True
-    retryable_names = {"NetworkError", "RequestTimeout", "ExchangeNotAvailable", "DDoSProtection"}
+    retryable_names = {"NetworkError", "RequestTimeout", "ExchangeNotAvailable"}
     return any(base.__name__ in retryable_names for base in type(e).__mro__)
 
 
@@ -93,17 +98,19 @@ def classify_error(e: Exception) -> str:
 
     Только класс «symbol» приговаривает символ и расходует бюджет ошибок:
     именно эти ответы BingX считает в счетчике нарушений."""
+    code = exchange_error_code(e)
+    # Ревью 2026-10-13, #25: лимит общий для клиента; ccxt наследует его от сетевых ошибок.
+    if (code in COOLDOWN_CODES or _HTTP_429_RE.search(str(e))
+            or any(base.__name__ in {"DDoSProtection", "RateLimitExceeded"} for base in type(e).__mro__)):
+        return "cooldown"
     if _retryable(e):
         return "network"
-    code = exchange_error_code(e)
-    if code in COOLDOWN_CODES:
-        return "cooldown"
     if code in TRANSIENT_CODES:
         return "transient"
     # ccxt типизирует серверные сбои (100500 и т.п.) как OperationFailed — это
     # не вина символа независимо от кода (ревью 2026-10-13: 6 ответов 5xx за скан
     # хоронили 6 здоровых символов и уводили в 15-минутную паузу)
-    if any(base.__name__ in {"OperationFailed", "RateLimitExceeded"} for base in type(e).__mro__):
+    if any(base.__name__ == "OperationFailed" for base in type(e).__mro__):
         return "transient"
     return "symbol"
 
@@ -115,6 +122,21 @@ def parse_retry_after_ms(e: Exception) -> int | None:
         return None
     raw = m.group(1)
     return int(raw) if len(raw) == 13 else int(raw) * 1000
+
+
+def rate_limit_wait(e: Exception, wall: float) -> float:
+    """Ревью 2026-10-13, #25: уважаем Retry-After (секунды/HTTP-date), иначе ждем 60 с."""
+    match = _RETRY_AFTER_HEADER_RE.search(str(e))
+    if match is not None:
+        value = match.group(1).strip()
+        seconds = re.match(r"\d+(?:\.\d+)?(?:\s|[,;]|$)", value)
+        if seconds is not None:
+            return float(seconds.group().rstrip(",; "))
+        try:
+            return max(0.0, parsedate_to_datetime(value).timestamp() - wall)
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return RATE_LIMIT_COOLDOWN_SEC
 
 
 class MarketDataClient:
@@ -189,6 +211,9 @@ class MarketDataClient:
     def _on_exchange_error(self, sym: str, e: Exception, now: float) -> None:
         kind = classify_error(e)
         if kind == "cooldown":
+            if exchange_error_code(e) not in COOLDOWN_CODES:
+                self._enter_cooldown(now + rate_limit_wait(e, self._wall()), "exchange rate limit")
+                return
             retry_ms = parse_retry_after_ms(e)
             if retry_ms is None:
                 wait = DEFAULT_COOLDOWN_SEC
@@ -217,6 +242,7 @@ class MarketDataClient:
                 return fn(*args, **kwargs)
             except Exception as e:  # noqa: BLE001 - фильтруем через classify_error
                 last = e
+                # Ревью 2026-10-13, #25: cooldown не повторяем даже для текущего символа.
                 if classify_error(e) not in ("network", "transient") or attempt >= RETRIES:
                     raise
                 self._sleep(RETRY_DELAY_SEC * (attempt + 1))
@@ -240,7 +266,10 @@ class MarketDataClient:
         try:
             raw = self._with_retry(self._ex.fetch_ohlcv, sym, timeframe, limit=limit + 1)
         except Exception as e:  # noqa: BLE001
-            self._on_exchange_error(sym, e, now)
+            self._on_exchange_error(sym, e, self._clock())
+            if classify_error(e) == "cooldown" and exchange_error_code(e) not in COOLDOWN_CODES:
+                # Скан прерывается сразу, даже если остальные символы есть в кеше (ревью #25).
+                raise ExchangeCooldown(self.cooldown_remaining(), self.cooldown_reason) from e
             raise
         if not raw or len(raw) < 2:
             raise RuntimeError(f"not enough candles for {sym} {timeframe}: got {len(raw or [])}")

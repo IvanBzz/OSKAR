@@ -231,9 +231,12 @@ class ShadowCycle:
 
         Ни SL, ни TP за EXPIRED_FLAT_BARS баров -> expired_flat (сетап протух)."""
         j = self._state.journal
+        # Ревью 2026-10-13, E.4: отбор в SQL не загружает весь хвост на каждый символ.
         rows = j.execute(
             "SELECT id, decision_id, candidate_json, entry_price, sl_price, tp_price "
-            "FROM counterfactuals WHERE hypothetical_outcome IS NULL"
+            "FROM counterfactuals WHERE hypothetical_outcome IS NULL "
+            "AND json_extract(candidate_json, '$.symbol') = ?",
+            (symbol,),
         ).fetchall()
         if not rows:
             return 0
@@ -241,8 +244,6 @@ class ShadowCycle:
         resolved = 0
         for r in rows:
             cand = json.loads(r["candidate_json"])
-            if cand["symbol"] != symbol:
-                continue
             direction = cand["direction"]
             # только бары, ОТКРЫВШИЕСЯ ПОСЛЕ создания кандидата (анти-look-ahead) и
             # в пределах горизонта: старые уровни против сегодняшних цен — не исход

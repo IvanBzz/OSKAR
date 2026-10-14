@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from oskar.agents.budget import BudgetLimits, check_budget, log_call
+from oskar.agents.budget import BudgetLimits, CallBudget, check_budget
 from oskar.agents.claude_cli import AgentCallResult, call_claude, extract_json_block
 from oskar.contracts.schemas import SetupCandidate, SetupVerdict, TradeDecision
 
@@ -59,11 +59,9 @@ def decide(
 ) -> TraderResult:
     check_budget(journal, "trader", limits)
     prompt = build_prompt(candidate, scout_verdict)
-    call = call_claude(prompt, model=model, cli_cmd=cli_cmd)
-    log_call(
-        journal, run_id=run_id, agent="trader", decision_id=candidate.id,
-        model=call.model, prompt_sha=call.prompt_sha, prompt=prompt,
-        response=call.text, duration_ms=call.duration_ms,
+    call = call_claude(
+        prompt, model=model, cli_cmd=cli_cmd,
+        budget=CallBudget(journal, run_id, "trader", candidate.id, limits),
     )
     try:
         data = extract_json_block(call.text)
