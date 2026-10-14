@@ -253,3 +253,57 @@ def test_fast_lane_protects_open_trade_without_stop(tmp_path):
     ex.place_sl = lambda s, side, px, cid: placed.append(cid) or PlacedOrder("s2", cid, "STOP_MARKET", "open")
     mon.tick_pending()
     assert placed and trade(j, "o1")["sl_order_id"] == "s2"
+
+
+# ------------------------------------------- перепроверка Codex: частичные пункты
+
+
+def test_orphan_scan_reads_registry_after_order_list(tmp_path):
+    """Исполнение стартовало ПОСЛЕ прежнего снимка реестра, но до ответа списка ордеров:
+    его свежий SL уже в списке. Реестр теперь читается после списка — SL не снимается."""
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
+    cid = executor_mod.make_client_order_id("r7", "ETHUSDTUSDT-1-long")
+    key = cid_base(cid)
+
+    def listing():
+        with executor_mod._INFLIGHT_LOCK:  # исполнитель зарегистрировался и поставил SL
+            executor_mod._INFLIGHT.add(key)
+        return [OpenOrderRef(SYM, "fresh-sl", cid + "-sl", "sl")]
+
+    ex.open_orders_all = listing
+    try:
+        rep = mon.tick()
+    finally:
+        with executor_mod._INFLIGHT_LOCK:
+            executor_mod._INFLIGHT.discard(key)
+    assert ex.cancelled == [] and rep.orphans == []
+
+
+def test_history_never_cancels_foreign_full_size_order(tmp_path):
+    """Ручной TP Ивана объемом 3 (позиция 2) по другой цене — не наш: не снимается
+    при разборе истории; наш прикрепленный SL (объем = позиции, триггер плана) — засчитан."""
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
+    add_trade(j, "d1", qty=2.0, sl=98.0, tp=104.0, opened_at=T0 - timedelta(minutes=30))
+    j.execute("UPDATE trades SET sl_order_id=NULL, tp_order_id=NULL WHERE decision_id='d1'")
+    j.commit()
+    ms = int((T0 - timedelta(minutes=5)).timestamp() * 1000)
+    ex.protection = [
+        ProtectiveOrder("att-sl", "sl", 98.0, "filled", avg_price=97.9, timestamp_ms=ms, qty=2.0),
+        ProtectiveOrder("ivan-tp", "tp", 110.0, "open", qty=3.0),
+        ProtectiveOrder("att-tp", "tp", 104.0, "open", qty=2.0),
+    ]
+    ex.pos = []
+    mon.tick()
+    mon.tick()
+    t = trade(j, "d1")
+    assert t["close_reason"] == "sl_hit" and t["exit_price"] == 97.9
+    assert "ivan-tp" not in ex.cancelled and "att-tp" in ex.cancelled
+
+
+def test_fast_lane_runs_with_only_unprotected_open_trade(tmp_path):
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
+    add_trade(j, "o1")
+    assert not mon._has_pending()  # защищенная open — быстрому проходу делать нечего
+    j.execute("UPDATE trades SET sl_order_id=NULL WHERE decision_id='o1'")
+    j.commit()
+    assert mon._has_pending()  # open без SL — повод для быстрого прохода

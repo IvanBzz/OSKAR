@@ -195,7 +195,10 @@ def loser_overhold_count(
         if dur is not None and dur <= limit + OVERHOLD_GRACE_SEC:
             continue  # прожила меньше лимита — лосер она или нет, неважно
         pnl = t["realized_pnl"]
-        if dur is None or pnl is None:
+        # P&L без сверки по филлам биржи — оценка монитора, не факт: зеленым по нему
+        # INV-002 быть не может (перепроверка Codex: 20 несверенных «прибыльных» — green)
+        reconciled = ("reconciled" in t.keys()) and bool(t["reconciled"])
+        if dur is None or pnl is None or not reconciled:
             unknown.append(t)
         elif pnl < 0:
             over.append(t)
@@ -204,7 +207,7 @@ def loser_overhold_count(
     if over:
         detail += f" ({_ids(over)})"
     if unknown:
-        detail += f"; без P&L или длительности, не классифицировать: {_ids(unknown)}"
+        detail += f"; без сверенного P&L или длительности, не классифицировать: {_ids(unknown)}"
     return Measurement(len(over), len(trades), full and not unknown, detail + _shortfall(window, trades))
 
 

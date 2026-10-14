@@ -250,13 +250,20 @@ def _print_panic(result: dict) -> int:
     return 0 if ok else 1
 
 
+def _journal_db():
+    """Путь журнала — из settings.journal.db_path, тот же резолвер, что у демона
+    (перепроверка Codex: CLI читал зашитый data/oskar.db и мог сверять не тот журнал)."""
+    from oskar.core.bootstrap import load_settings
+    from oskar.core.daemon import journal_path
+
+    return journal_path(load_settings())
+
+
 def _cmd_invariants(args) -> int:
     """Ст. 5: вердикты инвариантов по журналу + заметка в vault/runs/ (ревью 2026-10-13, Codex #27)."""
-    from pathlib import Path
-
     from oskar.ops.invariants import cli_main
 
-    return cli_main(Path(__file__).resolve().parents[2] / "data" / "oskar.db", write_note=not args.no_note)
+    return cli_main(_journal_db(), write_note=not args.no_note)
 
 
 def _cmd_sync(args) -> int:
@@ -304,7 +311,7 @@ def _cmd_sync(args) -> int:
     if args.sync_command == "diff":
         from oskar.journal.db import connect
 
-        conn = connect(repo / "data" / "oskar.db")
+        conn = connect(_journal_db())
         try:
             d = diff_positions(view, conn)
             print(render_diff(d))
@@ -315,7 +322,7 @@ def _cmd_sync(args) -> int:
         # ст. 1 п. 1: закрытые сделки vs филлы биржи (ревью 2026-10-13, Claudexor H10)
         from oskar.sync.reconcile import cli_reconcile
 
-        return cli_reconcile(view, repo / "data" / "oskar.db", write=not args.dry_run)
+        return cli_reconcile(view, _journal_db(), write=not args.dry_run)
     return 0
 
 

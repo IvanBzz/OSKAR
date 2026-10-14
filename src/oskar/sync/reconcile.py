@@ -391,8 +391,12 @@ def _reconcile_one(
         res.note = "empty search window (trade older than exchange history?)"
         return res
 
+    # Окно — серверными startTs/until, БЕЗ локального since: ccxt 4.5 фильтрует по since
+    # сам и выкидывает филлы, чье время он не разобрал (BingX отдает filledTime, ccxt
+    # читает filledTm) — до нашего _fill_ts дело не доходило (перепроверка Codex).
     raw = exchange.fetch_my_trades(
-        t["symbol"], since=_ms(since), params={**FETCH_PARAMS, "until": _ms(end)}
+        t["symbol"], since=None,
+        params={**FETCH_PARAMS, "startTs": _ms(since), "until": _ms(end)},
     )
     fills = _unique([f for f in (parse_fill(x) for x in raw or []) if f is not None and f.key not in claimed])
     mine = Ownership.of(t)
@@ -414,7 +418,9 @@ def _reconcile_one(
             if mine.owns(f) is None
             and not any(o.owns(f) for o in others)
             and f.side == side
-            and f.position_side in ("", t["side"])
+            # окном (без точного id) сторону hedge-позиции нужно ДОКАЗАТЬ: безымянный sell
+            # мог закрывать short/открывать long (перепроверка Codex: +9.8 P&L на чужом филле)
+            and f.position_side == t["side"]
             and f.ts is not None and lo_ms <= f.ts <= hi_ms
         ]
 

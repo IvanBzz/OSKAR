@@ -56,6 +56,8 @@ class FakeFills:
         if self.fail is not None:
             raise self.fail
         until = params.get("until")
+        if since is None:
+            since = params.get("startTs")  # окно задается серверным startTs, как у BingX
         out = []
         for f in self.fills:
             ts = f["timestamp"]
@@ -296,12 +298,12 @@ def test_neighbour_trade_fills_do_not_leak(tmp_path):
 
 def test_fill_owned_by_another_trade_is_excluded(tmp_path):
     """Филл без positionSide, точно принадлежащий другой сделке (ее clientOrderId),
-    в окно нашей не попадает."""
+    в окно нашей не попадает; наш выход окном — только с подтвержденной стороной."""
     j = journal(tmp_path)
     a = add_closed(j, "a", reason="manual")
     add_closed(j, "c", side="short", status="open", reason=None, closed=None, cid="OSKAR-r1-c")
     ex = FakeFills([
-        fill("a-x", "sell", 101.0, 2.0, T0 + timedelta(minutes=30), pos=""),
+        fill("a-x", "sell", 101.0, 2.0, T0 + timedelta(minutes=30)),
         fill("c-e", "sell", 101.0, 2.0, T0 + timedelta(minutes=31), pos="", cid="oskar-r1-c"),
     ])
     r = reconcile_closed_trades(ex, j, NOW).results[0]
@@ -322,7 +324,9 @@ def test_query_params_window_and_units(tmp_path):
     reconcile_closed_trades(ex, j, NOW)
     symbol, since, params = ex.calls[0]
     assert symbol == SYM
-    assert since == ms(T0 - timedelta(seconds=120))
+    # окно — серверным startTs, без локального since: иначе ccxt выкидывал филлы с
+    # неразобранным временем (filledTime) до нашего разбора (перепроверка Codex)
+    assert since is None and params["startTs"] == ms(T0 - timedelta(seconds=120))
     assert params["until"] == ms(T0 + timedelta(hours=1, minutes=5))
     assert params["tradingUnit"] == FETCH_PARAMS["tradingUnit"] == "COIN"
 
@@ -466,3 +470,25 @@ def test_scheduler_alerts_journal_lie_once_html_escaped(tmp_path):
     rec.tick(NOW)
     assert len(sent) == 1 and "журнал расходился" in sent[0] and "exit_price 98" in sent[0]
     assert "<" not in sent[0].replace("&lt;", "")  # parse_mode=HTML не ломается
+
+
+def test_window_match_requires_confirmed_position_side(tmp_path):
+    """Перепроверка Codex: безымянный sell без positionSide раньше засчитывался закрытием
+    long (reconciled=1, P&L +9.8). Окном (без точного id) сторону нужно доказать."""
+    j = journal(tmp_path)
+    add_closed(j, "a", reason="manual")
+    ex = FakeFills([fill("x", "sell", 104.9, 2.0, T0 + timedelta(minutes=30), pos="")])
+    r = reconcile_closed_trades(ex, j, NOW).results[0]
+    assert r.status == STATUS_UNMATCHED and r.exit_qty == 0
+    assert j.execute("SELECT reconciled FROM trades").fetchone()[0] == 0
+
+
+def test_fills_without_ccxt_timestamp_survive_the_query(tmp_path):
+    """ccxt 4.5 не разбирает filledTime -> timestamp None; раньше локальный since ccxt их
+    выкидывал. Теперь окно серверное, время разбираем сами — филл находит свою сделку."""
+    j = journal(tmp_path)
+    add_closed(j, "a", reason="manual")
+    raw = fill("a-x", "sell", 101.0, 2.0, None, info={"filledTime": "2026-10-15T20:30:00.000+0800"})
+    ex = FakeFills([raw])
+    r = reconcile_closed_trades(ex, j, NOW).results[0]
+    assert r.status == STATUS_OK and r.exit_price == 101.0

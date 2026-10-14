@@ -442,8 +442,13 @@ class PositionMonitor:
         since = _parse_iso(t["created_at"]) or _parse_iso(t["opened_at"])
         since_ms = int(since.timestamp() * 1000) - 60_000 if since else 0
         qty = float(t["qty"] or 0) or None
+        def _target(o):
+            return t["sl_price"] if o.kind == "sl" else t["tp_price"]
+
         mine = [o for o in history
-                if owns_protection(o, owner_cid=str(t["client_order_id"]), position_qty=qty)]
+                if o.exchange_id in (t["sl_order_id"], t["tp_order_id"])
+                or owns_protection(o, owner_cid=str(t["client_order_id"]), position_qty=qty,
+                                   target_price=_target(o))]
         fills = [o for o in mine if o.status == "filled"
                  and (o.timestamp_ms is None or o.timestamp_ms >= since_ms)]
         if not fills:
@@ -592,16 +597,21 @@ class PositionMonitor:
         if last is not None and (now - last).total_seconds() < ORPHAN_SCAN_SEC:
             return
         self._orphan_scan_at = now
+        from oskar.core.executor import inflight_client_ids
+
+        # Порядок важен (перепроверка Codex): сначала список ордеров, потом реестр «в
+        # процессе», потом журнал. Ордер из списка поставлен исполнением, которое
+        # зарегистрировалось ДО постановки: оно либо еще в реестре, либо уже записало
+        # сделку (запись — до снятия с реестра) и видно в журнале, читаемом последним.
+        orders = self._ex.open_orders_all()
+        known_cids = set(inflight_client_ids())
         live = self._j.execute(
             "SELECT client_order_id, entry_order_id, sl_order_id, tp_order_id FROM trades "
             "WHERE status IN ('pending','open')"
         ).fetchall()
         known_ids = {x for r in live for x in (r["entry_order_id"], r["sl_order_id"], r["tp_order_id"]) if x}
-        known_cids = {cid_base(str(r["client_order_id"])) for r in live}
-        from oskar.core.executor import inflight_client_ids
-
-        known_cids |= inflight_client_ids()  # исполнитель ставит ордера, записи еще нет
-        for o in self._ex.open_orders_all():
+        known_cids |= {cid_base(str(r["client_order_id"])) for r in live}
+        for o in orders:
             cid = o.client_order_id.lower()
             if not cid.startswith("oskar-"):
                 continue
@@ -669,7 +679,12 @@ class PositionMonitor:
     # ---------------------------------------------------------------- thread
 
     def _has_pending(self) -> bool:
-        return self._j.execute("SELECT 1 FROM trades WHERE status='pending' LIMIT 1").fetchone() is not None
+        # pending-входы ИЛИ open без подтвержденного SL (перепроверка Codex: при одной open
+        # без стопа быстрый проход не запускался — повтор ждал полного тика)
+        return self._j.execute(
+            "SELECT 1 FROM trades WHERE status='pending' "
+            "OR (status='open' AND sl_order_id IS NULL) LIMIT 1"
+        ).fetchone() is not None
 
     def run_forever(self) -> None:
         logger.info("position monitor started (interval=%.0fs, pending=%.0fs)",

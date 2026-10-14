@@ -99,18 +99,27 @@ def cid_base(client_order_id: str) -> str:
     return "-".join(client_order_id.lower().split("-")[:3])
 
 
-def owns_protection(o: ProtectiveOrder, *, owner_cid: str, position_qty: float | None) -> bool:
+def owns_protection(o: ProtectiveOrder, *, owner_cid: str, position_qty: float | None,
+                    target_price: float | None = None, tolerance_pct: float = 0.1) -> bool:
     """Принадлежит ли ордер защиты сделке. Ревью Codex раунд 2 (high #3): ручной стоп
     на 0.1 «усыновлялся» для позиции 2 — после его исполнения журнал закрывал всю сделку
     и снимал свой TP, а на бирже оставалось 1.9. Теперь:
-    - чужой cid OSKAR (другая сделка) — не наш;
-    - объем: closePosition или qty >= 99% позиции; частичный стоп всю позицию не защищает."""
+    - любой непустой чужой cid — не наш (ручной ордер с меткой, другая сделка OSKAR);
+    - наш cid (база OSKAR-<run>-<hash>) — наш;
+    - пустой cid — так выглядят и прикрепленные биржей SL/TP, и ручные ордера из UI:
+      наш, только если покрывает позицию (closePosition или qty >= 99%) И, когда задан
+      target_price, триггер совпадает с нашим планом (перепроверка Codex: ручной TP Ивана
+      объемом 3 при позиции 2 снимался при разборе истории)."""
     cid = o.client_order_id.lower()
-    if cid.startswith("oskar-") and cid_base(cid) != cid_base(owner_cid):
+    if cid:
+        return cid_base(cid) == cid_base(owner_cid)
+    covers = o.close_position or position_qty is None or (
+        o.qty is not None and o.qty >= position_qty * 0.99)
+    if not covers:
         return False
-    if o.close_position or position_qty is None:
-        return True
-    return o.qty is not None and o.qty >= position_qty * 0.99
+    if target_price is None or o.trigger_price is None:
+        return target_price is None
+    return abs(o.trigger_price - target_price) <= abs(target_price) * tolerance_pct / 100.0
 
 
 def pick_protection(orders: list[ProtectiveOrder], kind: str, target: float,

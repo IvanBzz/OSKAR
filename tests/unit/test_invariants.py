@@ -116,7 +116,7 @@ def test_hours_window_excludes_old_trades(tmp_path):
 
 def test_loser_overhold_red(tmp_path):
     j = connect(tmp_path / "j.db")
-    tid = add(j, "slow", pnl=-3.0, duration=LIMIT + OVERHOLD_GRACE_SEC + 60)
+    tid = add(j, "slow", pnl=-3.0, duration=LIMIT + OVERHOLD_GRACE_SEC + 60, reconciled=1)
     v = one(j, inv("loser_overhold_count", {"closed_trades": 20}))
     assert v.status == RED and v.value == 1 and f"#{tid}" in v.detail
 
@@ -124,8 +124,8 @@ def test_loser_overhold_red(tmp_path):
 def test_duration_stop_within_grace_winners_any_age(tmp_path):
     """Duration-stop закрывает на тике после лимита — люфт; победитель может жить сколько угодно."""
     j = connect(tmp_path / "j.db")
-    add(j, "stop", reason="duration_timeout", pnl=-2.0, duration=LIMIT + 90)
-    add(j, "winner", reason="tp_hit", pnl=5.0, duration=LIMIT * 4)
+    add(j, "stop", reason="duration_timeout", pnl=-2.0, duration=LIMIT + 90, reconciled=1)
+    add(j, "winner", reason="tp_hit", pnl=5.0, duration=LIMIT * 4, reconciled=1)
     v = one(j, inv("loser_overhold_count", {"hours": 48}))
     assert v.status == GREEN and v.value == 0
 
@@ -262,3 +262,13 @@ def test_cli_main_exit_codes(tmp_path, capsys):
     runs = tmp_path / "runs"
     assert cli_main(db, now=NOW, runs_dir=runs, invariants=spec) == 1
     assert len(list(runs.glob("*.md"))) == 1
+
+
+def test_unreconciled_pnl_never_proves_green(tmp_path):
+    """Перепроверка Codex: 20 несверенных «прибыльных» сделок дольше лимита давали green —
+    P&L монитора не факт, пока сверка по филлам его не подтвердила."""
+    j = connect(tmp_path / "j.db")
+    for i in range(20):
+        add(j, f"w{i}", reason="manual", pnl=5.0, duration=LIMIT * 2, reconciled=0)
+    v = one(j, inv("loser_overhold_count", {"closed_trades": 20}))
+    assert v.status == INSUFFICIENT
