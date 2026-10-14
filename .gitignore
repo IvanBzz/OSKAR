@@ -29,3 +29,6 @@ vault/.obsidian/cache/
 Thumbs.db
 .idea/
 .vscode/
+
+# рабочие копии агентов (worktree) — не часть репозитория
+/.claude/
