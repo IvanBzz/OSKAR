@@ -132,7 +132,11 @@ def test_market_qty_resized_to_plan_risk_at_live_price(tmp_path):
         p.candidate_id, "market"
     )
     assert out.ok
-    assert paper.positions()[0].qty == pytest.approx(1.22 / 2.0, rel=1e-4)
+    from oskar.risk.sizing import qty_for_risk
+
+    # риск плана держится от фактического входа 100 (стоп 98) с издержками; без
+    # пересайзинга было бы 1.22 x |100-98| = $2.44 — вдвое больше плана
+    assert paper.positions()[0].qty == pytest.approx(qty_for_risk(1.22, 100.0, 98.0), rel=1e-4)
 
 
 def test_position_limit_and_duplicate_checked_at_press(tmp_path):

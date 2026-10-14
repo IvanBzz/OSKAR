@@ -20,10 +20,12 @@ from oskar.contracts.schemas import (
 )
 from oskar.data.symbols import canonical
 from oskar.risk.sizing import (
+    RISK_CAP_REL_EPS,
     RR_TOLERANCE,
     dynamic_leverage,
     fee_adjusted_rr,
     position_size,
+    stop_loss_per_unit,
 )
 
 
@@ -52,7 +54,9 @@ class ProfileLimits:
 class OpenPosition:
     symbol: str  # канонический
     side: str  # long | short
-    risk_usd: float  # риск позиции (потеря при SL-хите) — экспозиция портфеля = сумма рисков
+    # риск позиции (потеря при SL-хите С издержками, как RiskComputed.risk_usd) —
+    # экспозиция портфеля = сумма рисков
+    risk_usd: float
 
 
 @dataclass
@@ -156,19 +160,33 @@ def evaluate(inp: RiskInput, caps: Caps, profile: ProfileLimits) -> RiskVerdict:
     ):
         return verdict(False)
 
-    # 7-8. леверидж и размер (только Python, ст. 2)
+    # 7. леверидж (только Python, ст. 2): ЦЕЛЫЙ — ровно то, что уйдет на биржу. Раньше
+    # маржа проверялась на 4.4x, а отправлялось 4x (ревью 2026-10-13, Codex #20); и
+    # непройденный шаг не останавливал лестницу — теперь останавливает.
     lev_cap = min(profile.max_leverage, caps.max_leverage)
     leverage = dynamic_leverage(lev_cap, inp.confidence, sl_dist_pct)
-    size = position_size(inp.equity_usd, caps.risk_per_trade_pct, inp.entry, inp.sl, leverage)
-    step("leverage", leverage <= lev_cap, value=f"{leverage}x", limit=f"<={lev_cap}x")
-    step(
-        "risk_per_trade",
-        True,  # размер ВЫЧИСЛЕН из капса, нарушение невозможно по построению
-        value=f"${size.risk_usd:.2f}",
-        limit=f"{caps.risk_per_trade_pct}% of ${inp.equity_usd:.2f}",
-    )
+    if not step("leverage", leverage <= lev_cap, value=f"{leverage}x", limit=f"<={lev_cap:g}x"):
+        return verdict(False)
 
-    # 8b. осуществимость: маржа новой позиции должна помещаться в equity
+    # 8. денежный риск-кап С ИЗДЕРЖКАМИ (ревью 2026-10-13, Codex #21). Раньше шаг был
+    # True «по построению», а построение (qty = risk / |entry - SL|) издержек не знало:
+    # $1000, 1%, entry 100, SL 99.5 -> qty 20 -> на стопе $10 хода + ~$3 комиссий и
+    # проскальзывания. Потеря пересчитывается из qty здесь же — шаг поймает любой
+    # сайзинг, забывший издержки. Это значение и уходит в RiskComputed.risk_usd.
+    size = position_size(inp.equity_usd, caps.risk_per_trade_pct, inp.entry, inp.sl, leverage)
+    risk_cap_usd = inp.equity_usd * caps.risk_per_trade_pct / 100.0
+    money_risk = size.qty * stop_loss_per_unit(inp.entry, inp.sl)
+    price_risk = size.qty * sl_dist
+    if not step(
+        "risk_per_trade",
+        money_risk <= risk_cap_usd * (1.0 + RISK_CAP_REL_EPS),
+        value=f"${money_risk:.2f} (ход ${price_risk:.2f} + издержки ${money_risk - price_risk:.2f})",
+        limit=f"<=${risk_cap_usd:.2f} ({caps.risk_per_trade_pct}% of ${inp.equity_usd:.2f})",
+    ):
+        return verdict(False)
+
+    # 8b. осуществимость: маржа новой позиции (notional / ЦЕЛОЕ плечо — то, что
+    # зарезервирует биржа) должна помещаться в equity
     if not step(
         "margin_feasible",
         size.margin_usd < inp.equity_usd,
@@ -180,7 +198,7 @@ def evaluate(inp: RiskInput, caps: Caps, profile: ProfileLimits) -> RiskVerdict:
     # 9. суммарный риск портфеля + лимит позиций + дубли
     sym = canonical(inp.candidate.symbol)
     open_risk = sum(p.risk_usd for p in inp.open_positions)
-    total_risk_pct = (open_risk + size.risk_usd) / inp.equity_usd * 100.0
+    total_risk_pct = (open_risk + money_risk) / inp.equity_usd * 100.0
     if not step(
         "portfolio_total_risk",
         total_risk_pct <= caps.max_total_risk_pct,
@@ -231,8 +249,8 @@ def evaluate(inp: RiskInput, caps: Caps, profile: ProfileLimits) -> RiskVerdict:
 
     computed = RiskComputed(
         qty=size.qty,
-        leverage=leverage,
-        risk_usd=size.risk_usd,
+        leverage=leverage,  # целое; контракт float — 4 станет 4.0, дробного не бывает
+        risk_usd=money_risk,  # потеря при стоп-ауте С издержками, <= капа (шаг 8)
         rr_fee_adjusted=round(rr, 4),
     )
     return verdict(True)

@@ -40,6 +40,7 @@ from oskar.contracts.schemas import ExecutionPlan
 from oskar.data.client import classify_error, exchange_error_code
 from oskar.execution.base import ExchangeAdapter, PlacedOrder, pick_protection
 from oskar.journal.db import transaction
+from oskar.risk.sizing import qty_for_risk
 
 logger = logging.getLogger("oskar.executor")
 
@@ -160,13 +161,14 @@ class ExecutionService:
     @staticmethod
     def risk_sized_qty(plan: ExecutionPlan, entry_price: float) -> float:
         """qty под ФАКТИЧЕСКУЮ цену входа: план хранит одну qty для обоих входов, а
-        риск = qty * |entry - SL|. Кнопка «Маркет» при цене дальше от стопа, чем
-        проверенный лестницей вход, раздувала риск (Codex 2026-10-13: $10 -> $30).
+        потеря на стопе зависит от входа. Кнопка «Маркет» при цене дальше от стопа,
+        чем проверенный лестницей вход, раздувала риск (Codex 2026-10-13: $10 -> $30).
+        Та же формула, что у лестницы — с комиссиями и проскальзыванием стопа
+        (plan.risk_usd их включает, блок B), иначе издержки снова выпали бы из капа.
         Детерминированная арифметика, не решение модели (ст. 2). Только вниз."""
-        dist = abs(entry_price - plan.sl)
-        if dist <= 0:
+        if abs(entry_price - plan.sl) <= 0:
             return plan.qty
-        return min(plan.qty, plan.risk_usd / dist)
+        return min(plan.qty, qty_for_risk(plan.risk_usd, entry_price, plan.sl))
 
     # -------------------------------------------------------------- execute
 

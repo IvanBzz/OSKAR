@@ -67,9 +67,13 @@ def test_market_execution_places_entry_sl_tp(tmp_path):
     assert row["client_order_id"].startswith("OSKAR-r1-")
 
     positions = adapter.positions()
-    # qty ограничена риском плана от фактической цены входа: 1.22 / |100 - 103.5|
+    # qty ограничена риском плана от фактической цены входа С издержками (блок B):
+    # потеря на стопе = ход до SL + проскальзывание + taker обеих ног
     # (фикстура несет qty 2.7429 — исполнитель ей не верит, ревью Codex 2026-10-13)
-    assert len(positions) == 1 and positions[0].qty == pytest.approx(1.22 / 3.5, rel=1e-4)
+    from oskar.risk.sizing import qty_for_risk
+
+    expected = qty_for_risk(1.22, 100.0, 103.5)
+    assert len(positions) == 1 and positions[0].qty == pytest.approx(expected, rel=1e-4)
 
     dec = j.execute(
         "SELECT outcome, outcome_detail FROM decisions WHERE decision_id=?", (p.candidate_id,)

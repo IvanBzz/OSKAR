@@ -1,6 +1,9 @@
 """Риск-лестница: таблично каждый шаг, edge cases v1, анти-feedback сторож."""
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
+
+import pytest
 
 from oskar.contracts.schemas import (
     FvgInfo,
@@ -9,6 +12,8 @@ from oskar.contracts.schemas import (
     SetupCandidate,
     SetupFeatures,
 )
+from oskar.core.escalation import build_plan
+from oskar.risk import ladder
 from oskar.risk.ladder import (
     FORBIDDEN_INPUT_FIELDS,
     Caps,
@@ -17,6 +22,7 @@ from oskar.risk.ladder import (
     RiskInput,
     evaluate,
 )
+from oskar.risk.sizing import PositionSize
 
 CAPS = Caps(
     risk_per_trade_pct=1.0,
@@ -62,7 +68,7 @@ def good_input(**overrides) -> RiskInput:
         candidate=candidate(),
         entry=100.0,
         sl=101.5,  # 1.5% SHORT
-        tp=96.0,   # rr_fee = (4 - 0.16) / 1.5 = 2.56
+        tp=96.0,   # rr_fee = (4 - 0.20) / 1.5 = 2.53
         confidence=68,
         equity_usd=1000.0,
     )
@@ -74,11 +80,18 @@ def failed_step(verdict):
     return next((s.name for s in verdict.steps if not s.passed), None)
 
 
+def stop_loss_usd(qty: float, entry: float, sl: float) -> float:
+    """Независимый пересчет потери на стопе: исполнение хуже SL на 0.05% от entry,
+    taker BingX 0.05% на вход и на выход (каждая нога от своей цены)."""
+    exit_px = sl - 0.0005 * entry if sl < entry else sl + 0.0005 * entry
+    return qty * abs(entry - exit_px) + qty * 0.0005 * (entry + exit_px)
+
+
 def test_happy_path_passes():
     v = evaluate(good_input(), CAPS, PROFILE)
     assert v.passed, [s for s in v.steps if not s.passed]
     assert v.computed is not None
-    assert v.computed.risk_usd == 10.0
+    assert v.computed.risk_usd == pytest.approx(10.0)
     assert v.computed.leverage <= 8
     assert len(v.caps_hash) == 64
 
@@ -123,7 +136,7 @@ def test_wrong_price_geometry_blocks():
 
 
 def test_rr_below_floor_blocks():
-    # SHORT: SL 101.5 (1.5), TP 97.5 (2.5): rr = (2.5-0.16)/1.5 = 1.56 < 2.0
+    # SHORT: SL 101.5 (1.5), TP 97.5 (2.5): rr = (2.5-0.20)/1.5 = 1.53 < 2.0
     v = evaluate(good_input(tp=97.5), CAPS, PROFILE)
     assert not v.passed and failed_step(v) == "rr_fee_adjusted"
 
@@ -131,8 +144,8 @@ def test_rr_below_floor_blocks():
 def test_rr_float_tolerance_v1_bug():
     """Урок v1: R:R на границе с плавающей точкой не должен резаться.
     Подбираем TP так, чтобы rr_fee = 1.9999.. — проходит с tolerance 0.01."""
-    # rr = (tp_dist - 0.16) / 1.5 = 1.995 -> tp_dist = 3.1525
-    v = evaluate(good_input(tp=100.0 - 3.1525), CAPS, PROFILE)
+    # rr = (tp_dist - 0.20) / 1.5 = 1.995 -> tp_dist = 3.1925
+    v = evaluate(good_input(tp=100.0 - 3.1925), CAPS, PROFILE)
     assert v.passed, failed_step(v)
 
 
@@ -144,10 +157,81 @@ def test_total_risk_cap_blocks():
 
 
 def test_margin_infeasible_blocks():
-    """Леверидж 1x + узкий стоп 0.5%: маржа = 2x equity — не помещается."""
+    """Леверидж 1x + узкий стоп 0.5%: маржа ~1.5x equity — не помещается."""
     no_lev = ProfileLimits(sl_dist_pct_min=0.4, sl_dist_pct_max=3.0, max_leverage=1)
     v = evaluate(good_input(sl=100.5, tp=97.5), CAPS, no_lev)  # SHORT, SL 0.5%
     assert not v.passed and failed_step(v) == "margin_feasible"
+
+
+# --- ревью 2026-10-13: Codex #20 (целое плечо) и #21 (издержки в риск-капе) ---
+
+
+def test_leverage_is_whole_number_sent_to_exchange():
+    """8x * conf 68 * SL 1.5% = 4.416: раньше в вердикт шло 4.4x, а BingX получал 4x."""
+    v = evaluate(good_input(), CAPS, PROFILE)
+    assert v.passed, failed_step(v)
+    assert v.computed.leverage == 4
+    lev_step = next(s for s in v.steps if s.name == "leverage")
+    assert lev_step.value == "4x"
+    margin = next(s for s in v.steps if s.name == "margin_feasible")
+    assert margin.value == f"${v.computed.qty * 100.0 / 4:.2f}"  # notional / ЦЕЛОЕ плечо
+
+
+def test_margin_checked_on_integer_leverage():
+    """Кап 3x * conf 75 = 1.95x: на 1.95x маржа $789 влезла бы в $1000, но на биржу
+    уйдет 1x — маржа $1538 не помещается. Проверяется то, что будет отправлено."""
+    profile = ProfileLimits(sl_dist_pct_min=0.4, sl_dist_pct_max=3.0, max_leverage=3)
+    v = evaluate(good_input(sl=100.5, tp=97.5, confidence=75), CAPS, profile)
+    assert not v.passed and failed_step(v) == "margin_feasible"
+    assert next(s for s in v.steps if s.name == "leverage").value == "1x"
+
+
+def test_leverage_step_stops_ladder():
+    """Непройденный шаг «leverage» раньше писался в след, но лестница шла дальше и
+    давала passed=True. Кап < 1x: минимальное целое плечо 1x — отказ."""
+    sub_one = ProfileLimits(sl_dist_pct_min=0.5, sl_dist_pct_max=3.0, max_leverage=0.5)
+    v = evaluate(good_input(), CAPS, sub_one)
+    assert not v.passed and failed_step(v) == "leverage"
+
+
+def test_risk_per_trade_includes_costs_codex_scenario():
+    """Codex #21: $1000, 1%, LONG entry 100, SL 99.5 -> было qty 20 и на стопе
+    $10 хода + ~$3 издержек. Теперь потеря С комиссиями и проскальзыванием = $10."""
+    inp = good_input(candidate=candidate(direction="long"), sl=99.5, tp=102.0)
+    v = evaluate(inp, CAPS, PROFILE)
+    assert v.passed, failed_step(v)
+    assert v.computed.qty == pytest.approx(15.391, abs=1e-3)
+    loss = stop_loss_usd(v.computed.qty, 100.0, 99.5)
+    assert loss == pytest.approx(10.0) and v.computed.risk_usd == pytest.approx(loss)
+    step = next(s for s in v.steps if s.name == "risk_per_trade")
+    assert "издержки" in step.value and step.limit.startswith("<=$10.00")
+
+
+def test_risk_per_trade_rejects_fee_blind_sizing(monkeypatch):
+    """Шаг больше не `True` по построению: сайзинг, забывший издержки (старая формула
+    qty = risk / |entry - SL|), отклоняется — потеря на стопе выше капа."""
+
+    def legacy(equity_usd, risk_pct, entry, sl, leverage):
+        risk = equity_usd * risk_pct / 100.0
+        qty = risk / abs(entry - sl)
+        return PositionSize(qty=qty, leverage=leverage, risk_usd=risk,
+                            margin_usd=qty * entry / leverage, notional_usd=qty * entry)
+
+    monkeypatch.setattr(ladder, "position_size", legacy)
+    v = evaluate(good_input(), CAPS, PROFILE)
+    assert not v.passed and failed_step(v) == "risk_per_trade"
+
+
+def test_plan_money_fields_come_from_verdict():
+    """build_plan: qty/leverage/risk_usd — из вердикта как есть. Плечо целое,
+    risk_usd — потеря на стопе С издержками от входа, проверенного лестницей."""
+    v = evaluate(good_input(), CAPS, PROFILE)
+    plan = build_plan(candidate(), v, SimpleNamespace(tldr=""), 100.0, 101.5, 96.0, "limit")
+    assert (plan.qty, plan.leverage, plan.risk_usd) == (
+        v.computed.qty, v.computed.leverage, v.computed.risk_usd)
+    assert plan.leverage == int(plan.leverage)
+    assert plan.risk_usd == pytest.approx(stop_loss_usd(plan.qty, 100.0, 101.5))
+    assert plan.risk_usd <= 10.0 * (1 + 1e-9)
 
 
 def test_max_positions_blocks():
