@@ -47,6 +47,9 @@ class OrderState:
     filled_qty: float = 0.0
     avg_price: float | None = None
     fee: float | None = None  # комиссия в quote, если биржа отдала
+    # время исполнения по бирже (ms): opened_at сделки — от него, а не от момента опроса
+    # монитором (иначе SL, сработавший до первого опроса, выпадал из истории — Codex р.2 #6)
+    timestamp_ms: int | None = None
 
     @property
     def is_filled(self) -> bool:
@@ -72,6 +75,8 @@ class ProtectiveOrder:
     fee: float | None = None
     timestamp_ms: int | None = None  # время исполнения/обновления (для истории)
     client_order_id: str = ""
+    qty: float | None = None  # объем ордера (у прикрепленных = объем входа)
+    close_position: bool = False  # closePosition: закрывает всю позицию, объем не задан
 
 
 @dataclass(frozen=True)
@@ -89,13 +94,36 @@ class OrderNotFoundError(RuntimeError):
     «нет ордера» — факт для решений монитора, «не дозвонились» — повод повторить."""
 
 
+def cid_base(client_order_id: str) -> str:
+    """База clientOrderId OSKAR: OSKAR-<run>-<hash> (без -sl/-tp/-rN), нижний регистр."""
+    return "-".join(client_order_id.lower().split("-")[:3])
+
+
+def owns_protection(o: ProtectiveOrder, *, owner_cid: str, position_qty: float | None) -> bool:
+    """Принадлежит ли ордер защиты сделке. Ревью Codex раунд 2 (high #3): ручной стоп
+    на 0.1 «усыновлялся» для позиции 2 — после его исполнения журнал закрывал всю сделку
+    и снимал свой TP, а на бирже оставалось 1.9. Теперь:
+    - чужой cid OSKAR (другая сделка) — не наш;
+    - объем: closePosition или qty >= 99% позиции; частичный стоп всю позицию не защищает."""
+    cid = o.client_order_id.lower()
+    if cid.startswith("oskar-") and cid_base(cid) != cid_base(owner_cid):
+        return False
+    if o.close_position or position_qty is None:
+        return True
+    return o.qty is not None and o.qty >= position_qty * 0.99
+
+
 def pick_protection(orders: list[ProtectiveOrder], kind: str, target: float,
-                    tolerance_pct: float = 0.5) -> ProtectiveOrder | None:
+                    tolerance_pct: float = 0.5, *, owner_cid: str | None = None,
+                    position_qty: float | None = None) -> ProtectiveOrder | None:
     """Ордер защиты нужного вида с триггером ближе всего к целевой цене плана.
-    Допуск отсекает чужие ордера на том же символе (ручные ордера Ивана)."""
+    Допуск отсекает чужие ордера на том же символе (ручные ордера Ивана); с owner_cid —
+    еще и проверка принадлежности и объема (owns_protection)."""
     best, best_diff = None, None
     for o in orders:
         if o.kind != kind or o.trigger_price is None:
+            continue
+        if owner_cid is not None and not owns_protection(o, owner_cid=owner_cid, position_qty=position_qty):
             continue
         diff = abs(o.trigger_price - target)
         if diff > abs(target) * tolerance_pct / 100.0:

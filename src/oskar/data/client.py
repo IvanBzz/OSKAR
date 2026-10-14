@@ -52,8 +52,10 @@ RWA_BASE_RE = re.compile(r"^NC(SK|FX|CO|SI)[A-Z0-9]{2,}$")
 
 _CODE_RE = re.compile(r'"code"\s*:\s*"?(\d+)"?')
 _RETRY_AFTER_RE = re.compile(r"retry after time:\s*(\d{10,13})")
-# 429 отдельным числом: не часть цены «0.429» и не хвост кода 109429 (ревью диффа Codex)
-_HTTP_429_RE = re.compile(r"(?<![\d.])429(?![\d.])")
+# HTTP 429 — только как статус ответа, не любое «429» в тексте: в тексте ccxt бывают URL с
+# параметрами (quantity=429), цены (0.429) и код 109429 (ревью диффа Codex, оба раунда)
+_HTTP_429_STATUS_RE = re.compile(r"\b429\s+Too Many Requests\b", re.I)
+_HTTP_429_RE = re.compile(r'HTTP(?:/\d(?:\.\d)?)?\s*429\b|"code"\s*:\s*"?429\b')
 _RETRY_AFTER_HEADER_RE = re.compile(r"\bretry-after\b[\"']?\s*[:=]\s*[\"']?([^\r\n\"'}]+)", re.I)
 
 
@@ -99,12 +101,18 @@ def classify_error(e: Exception) -> str:
     Только класс «symbol» приговаривает символ и расходует бюджет ошибок:
     именно эти ответы BingX считает в счетчике нарушений."""
     code = exchange_error_code(e)
+    text = str(e)
     # Ревью 2026-10-13, #25: лимит общий для клиента; ccxt наследует его от сетевых ошибок.
-    if (code in COOLDOWN_CODES or _HTTP_429_RE.search(str(e))
-            or any(base.__name__ in {"DDoSProtection", "RateLimitExceeded"} for base in type(e).__mro__)):
+    if (any(base.__name__ in {"DDoSProtection", "RateLimitExceeded"} for base in type(e).__mro__)
+            or _HTTP_429_STATUS_RE.search(text)):
         return "cooldown"
+    # Сетевую ошибку решает ТИП, а не текст: в тексте ccxt — URL запроса с параметрами,
+    # и «quantity=429» превращал таймаут входа в «rate limit» -> исполнитель повторял
+    # вход вслепую (ревью Codex раунд 2, high #1)
     if _retryable(e):
         return "network"
+    if code in COOLDOWN_CODES or code == "429" or _HTTP_429_RE.search(text):
+        return "cooldown"
     if code in TRANSIENT_CODES:
         return "transient"
     # ccxt типизирует серверные сбои (100500 и т.п.) как OperationFailed — это

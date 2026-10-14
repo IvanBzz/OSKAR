@@ -81,8 +81,9 @@ class ScriptedExchange(ExchangeAdapter):
         if filled:
             self.pos = [PositionInfo(symbol, side, qty, 100.0, 0.0)]
             if stop_loss is not None:  # биржа создает прикрепленные SL/TP при исполнении
-                self.protection = [ProtectiveOrder("att-sl", "sl", stop_loss, "open"),
-                                   ProtectiveOrder("att-tp", "tp", take_profit, "open")]
+                # у прикрепленных SL/TP BingX объем = объему входа (ccxt amount)
+                self.protection = [ProtectiveOrder("att-sl", "sl", stop_loss, "open", qty=qty),
+                                   ProtectiveOrder("att-tp", "tp", take_profit, "open", qty=qty)]
         return PlacedOrder(oid, cid, entry_type.upper(), "open")
 
     def place_sl(self, symbol, side, stop_price, cid):
@@ -269,8 +270,8 @@ def test_monitor_adopts_attached_protection_after_limit_fill(tmp_path):
               "entry_type='limit' WHERE decision_id='p1'")
     j.commit()
     ex.orders["e1"] = OrderState("e1", "filled", 2.0, 99.5, 0.03)
-    ex.protection = [ProtectiveOrder("x-sl", "sl", 98.0, "open"),
-                     ProtectiveOrder("x-tp", "tp", 104.0, "open")]
+    ex.protection = [ProtectiveOrder("x-sl", "sl", 98.0, "open", qty=2.0),
+                     ProtectiveOrder("x-tp", "tp", 104.0, "open", qty=2.0)]
     rep = mon.tick_pending()
     t = trade(j, "p1")
     assert t["status"] == "open" and t["entry_price"] == 99.5
@@ -325,9 +326,10 @@ def test_vanished_position_classified_by_exchange_history(tmp_path):
     opened_ms = int((T0 - timedelta(minutes=30)).timestamp() * 1000)
     ex.protection = [
         ProtectiveOrder("h-sl", "sl", 98.0, "filled", avg_price=97.9, fee=0.1,
-                        timestamp_ms=opened_ms + 60_000),
-        ProtectiveOrder("h-tp", "tp", 104.0, "open"),
-        ProtectiveOrder("old-sl", "sl", 98.0, "filled", avg_price=50.0, timestamp_ms=opened_ms - 10**7),
+                        timestamp_ms=opened_ms + 60_000, qty=2.0),
+        ProtectiveOrder("h-tp", "tp", 104.0, "open", qty=2.0),
+        ProtectiveOrder("old-sl", "sl", 98.0, "filled", avg_price=50.0, timestamp_ms=opened_ms - 10**7,
+                        qty=2.0),
     ]
     ex.pos = []
     mon.tick()

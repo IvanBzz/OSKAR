@@ -89,9 +89,11 @@ def add_trade(j, decision_id, *, status="open", symbol=SYM, side="long", entry=1
     j.execute(
         "INSERT INTO trades (run_id, decision_id, client_order_id, symbol, side, status, "
         "entry_price, qty, leverage, risk_usd, sl_price, tp_price, sl_order_id, tp_order_id, "
-        "setup_type, timeframe, reasoning, opened_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "setup_type, timeframe, reasoning, opened_at, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (run_id, decision_id, f"OSKAR-{run_id}-{decision_id}", symbol, side, status, entry, qty,
-         5.0, 1.0, sl, tp, f"{decision_id}-sl", f"{decision_id}-tp", "", "15m", "tldr", _iso(opened_at)),
+         5.0, 1.0, sl, tp, f"{decision_id}-sl", f"{decision_id}-tp", "", "15m", "tldr", _iso(opened_at),
+         _iso(opened_at)),  # created_at по тестовым часам: окно истории считается от него
     )
     j.execute(
         "INSERT INTO decisions (run_id, decision_id, candidate_json, outcome) "

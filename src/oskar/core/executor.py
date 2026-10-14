@@ -32,13 +32,14 @@ closePosition-ордера SL/TP, пока позиции нет — 109420 «po
 import hashlib
 import logging
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from oskar.contracts.schemas import ExecutionPlan
 from oskar.data.client import classify_error, exchange_error_code
-from oskar.execution.base import ExchangeAdapter, PlacedOrder, pick_protection
+from oskar.execution.base import ExchangeAdapter, PlacedOrder, cid_base, pick_protection
 from oskar.journal.db import transaction
 from oskar.risk.sizing import qty_for_risk
 
@@ -48,6 +49,27 @@ DEFAULT_MAX_DRIFT_PCT = 0.5  # цена ушла дальше — план ус�
 POSITION_MISSING_CODE = "109420"  # BingX: «position not exist» — позиции (еще) нет
 POSITION_WAIT_SEC = 6.0  # маркет без прикрепленной защиты: ждать появления позиции
 NETWORK_RETRIES = 2  # идемпотентные вызовы (плечо): таймаут VST — повтор, не отказ
+
+
+# Входы «в процессе»: исполнитель (поток кнопок) уже шлет ордера, а запись в журнале
+# появится только в конце. Монитор (свой поток) не должен в это окно ни принять их
+# ордера за сирот и снять (ревью Codex раунд 2, high #2), ни ставить защиту параллельно.
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT: set[str] = set()  # база clientOrderId (OSKAR-<run>-<hash>), нижний регистр
+
+
+def inflight_client_ids() -> set[str]:
+    with _INFLIGHT_LOCK:
+        return set(_INFLIGHT)
+
+
+def _is_ambiguous(e: Exception) -> bool:
+    """Принят ли запрос биржей — неизвестно: сеть/таймаут (вся ветка NetworkError ccxt,
+    включая rate limit). Решает ТИП исключения: в тексте ccxt — URL с параметрами, по нему
+    «quantity=429» выглядел как отказ и вход повторялся вслепую (Codex раунд 2, high #1)."""
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return True
+    return any(b.__name__ in ("NetworkError", "RequestTimeout") for b in type(e).__mro__)
 
 
 class ExecutionError(RuntimeError):
@@ -174,6 +196,16 @@ class ExecutionService:
 
     def execute(self, decision_id: str, mode: str) -> ExecutionOutcome:
         """mode: market | limit. Возвращает исход; исключения не пробрасывает."""
+        key = cid_base(make_client_order_id(self._run_id, decision_id))
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.add(key)
+        try:
+            return self._execute(decision_id, mode)
+        finally:
+            with _INFLIGHT_LOCK:
+                _INFLIGHT.discard(key)
+
+    def _execute(self, decision_id: str, mode: str) -> ExecutionOutcome:
         if mode not in ("market", "limit"):
             return ExecutionOutcome(False, f"неизвестный режим {mode}")
         if self.already_executed(decision_id):
@@ -232,7 +264,7 @@ class ExecutionService:
                 flattened = self._flatten(plan, sl_id)
         status, entry_price, entry_fee = self._entry_state(plan, entry.order, mode, price)
         if entry.attached and status == "open":
-            sl_id, tp_id = self._adopt_attached(plan)  # None — подберет монитор
+            sl_id, tp_id = self._adopt_attached(plan, qty)  # None — подберет монитор
 
         close_reason = closed_at = None
         if protection_error is not None and flattened:
@@ -287,16 +319,20 @@ class ExecutionService:
                                          stop_loss=plan.sl, take_profit=plan.tp, **kw)
             return _EntryResult(order, attached=True)
         except Exception as e:  # noqa: BLE001
-            if classify_error(e) == "network":
+            if _is_ambiguous(e):
                 return self._resolve_unknown_entry(plan, cid, mode, e, attached=True)
-            # биржа ОТВЕТИЛА отказом — ордера нет; возможно, не приняла прикрепление
+            # Голый повтор — ТОЛЬКО после явного отказа биржи с кодом (ордера точно нет;
+            # возможно, не принято прикрепление). Rate limit/бан — не повторяем, без кода
+            # (локальная ошибка) — тоже.
+            if exchange_error_code(e) is None or classify_error(e) == "cooldown":
+                return _EntryResult(None, attached=True, error=e)
             logger.warning("entry with attached SL/TP rejected for %s (%s) - retrying bare entry",
                            cid, short_error(e))
         try:
             return _EntryResult(self._ex.place_entry(plan.symbol, plan.side, qty, cid, **kw),
                                 attached=False)
         except Exception as e:  # noqa: BLE001
-            if classify_error(e) == "network":
+            if _is_ambiguous(e):
                 return self._resolve_unknown_entry(plan, cid, mode, e, attached=False)
             return _EntryResult(None, attached=False, error=e)
 
@@ -358,7 +394,7 @@ class ExecutionService:
             logger.warning("TP failed for %s (monitor will retry): %s", cid, e)
         return sl.exchange_id, tp_id, None
 
-    def _adopt_attached(self, plan: ExecutionPlan) -> tuple[str | None, str | None]:
+    def _adopt_attached(self, plan: ExecutionPlan, qty: float) -> tuple[str | None, str | None]:
         """Id SL/TP, созданных биржей из прикрепленных параметров. Не видны сразу —
         не беда: монитор подберет их следующим тиком."""
         try:
@@ -366,8 +402,9 @@ class ExecutionService:
         except Exception as e:  # noqa: BLE001
             logger.info("attached protection lookup deferred to monitor: %s", e)
             return None, None
-        sl = pick_protection(orders, "sl", plan.sl)
-        tp = pick_protection(orders, "tp", plan.tp)
+        cid = make_client_order_id(self._run_id, plan.candidate_id)
+        sl = pick_protection(orders, "sl", plan.sl, owner_cid=cid, position_qty=qty)
+        tp = pick_protection(orders, "tp", plan.tp, owner_cid=cid, position_qty=qty)
         return (sl.exchange_id if sl else None), (tp.exchange_id if tp else None)
 
     def _entry_state(

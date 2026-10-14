@@ -229,12 +229,14 @@ class BingXAdapter(ExchangeAdapter):
         fee = raw.get("fee") or {}
         fee_cost = fee.get("cost") if isinstance(fee, dict) else None
         avg = raw.get("average")
+        ts = raw.get("lastTradeTimestamp") or raw.get("lastUpdateTimestamp") or raw.get("timestamp")
         return OrderState(
             exchange_id=str(raw.get("id") or ""),
             status=_ORDER_STATUS.get(status, status or "unknown"),
             filled_qty=float(raw.get("filled") or 0.0),
             avg_price=float(avg) if avg else None,
             fee=float(fee_cost) if fee_cost is not None else None,
+            timestamp_ms=int(ts) if ts else None,
         )
 
     def _history_fetchers(self):
@@ -323,13 +325,16 @@ class BingXAdapter(ExchangeAdapter):
             if not st.exchange_id or st.exchange_id in seen:
                 continue
             seen.add(st.exchange_id)
-            ts = o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp") or o.get("timestamp")
+            amount = o.get("amount")
+            close_all = str(info.get("closePosition") or "").lower() == "true"
             out.append(ProtectiveOrder(
                 exchange_id=st.exchange_id, kind=kind,
                 trigger_price=float(trig) if trig not in (None, "", 0, "0") else None,
                 status=st.status, avg_price=st.avg_price, fee=st.fee,
-                timestamp_ms=int(ts) if ts else None,
+                timestamp_ms=st.timestamp_ms,
                 client_order_id=str(o.get("clientOrderId") or ""),
+                qty=float(amount) if amount not in (None, "") else None,
+                close_position=close_all,
             ))
         return out
 

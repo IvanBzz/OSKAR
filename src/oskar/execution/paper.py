@@ -201,7 +201,7 @@ class PaperAdapter(ExchangeAdapter):
             out.append(ProtectiveOrder(
                 exchange_id=oid, kind=o.kind, trigger_price=o.avg_price, status=o.status,
                 avg_price=o.avg_price if o.status == "filled" else None,
-                client_order_id=o.client_order_id,
+                client_order_id=o.client_order_id, close_position=True,  # как closePosition
             ))
         return out
 

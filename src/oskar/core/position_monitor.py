@@ -42,6 +42,8 @@ from oskar.execution.base import (
     OrderNotFoundError,
     OrderState,
     PositionInfo,
+    cid_base,
+    owns_protection,
     pick_protection,
 )
 from oskar.journal.db import transaction
@@ -148,10 +150,22 @@ class PositionMonitor:
         return rep
 
     def tick_pending(self) -> MonitorReport:
-        """Быстрый проход: только pending-входы (исполнение лимитки -> защита)."""
+        """Быстрый проход: pending-входы (исполнение лимитки -> защита) и open-сделки без
+        подтвержденного SL (109420 сразу после исполнения — повтор через 5 с, а не через
+        минуту полного тика; идея Codex раунд 2)."""
         rep = MonitorReport()
         self._pending_pass(rep)
+        for t in self._j.execute(
+            "SELECT * FROM trades WHERE status='open' AND sl_order_id IS NULL ORDER BY id"
+        ).fetchall():
+            if self._inflight(t):
+                continue
+            self._guard(rep, t["decision_id"], lambda t=t: self._protect_if_visible(t, rep))
         return rep
+
+    def _protect_if_visible(self, t: sqlite3.Row, rep: MonitorReport) -> None:
+        if self._find_position(t["symbol"], t["side"]) is not None:
+            self._ensure_protection(t, rep)
 
     def _pending_pass(self, rep: MonitorReport) -> None:
         for t in self._trades("pending"):
@@ -229,7 +243,14 @@ class PositionMonitor:
                 self._j.execute("UPDATE trades SET entry_order_id=? WHERE id=?", (st.exchange_id, t["id"]))
         return st
 
+    def _inflight(self, t: sqlite3.Row) -> bool:
+        from oskar.core.executor import inflight_client_ids
+
+        return cid_base(str(t["client_order_id"])) in inflight_client_ids()
+
     def _check_pending(self, t: sqlite3.Row, rep: MonitorReport) -> None:
+        if self._inflight(t):
+            return  # исполнитель еще ставит ордера этой сделки — не мешаем
         age = self._age_sec(t)
         ttl = UNKNOWN_ENTRY_TTL_SEC if t["entry_type"] == "market" else self._limit_ttl
         try:
@@ -244,10 +265,15 @@ class PositionMonitor:
             self._promote(t, st, rep)
             self._ensure_protection(self._reload(t), rep)
             return
-        if st is not None and not st.is_gone and age < ttl:
+        partial = st is not None and not st.is_gone and st.filled_qty > 0
+        if st is not None and not st.is_gone and age < ttl and not partial:
             return  # ждем цену
+        # Частичный филл НЕ ждет TTL: часть позиции уже есть, а у голой лимитки защиты нет
+        # (Codex раунд 2, high #4). Остаток снимается, исполненное — open + защита сейчас.
 
-        why = "снят биржей" if st is None or st.is_gone else f"не исполнился за {int(age // 60)} мин"
+        why = ("снят биржей" if st is None or st.is_gone
+               else "исполнен частично — остаток снят" if partial
+               else f"не исполнился за {int(age // 60)} мин")
         if st is not None and not st.is_gone:
             if not self._ex.cancel_order(t["symbol"], st.exchange_id):
                 raise RuntimeError(f"entry {st.exchange_id!r} not cancelled - protection kept")
@@ -277,11 +303,15 @@ class PositionMonitor:
     def _promote(self, t: sqlite3.Row, st: OrderState, rep: MonitorReport, partial: bool = False) -> None:
         price = st.avg_price or t["entry_price"]
         qty = st.filled_qty or t["qty"]
+        # opened_at — момент исполнения ПО БИРЖЕ, а не момент нашего опроса: SL, сработавший
+        # до первого опроса, иначе выпадал из истории (Codex раунд 2, medium #6)
+        filled_at = (datetime.fromtimestamp(st.timestamp_ms / 1000, tz=UTC)
+                     if st.timestamp_ms else self._now())
         with transaction(self._j):
             self._j.execute(
                 "UPDATE trades SET status='open', entry_price=?, qty=?, opened_at=?, entry_fees=?, "
                 "entry_order_id=COALESCE(entry_order_id, ?) WHERE id=?",
-                (price, qty, _iso(self._now()), st.fee, st.exchange_id or None, t["id"]),
+                (price, qty, _iso(filled_at), st.fee, st.exchange_id or None, t["id"]),
             )
         rep.filled.append(t["decision_id"])
         tag = " частично" if partial else ""
@@ -312,10 +342,19 @@ class PositionMonitor:
         need = [kind for kind, st in (("sl", sl), ("tp", tp)) if st is None or st.is_gone]
         if not need:
             return False
-        existing = [o for o in self._ex.protection_orders(t["symbol"], t["side"]) if o.status == "open"]
+        try:
+            existing = [o for o in self._ex.protection_orders(t["symbol"], t["side"])
+                        if o.status == "open"]
+        except Exception as e:  # noqa: BLE001
+            # не смогли проверить защиту — это НЕ «ее нет» и не повод молчать: ставим свою
+            # (дубль closePosition-стопа безвреден, голая позиция — нет); не встанет —
+            # счетчик неудач и SAFE MODE (Codex раунд 2, high #5)
+            logger.warning("%s: protection list unavailable (%s) - placing own", t["decision_id"], e)
+            existing = []
         for kind in need:
             target = t["sl_price"] if kind == "sl" else t["tp_price"]
-            found = pick_protection(existing, kind, target)
+            found = pick_protection(existing, kind, target, owner_cid=str(t["client_order_id"]),
+                                    position_qty=float(t["qty"] or 0) or None)
             if found is not None:
                 self._set_order_id(t, kind, found.exchange_id)
                 self._protect_fail.pop(f"{t['decision_id']}:{kind}", None)
@@ -398,15 +437,20 @@ class PositionMonitor:
         except Exception as e:  # noqa: BLE001 - закроем как manual, реконсиляция уточнит
             logger.warning("history lookup failed for %s: %s", t["decision_id"], e)
             return False
-        opened = _parse_iso(t["opened_at"])
-        opened_ms = int(opened.timestamp() * 1000) if opened else 0
-        fills = [o for o in history if o.status == "filled"
-                 and (o.timestamp_ms is None or o.timestamp_ms >= opened_ms)]
+        # окно — от создания записи (вход отправлен), а не от opened_at: тот мог быть
+        # временем нашего опроса, позже срабатывания стопа (Codex раунд 2, medium #6)
+        since = _parse_iso(t["created_at"]) or _parse_iso(t["opened_at"])
+        since_ms = int(since.timestamp() * 1000) - 60_000 if since else 0
+        qty = float(t["qty"] or 0) or None
+        mine = [o for o in history
+                if owns_protection(o, owner_cid=str(t["client_order_id"]), position_qty=qty)]
+        fills = [o for o in mine if o.status == "filled"
+                 and (o.timestamp_ms is None or o.timestamp_ms >= since_ms)]
         if not fills:
             return False
         last = max(fills, key=lambda o: o.timestamp_ms or 0)
         self._cancel_protection(t)
-        for o in history:  # парный ордер мог остаться открытым
+        for o in mine:  # парный ордер мог остаться открытым (только свои — ручные не трогаем)
             if o.status == "open":
                 try:
                     self._ex.cancel_order(t["symbol"], o.exchange_id)
@@ -553,13 +597,15 @@ class PositionMonitor:
             "WHERE status IN ('pending','open')"
         ).fetchall()
         known_ids = {x for r in live for x in (r["entry_order_id"], r["sl_order_id"], r["tp_order_id"]) if x}
-        known_cids = {str(r["client_order_id"]).lower() for r in live}
+        known_cids = {cid_base(str(r["client_order_id"])) for r in live}
+        from oskar.core.executor import inflight_client_ids
+
+        known_cids |= inflight_client_ids()  # исполнитель ставит ордера, записи еще нет
         for o in self._ex.open_orders_all():
             cid = o.client_order_id.lower()
             if not cid.startswith("oskar-"):
                 continue
-            base = "-".join(cid.split("-")[:3])  # OSKAR-<run>-<hash>[-sl|-tp[-rN]]
-            if o.exchange_id in known_ids or base in known_cids:
+            if o.exchange_id in known_ids or cid_base(cid) in known_cids:
                 continue
             self._ex.cancel_order(o.symbol, o.exchange_id)
             rep.orphans.append(f"{o.symbol}:{o.kind}:{o.exchange_id}")
