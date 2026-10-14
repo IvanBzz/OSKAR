@@ -18,7 +18,17 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 2  # v2: исходы trader_decline/pending, cohort trader_decline
+SCHEMA_VERSION = 3  # v3: trades.entry_order_id/entry_type (защита по факту входа)
+
+# Миграции «вперед»: версия -> ADD COLUMN (имя, определение). Журнал хранит
+# датасет решений и counterfactuals — стирать его при смене схемы нельзя
+# (ревью 2026-10-13: архив+удаление уносили и открытые сделки).
+MIGRATIONS: dict[int, list[tuple[str, str, str]]] = {
+    3: [
+        ("trades", "entry_order_id", "TEXT"),
+        ("trades", "entry_type", "TEXT"),
+    ],
+}
 
 DDL = """
 PRAGMA journal_mode=WAL;
@@ -58,7 +68,9 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_at TEXT,
     duration_seconds INTEGER,
     reconciled INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    entry_order_id TEXT,               -- v3: биржевой id входа (опрос по id, не по clientOrderId)
+    entry_type TEXT                    -- v3: market | limit (TTL неизвестного входа)
 );
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
@@ -180,11 +192,27 @@ def connect(db_path: Path) -> sqlite3.Connection:
         (str(SCHEMA_VERSION),),
     )
     conn.commit()
-    existing = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    if int(existing["value"]) != SCHEMA_VERSION:
+    existing = int(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"])
+    if existing < SCHEMA_VERSION and all(v in MIGRATIONS for v in range(existing + 1, SCHEMA_VERSION + 1)):
+        _migrate(conn, existing)
+        existing = SCHEMA_VERSION
+    if existing != SCHEMA_VERSION:
         conn.close()
         raise RuntimeError(
-            f"journal schema v{existing['value']} != code v{SCHEMA_VERSION}; "
+            f"journal schema v{existing} != code v{SCHEMA_VERSION}; "
             "run archive + migration first"
         )
     return conn
+
+
+def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+    """Поэтапно до SCHEMA_VERSION; ADD COLUMN идемпотентен (колонка уже есть — пропуск)."""
+    with transaction(conn):
+        for version in range(from_version + 1, SCHEMA_VERSION + 1):
+            for table, column, decl in MIGRATIONS[version]:
+                cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            conn.execute(
+                "UPDATE meta SET value=? WHERE key='schema_version'", (str(version),)
+            )

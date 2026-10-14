@@ -60,6 +60,11 @@ class ProtectionFails(PaperAdapter):
         super().__init__(price_fn, **kw)
         self.closed: list[tuple] = []
 
+    def place_entry(self, symbol, side, qty, client_order_id, **kw):
+        if kw.get("stop_loss") is not None:  # прикрепленный стоп биржа тоже отвергает
+            raise RuntimeError('bingx {"code":80014,"msg":"stop price invalid"}')
+        return super().place_entry(symbol, side, qty, client_order_id, **kw)
+
     def place_sl(self, symbol, side, stop_price, client_order_id):
         raise RuntimeError('bingx {"code":80014,"msg":"stop price invalid"}')
 
@@ -81,7 +86,7 @@ def test_protection_failure_journals_trade_and_flattens(tmp_path):
     row = trade(j, p.candidate_id)
     assert row is not None and row["status"] == "closed" and row["close_reason"] == "manual"
     assert row["sl_order_id"] is None
-    assert "защита не встала" in out.message
+    assert "стоп не встал" in out.message
     assert ExecutionService(adapter, j, "r1").execute(p.candidate_id, "market").message == "уже исполнено"
 
 
@@ -271,10 +276,10 @@ def test_pending_not_found_past_ttl_is_cancelled(tmp_path):
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path, limit_ttl=3600)
     add_trade(j, "ghost", status="pending", opened_at=T0 - timedelta(hours=2))
     add_trade(j, "young", status="pending", opened_at=T0 - timedelta(minutes=5))
-    # ордеров нет ни в by_cid, ни в orders -> KeyError из адаптера
+    # ордеров нет ни в by_cid, ни в orders -> биржа отвечает «нет такого ордера»
     rep = mon.tick()
     assert trade(j, "ghost")["status"] == "cancelled"
-    assert trade(j, "young")["status"] == "pending" and any("young" in e for e in rep.errors)
+    assert trade(j, "young")["status"] == "pending" and rep.errors == []  # молодой — просто ждем
 
 
 def test_gone_protection_is_replaced_and_failure_flips_safe_mode(tmp_path):

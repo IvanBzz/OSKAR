@@ -110,11 +110,12 @@ def test_limit_unavailable_without_level(tmp_path):
 
 
 def test_exchange_failure_writes_no_trade(tmp_path):
-    """Биржа отказала — сделки в журнале нет (журнал не врет, ст. 1)."""
+    """Биржа ОТВЕТИЛА отказом — сделки в журнале нет (журнал не врет, ст. 1).
+    (Сетевой сбой на входе — другой исход: ордер мог пройти, см. test_protection_lifecycle.)"""
     svc, j, adapter, p = make_service(tmp_path)
 
     def boom(*a, **kw):
-        raise ConnectionError("bingx 109400")
+        raise RuntimeError('bingx {"code":109400,"msg":"positionSide invalid"}')
 
     adapter.place_entry = boom
     out = svc.execute(p.candidate_id, "market")

@@ -7,9 +7,11 @@ from oskar.core.state import RuntimeState
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OrderNotFoundError,
     OrderState,
     PlacedOrder,
     PositionInfo,
+    ProtectiveOrder,
 )
 from oskar.execution.paper import PaperAdapter
 from oskar.journal.db import connect
@@ -29,6 +31,7 @@ class FakeAdapter(ExchangeAdapter):
         self.closed: list[tuple[str, str]] = []
         self.fail_symbols: set[str] = set()
         self.close_price = 97.0
+        self.protection: list[ProtectiveOrder] = []  # SL/TP «на бирже» (в т.ч. прикрепленные)
 
     def normalize_qty(self, symbol, qty):
         return qty
@@ -63,7 +66,13 @@ class FakeAdapter(ExchangeAdapter):
     def order_status(self, symbol, exchange_id="", client_order_id=""):
         if symbol in self.fail_symbols:
             raise RuntimeError("exchange hiccup")
-        return self.orders[exchange_id] if exchange_id else self.by_cid[client_order_id]
+        book, key = (self.orders, exchange_id) if exchange_id else (self.by_cid, client_order_id)
+        if key not in book:
+            raise OrderNotFoundError(f"no order {key}")  # как у биржи: «нет такого» — не сбой сети
+        return book[key]
+
+    def protection_orders(self, symbol, side, *, include_closed=False):
+        return [o for o in self.protection if include_closed or o.status == "open"]
 
     def cancel_order(self, symbol, exchange_id):
         self.cancelled.append(exchange_id)

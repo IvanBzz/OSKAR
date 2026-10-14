@@ -17,9 +17,11 @@ from oskar.data.symbols import canonical
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OrderNotFoundError,
     OrderState,
     PlacedOrder,
     PositionInfo,
+    ProtectiveOrder,
     Side,
 )
 
@@ -89,13 +91,28 @@ class BingXAdapter(ExchangeAdapter):
         *,
         entry_type: str = "market",
         price: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> PlacedOrder:
         if entry_type == "limit" and (price is None or price <= 0):
             raise ValueError("limit entry requires positive price")
-        params = self._guard_params({
+        params: dict = {
             "positionSide": _POSITION_SIDE[side],
             "clientOrderId": client_order_id,
-        })
+        }
+        # Прикрепленная защита (параметры stopLoss/takeProfit ордера BingX): биржа
+        # создает SL/TP сама в момент исполнения. Отдельные closePosition-ордера до
+        # появления позиции BingX отвергает — живой случай 2026-10-14, лимитка BERA:
+        # 109420 «position not exist». ccxt округляет триггеры и подставляет quantity.
+        if stop_loss is not None:
+            params["stopLoss"] = {
+                "type": "STOP_MARKET", "triggerPrice": stop_loss, "workingType": "MARK_PRICE",
+            }
+        if take_profit is not None:
+            params["takeProfit"] = {
+                "type": "TAKE_PROFIT_MARKET", "triggerPrice": take_profit, "workingType": "MARK_PRICE",
+            }
+        params = self._guard_params(params)
         raw = self._ex.create_order(
             canonical(symbol),
             entry_type,
@@ -219,16 +236,30 @@ class BingXAdapter(ExchangeAdapter):
             fee=float(fee_cost) if fee_cost is not None else None,
         )
 
+    def _history_fetchers(self):
+        """Открытые + история (исполненные И снятые). ccxt fetch_closed_orders
+        отдает только status=closed — снятый ордер через него не найти (ревью)."""
+        fetchers = [self._ex.fetch_open_orders]
+        both = getattr(self._ex, "fetch_canceled_and_closed_orders", None)
+        if both is not None:
+            fetchers.append(both)
+        else:
+            fetchers.append(self._ex.fetch_closed_orders)
+            canceled = getattr(self._ex, "fetch_canceled_orders", None)
+            if canceled is not None:
+                fetchers.append(canceled)
+        return fetchers
+
     def _find_by_client_id(self, sym: str, client_order_id: str) -> dict:
-        try:
-            return self._ex.fetch_order(None, sym, {"clientOrderId": client_order_id})
-        except Exception:  # noqa: BLE001 - не все версии ccxt ищут по clientOrderId
-            pass
-        for fetch in (self._ex.fetch_open_orders, self._ex.fetch_closed_orders):
+        # ccxt bingx.fetch_order по clientOrderId не умеет (шлет orderId=None), поэтому
+        # перебор открытых + истории. BingX может привести clientOrderID к нижнему
+        # регистру — сравнение без учета регистра (ревью Codex 2026-10-13).
+        want = client_order_id.lower()
+        for fetch in self._history_fetchers():
             for o in fetch(sym):
-                if str(o.get("clientOrderId") or "") == client_order_id:
+                if str(o.get("clientOrderId") or "").lower() == want:
                     return o
-        raise RuntimeError(f"order {client_order_id} not found on exchange for {sym}")
+        raise OrderNotFoundError(f"order {client_order_id} not found on exchange for {sym}")
 
     def order_status(
         self, symbol: str, exchange_id: str = "", client_order_id: str = ""
@@ -236,12 +267,56 @@ class BingXAdapter(ExchangeAdapter):
         if not exchange_id and not client_order_id:
             raise ValueError("order_status needs exchange_id or client_order_id")
         sym = canonical(symbol)
-        raw = (
-            self._ex.fetch_order(exchange_id, sym)
-            if exchange_id
-            else self._find_by_client_id(sym, client_order_id)
-        )
-        return self._order_state(raw)
+        if not exchange_id:
+            return self._order_state(self._find_by_client_id(sym, client_order_id))
+        try:
+            return self._order_state(self._ex.fetch_order(exchange_id, sym))
+        except Exception as e:  # noqa: BLE001 - «нет такого» отделяем от сетевых сбоев
+            if any(b.__name__ == "OrderNotFound" for b in type(e).__mro__):
+                raise OrderNotFoundError(str(e)) from e
+            raise
+
+    def protection_orders(
+        self, symbol: str, side: Side, *, include_closed: bool = False
+    ) -> list[ProtectiveOrder]:
+        """SL/TP позиции. Вид — по СЫРОМУ типу BingX (info.type): унифицированный
+        ccxt тип у STOP_MARKET/TAKE_PROFIT_MARKET равен «market» (parse_order_type),
+        по нему защиту от входа не отличить."""
+        self._ensure_markets()
+        sym = canonical(symbol)
+        raw: list[dict] = list(self._ex.fetch_open_orders(sym))
+        if include_closed:
+            for fetch in self._history_fetchers()[1:]:
+                raw.extend(fetch(sym))
+        want_ps = _POSITION_SIDE[side]
+        out: list[ProtectiveOrder] = []
+        seen: set[str] = set()
+        for o in raw:
+            info = o.get("info") or {}
+            ps = str(info.get("positionSide") or "").upper()
+            if ps and ps != want_ps:
+                continue
+            raw_type = str(info.get("type") or "").upper()
+            if raw_type.startswith("TAKE_PROFIT"):
+                kind, trig = "tp", o.get("takeProfitPrice")
+            elif raw_type.startswith("STOP"):
+                kind, trig = "sl", o.get("stopLossPrice")
+            else:
+                continue  # вход/прочее
+            trig = trig or o.get("triggerPrice") or info.get("stopPrice")
+            st = self._order_state(o)
+            if not st.exchange_id or st.exchange_id in seen:
+                continue
+            seen.add(st.exchange_id)
+            ts = o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp") or o.get("timestamp")
+            out.append(ProtectiveOrder(
+                exchange_id=st.exchange_id, kind=kind,
+                trigger_price=float(trig) if trig not in (None, "", 0, "0") else None,
+                status=st.status, avg_price=st.avg_price, fee=st.fee,
+                timestamp_ms=int(ts) if ts else None,
+                client_order_id=str(o.get("clientOrderId") or ""),
+            ))
+        return out
 
     def cancel_order(self, symbol: str, exchange_id: str) -> bool:
         if not exchange_id:

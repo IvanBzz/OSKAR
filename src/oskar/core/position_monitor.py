@@ -1,42 +1,60 @@
 """Монитор позиций — единственное место, где журнал догоняет биржу (ст. 1).
 
-Раз в interval_seconds:
+Два ритма:
+- быстрый (fast_interval, 5 с) — только pending-входы: лимитка исполнилась ->
+  open + защита в тот же проход (окно «позиция без стопа» — секунды, а у входа
+  с прикрепленными SL/TP его нет вовсе);
+- полный (interval, 60 с) — всё ниже.
+
 1. sweeper: pending_approvals с истекшим TTL -> expired (кнопки с карточки снимаются,
    decisions.outcome = approval_expired);
-2. pending-сделки (лимитный вход): исполнилась -> open с ценой/qty/комиссией биржи;
-   снята биржей, не найдена или старше limit_entry_ttl -> остаток снимается; если
-   часть УЖЕ исполнена — позиция есть, ведем как open и защиту НЕ трогаем;
-3. open-сделки: SL/TP исполнился -> closed с close_reason sl_hit/tp_hit и
-   отменой парного ордера; защита исчезла при живой позиции -> переставляется
-   (не удалось -> SAFE MODE: голую позицию не держим молча); позиции нет два
-   тика подряд и защита не срабатывала -> закрыта извне (manual, exit/pnl NULL,
-   reconciled=0); лосер старше max_loss_hold -> рыночное закрытие с ПОДТВЕРЖДЕНИЕМ
-   по позициям -> duration_timeout (урок v1: лосеры жили в 3.4x дольше);
+2. pending-сделки: исполнилась -> open с ценой/qty/комиссией биржи и защитой;
+   снята биржей, не найдена или старше TTL -> остаток снимается; если часть УЖЕ
+   исполнена — позиция есть, ведем как open и защиту НЕ трогаем. TTL: лимитка —
+   limit_entry_ttl профиля, вход с неизвестным исходом (таймаут) — 3 мин;
+3. open-сделки: SL/TP исполнился -> closed (sl_hit/tp_hit) с отменой парного;
+   защиты нет/исчезла при живой позиции -> сначала «усыновить» с биржи (SL/TP,
+   прикрепленные ко входу, биржа создает сама — их id заранее неизвестны), иначе
+   поставить; не встает — повтор (109420 сразу после исполнения: позиция еще не
+   видна), затем SAFE MODE (голую позицию молча не держим). Позиции нет два тика
+   подряд -> по истории биржи: сработал SL/TP -> sl_hit/tp_hit, иначе manual
+   (exit/pnl NULL, reconciled=0); лосер старше max_loss_hold -> рыночное закрытие с
+   ПОДТВЕРЖДЕНИЕМ по позициям -> duration_timeout (урок v1: лосеры жили в 3.4x дольше);
 4. reconcile: позиции биржи vs open-сделки журнала (сумма qty по ключу, допуск 1%) —
    расхождение два тика подряд -> SAFE MODE + Telegram, один раз на ключ.
 
-Все решения — по состоянию ордеров НА БИРЖЕ (order_status), не по ценам свечей.
-Исключение по одной сделке не валит проход по остальным. realized_pnl — брутто
-по ценам исполнения минус комиссии, если биржа их отдала (иначе брутто).
-Один сомнительный опрос биржи (пустой positions()) защиту не снимает — только
-подтвержденное отсутствие.
+Все решения — по состоянию ордеров НА БИРЖЕ, не по ценам свечей. Исключение по
+одной сделке не валит проход по остальным. realized_pnl — брутто по ценам
+исполнения минус комиссии, если биржа их отдала (иначе брутто).
 """
 
 import logging
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from oskar.core.approvals import mark_decision
-from oskar.execution.base import ExchangeAdapter, OrderState, PositionInfo
+from oskar.data.client import exchange_error_code
+from oskar.execution.base import (
+    ExchangeAdapter,
+    OrderNotFoundError,
+    OrderState,
+    PositionInfo,
+    pick_protection,
+)
 from oskar.journal.db import transaction
 
 logger = logging.getLogger("oskar.monitor")
 
 DEFAULT_INTERVAL_SEC = 60.0
+DEFAULT_FAST_INTERVAL_SEC = 5.0
 QTY_TOLERANCE = 0.01  # 1%: округления биржи — не расхождение
 CONFIRM_TICKS = 2  # отсутствие позиции / расхождение должны повториться
+UNKNOWN_ENTRY_TTL_SEC = 180  # вход после таймаута не найден за 3 мин — его нет
+PROTECT_RETRIES = 3  # 109420 сразу после исполнения: позиция еще не видна бирже
+POSITION_MISSING_CODE = "109420"
 
 
 @dataclass
@@ -45,7 +63,8 @@ class MonitorReport:
     filled: list[str] = field(default_factory=list)
     cancelled: list[str] = field(default_factory=list)
     closed: list[tuple[str, str]] = field(default_factory=list)  # (decision_id, reason)
-    replaced: list[str] = field(default_factory=list)  # переставленная защита
+    replaced: list[str] = field(default_factory=list)  # поставленная монитором защита
+    adopted: list[str] = field(default_factory=list)  # защита, найденная на бирже
     mismatches: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -53,8 +72,8 @@ class MonitorReport:
         return {
             "expired_cards": self.expired_cards, "filled": len(self.filled),
             "cancelled": len(self.cancelled), "closed": len(self.closed),
-            "replaced": len(self.replaced), "mismatches": len(self.mismatches),
-            "errors": len(self.errors),
+            "replaced": len(self.replaced), "adopted": len(self.adopted),
+            "mismatches": len(self.mismatches), "errors": len(self.errors),
         }
 
 
@@ -86,6 +105,7 @@ class PositionMonitor:
         state=None,  # RuntimeState: safe_mode при голой позиции / расхождении
         now_fn=lambda: datetime.now(UTC),
         interval_seconds: float = DEFAULT_INTERVAL_SEC,
+        fast_interval_seconds: float = DEFAULT_FAST_INTERVAL_SEC,
     ):
         self._ex = adapter
         self._j = journal
@@ -96,10 +116,12 @@ class PositionMonitor:
         self._state = state
         self._now = now_fn
         self._interval = interval_seconds
+        self._fast_interval = fast_interval_seconds
         self._reported_mismatches: set[str] = set()
         self._mismatch_streak: dict[str, int] = {}
         self._missing: dict[str, int] = {}  # decision_id -> тиков подряд без позиции
-        self._replaced: dict[str, int] = {}  # "<decision>:<sl|tp>" -> сколько раз переставляли
+        self._replaced: dict[str, int] = {}  # "<decision>:<sl|tp>" -> сколько раз ставили
+        self._protect_fail: dict[str, int] = {}  # "<decision>:<sl|tp>" -> неудач подряд
         self.last_report: dict = {}
         self.ticks = 0
         self._stop = threading.Event()
@@ -109,14 +131,23 @@ class PositionMonitor:
     def tick(self) -> MonitorReport:
         rep = MonitorReport()
         self._guard(rep, "sweeper", lambda: self._sweep_expired(rep))
-        for t in self._trades("pending"):
-            self._guard(rep, t["decision_id"], lambda t=t: self._check_pending(t, rep))
+        self._pending_pass(rep)
         for t in self._trades("open"):
             self._guard(rep, t["decision_id"], lambda t=t: self._check_open(t, rep))
         self._guard(rep, "reconcile", lambda: self._reconcile(rep))
         self.ticks += 1
         self.last_report = rep.as_dict()
         return rep
+
+    def tick_pending(self) -> MonitorReport:
+        """Быстрый проход: только pending-входы (исполнение лимитки -> защита)."""
+        rep = MonitorReport()
+        self._pending_pass(rep)
+        return rep
+
+    def _pending_pass(self, rep: MonitorReport) -> None:
+        for t in self._trades("pending"):
+            self._guard(rep, t["decision_id"], lambda t=t: self._check_pending(t, rep))
 
     def _guard(self, rep: MonitorReport, label: str, fn) -> None:
         try:
@@ -129,6 +160,9 @@ class PositionMonitor:
         return self._j.execute(
             "SELECT * FROM trades WHERE status = ? ORDER BY id", (status,)
         ).fetchall()
+
+    def _reload(self, t: sqlite3.Row) -> sqlite3.Row:
+        return self._j.execute("SELECT * FROM trades WHERE id = ?", (t["id"],)).fetchone()
 
     def _say(self, text: str) -> None:
         logger.info(text)
@@ -176,21 +210,33 @@ class PositionMonitor:
         placed_at = _parse_iso(t["opened_at"]) or _parse_iso(t["created_at"]) or self._now()
         return (self._now() - placed_at).total_seconds()
 
+    def _entry_state(self, t: sqlite3.Row) -> OrderState:
+        """Вход по биржевому id (сохранен исполнителем); без id — по clientOrderId
+        (вход после таймаута / старые записи), найденный id запоминаем."""
+        if t["entry_order_id"]:
+            return self._ex.order_status(t["symbol"], exchange_id=t["entry_order_id"])
+        st = self._ex.order_status(t["symbol"], client_order_id=t["client_order_id"])
+        if st.exchange_id:
+            with transaction(self._j):
+                self._j.execute("UPDATE trades SET entry_order_id=? WHERE id=?", (st.exchange_id, t["id"]))
+        return st
+
     def _check_pending(self, t: sqlite3.Row, rep: MonitorReport) -> None:
         age = self._age_sec(t)
+        ttl = UNKNOWN_ENTRY_TTL_SEC if t["entry_type"] == "market" else self._limit_ttl
         try:
-            st: OrderState | None = self._ex.order_status(
-                t["symbol"], client_order_id=t["client_order_id"]
-            )
-        except Exception:
-            if age < self._limit_ttl:
-                raise  # транспорт/задержка биржи — повторим следующим тиком
+            st: OrderState | None = self._entry_state(t)
+        except OrderNotFoundError:
+            if age < ttl:
+                return  # биржа еще не показала ордер (таймаут на входе) — ждем
             st = None  # за TTL ордера нет нигде: считаем снятым
+        # сетевые ошибки идут наверх: _guard, повтор следующим тиком (не «снят»)
 
         if st is not None and st.is_filled:
             self._promote(t, st, rep)
+            self._ensure_protection(self._reload(t), rep)
             return
-        if st is not None and not st.is_gone and age < self._limit_ttl:
+        if st is not None and not st.is_gone and age < ttl:
             return  # ждем цену
 
         why = "снят биржей" if st is None or st.is_gone else f"не исполнился за {int(age // 60)} мин"
@@ -203,6 +249,7 @@ class PositionMonitor:
                 logger.warning("post-cancel lookup failed for %s: %s", t["decision_id"], e)
         if st is not None and st.filled_qty > 0:
             self._promote(t, st, rep, partial=True)  # позиция ЕСТЬ — защиту не трогаем
+            self._ensure_protection(self._reload(t), rep)
             return
 
         self._cancel_protection(t)
@@ -216,32 +263,94 @@ class PositionMonitor:
                 (f"limit_cancelled: {why}", t["decision_id"]),
             )
         rep.cancelled.append(t["decision_id"])
-        self._say(f"⏳❌ {t['symbol']} {t['side']}: лимит {why}, SL/TP сняты")
+        kind = "вход" if t["entry_type"] == "market" else "лимит"
+        self._say(f"⏳❌ {t['symbol']} {t['side']}: {kind} {why}")
 
     def _promote(self, t: sqlite3.Row, st: OrderState, rep: MonitorReport, partial: bool = False) -> None:
         price = st.avg_price or t["entry_price"]
         qty = st.filled_qty or t["qty"]
         with transaction(self._j):
             self._j.execute(
-                "UPDATE trades SET status='open', entry_price=?, qty=?, opened_at=?, entry_fees=? "
-                "WHERE id=?", (price, qty, _iso(self._now()), st.fee, t["id"]),
+                "UPDATE trades SET status='open', entry_price=?, qty=?, opened_at=?, entry_fees=?, "
+                "entry_order_id=COALESCE(entry_order_id, ?) WHERE id=?",
+                (price, qty, _iso(self._now()), st.fee, st.exchange_id or None, t["id"]),
             )
         rep.filled.append(t["decision_id"])
         tag = " частично" if partial else ""
-        self._say(f"✅ {t['symbol']} {t['side']}: лимит исполнен{tag} @ {price:.6g}, qty {qty:g}")
+        what = "вход" if t["entry_type"] == "market" else "лимит"
+        self._say(f"✅ {t['symbol']} {t['side']}: {what} исполнен{tag} @ {price:.6g}, qty {qty:g}")
 
-    # ------------------------------------------------------------------ open
+    # ------------------------------------------------------------ protection
 
-    def _status_or_none(self, symbol: str, order_id: str | None) -> OrderState | None:
+    def _protection_state(self, symbol: str, order_id: str | None) -> OrderState | None:
         if not order_id:
             return None
-        return self._ex.order_status(symbol, exchange_id=order_id)
+        try:
+            return self._ex.order_status(symbol, exchange_id=order_id)
+        except OrderNotFoundError:
+            return OrderState(exchange_id=order_id, status="canceled")  # нет на бирже = нет защиты
 
-    def _find_position(self, symbol: str, side: str) -> PositionInfo | None:
-        for p in self._ex.positions():
-            if p.symbol == symbol and p.side == side and p.qty > 0:
-                return p
-        return None
+    def _set_order_id(self, t: sqlite3.Row, kind: str, order_id: str) -> None:
+        column = "sl_order_id" if kind == "sl" else "tp_order_id"
+        with transaction(self._j):
+            self._j.execute(f"UPDATE trades SET {column}=? WHERE id=?", (order_id, t["id"]))
+
+    def _ensure_protection(self, t: sqlite3.Row, rep: MonitorReport,
+                           sl: OrderState | None = None, tp: OrderState | None = None) -> bool:
+        """SL/TP на месте? Нет id или ордер исчез -> найти на бирже (прикрепленные ко
+        входу), иначе поставить. True — что-то поменяли в этом проходе."""
+        sl = sl if sl is not None else self._protection_state(t["symbol"], t["sl_order_id"])
+        tp = tp if tp is not None else self._protection_state(t["symbol"], t["tp_order_id"])
+        need = [kind for kind, st in (("sl", sl), ("tp", tp)) if st is None or st.is_gone]
+        if not need:
+            return False
+        existing = [o for o in self._ex.protection_orders(t["symbol"], t["side"]) if o.status == "open"]
+        for kind in need:
+            target = t["sl_price"] if kind == "sl" else t["tp_price"]
+            found = pick_protection(existing, kind, target)
+            if found is not None:
+                self._set_order_id(t, kind, found.exchange_id)
+                self._protect_fail.pop(f"{t['decision_id']}:{kind}", None)
+                rep.adopted.append(f"{t['decision_id']}:{kind}")
+                logger.info("%s %s adopted from exchange: %s", t["decision_id"], kind, found.exchange_id)
+                continue
+            self._place_protection(t, kind, rep, had_id=bool(t[f"{kind}_order_id"]))
+        return True
+
+    def _place_protection(self, t: sqlite3.Row, kind: str, rep: MonitorReport, had_id: bool) -> None:
+        key = f"{t['decision_id']}:{kind}"
+        n = self._replaced.get(key, 0) + 1
+        cid = f"{t['client_order_id']}-{kind}-r{n}"
+        try:
+            if kind == "sl":
+                order = self._ex.place_sl(t["symbol"], t["side"], t["sl_price"], cid)
+            else:
+                order = self._ex.place_tp(t["symbol"], t["side"], t["tp_price"], cid)
+        except Exception as e:  # noqa: BLE001
+            fails = self._protect_fail.get(key, 0) + 1
+            self._protect_fail[key] = fails
+            rep.errors.append(f"{key}: place failed ({fails}): {e}")
+            if exchange_error_code(e) == POSITION_MISSING_CODE and fails < PROTECT_RETRIES:
+                logger.warning("%s: position not visible yet (%d/%d), retry next tick", key, fails,
+                               PROTECT_RETRIES)
+                return
+            if kind == "tp":
+                if fails == PROTECT_RETRIES or exchange_error_code(e) != POSITION_MISSING_CODE:
+                    self._say(f"⚠️ {t['symbol']} {t['side']}: TP не встал ({e}); стоп на месте")
+                return  # без TP позиция защищена стопом — safe mode не нужен
+            self._say(f"🛑 {t['symbol']} {t['side']} БЕЗ SL: поставить не удалось ({e})")
+            self._set_safe_mode(f"позиция {t['symbol']} без защиты")
+            return
+        self._replaced[key] = n
+        self._protect_fail.pop(key, None)
+        self._set_order_id(t, kind, order.exchange_id)
+        rep.replaced.append(key)
+        if had_id:
+            self._say(f"⚠️ {kind.upper()} переставлен: {t['symbol']} {t['side']} "
+                      "(ордер исчез при живой позиции)")
+        else:
+            self._say(f"🛡 {kind.upper()} выставлен: {t['symbol']} {t['side']} "
+                      f"@ {t['sl_price'] if kind == 'sl' else t['tp_price']:.6g}")
 
     def _cancel_protection(self, t: sqlite3.Row, keep: str | None = None) -> None:
         for oid in (t["sl_order_id"], t["tp_order_id"]):
@@ -251,19 +360,53 @@ class PositionMonitor:
                 except Exception as e:  # noqa: BLE001 - учет важнее косметики
                     logger.warning("cancel %s for %s failed: %s", oid, t["decision_id"], e)
 
+    # ------------------------------------------------------------------ open
+
+    def _find_position(self, symbol: str, side: str) -> PositionInfo | None:
+        for p in self._ex.positions():
+            if p.symbol == symbol and p.side == side and p.qty > 0:
+                return p
+        return None
+
     def _close_if_protection_filled(self, t: sqlite3.Row, rep: MonitorReport) -> bool:
-        sl = self._status_or_none(t["symbol"], t["sl_order_id"])
+        sl = self._protection_state(t["symbol"], t["sl_order_id"])
         if sl is not None and sl.is_filled:
             self._cancel_protection(t, keep=t["sl_order_id"])
             self._close(t, rep, sl.avg_price or t["sl_price"], "sl_hit", sl.fee)
             return True
-        tp = self._status_or_none(t["symbol"], t["tp_order_id"])
+        tp = self._protection_state(t["symbol"], t["tp_order_id"])
         if tp is not None and tp.is_filled:
             self._cancel_protection(t, keep=t["tp_order_id"])
             self._close(t, rep, tp.avg_price or t["tp_price"], "tp_hit", tp.fee)
             return True
         self._last_protection = (sl, tp)
         return False
+
+    def _close_by_exchange_history(self, t: sqlite3.Row, rep: MonitorReport) -> bool:
+        """Позиции нет, а id защиты журналу не известны (прикрепленные SL/TP не успели
+        усыновить): спросить историю биржи — какой из них исполнился после входа."""
+        try:
+            history = self._ex.protection_orders(t["symbol"], t["side"], include_closed=True)
+        except Exception as e:  # noqa: BLE001 - закроем как manual, реконсиляция уточнит
+            logger.warning("history lookup failed for %s: %s", t["decision_id"], e)
+            return False
+        opened = _parse_iso(t["opened_at"])
+        opened_ms = int(opened.timestamp() * 1000) if opened else 0
+        fills = [o for o in history if o.status == "filled"
+                 and (o.timestamp_ms is None or o.timestamp_ms >= opened_ms)]
+        if not fills:
+            return False
+        last = max(fills, key=lambda o: o.timestamp_ms or 0)
+        self._cancel_protection(t)
+        for o in history:  # парный ордер мог остаться открытым
+            if o.status == "open":
+                try:
+                    self._ex.cancel_order(t["symbol"], o.exchange_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("cancel sibling %s failed: %s", o.exchange_id, e)
+        price = last.avg_price or last.trigger_price
+        self._close(t, rep, price, "sl_hit" if last.kind == "sl" else "tp_hit", last.fee)
+        return True
 
     def _check_open(self, t: sqlite3.Row, rep: MonitorReport) -> None:
         if self._close_if_protection_filled(t, rep):
@@ -279,7 +422,8 @@ class PositionMonitor:
                 logger.info("position %s not seen (%d/%d) - waiting a tick", did, n, CONFIRM_TICKS)
                 return
             # подтвержденное отсутствие: защита могла сработать между опросами — перепроверка
-            if self._close_if_protection_filled(t, rep):
+            if self._close_if_protection_filled(t, rep) or self._close_by_exchange_history(t, rep):
+                self._missing.pop(did, None)
                 return
             self._missing.pop(did, None)
             self._cancel_protection(t)
@@ -287,43 +431,13 @@ class PositionMonitor:
             return
         self._missing.pop(did, None)
 
-        # защита на месте? ордер отменен/исчез при живой позиции -> переставить
-        replaced = False
-        if sl is None or sl.is_gone:
-            self._replace_protection(t, "sl", rep)
-            replaced = True
-        if tp is None or tp.is_gone:
-            self._replace_protection(t, "tp", rep)
-            replaced = True
-        if replaced:
+        if self._ensure_protection(t, rep, sl, tp):
             return  # дальше — следующим тиком, с актуальными id
 
         opened = _parse_iso(t["opened_at"]) or self._now()
         age = (self._now() - opened).total_seconds()
         if pos.unrealized_pnl < 0 and age >= self._max_loss_hold:
             self._duration_stop(t, rep)
-
-    def _replace_protection(self, t: sqlite3.Row, kind: str, rep: MonitorReport) -> None:
-        key = f"{t['decision_id']}:{kind}"
-        n = self._replaced.get(key, 0) + 1
-        self._replaced[key] = n
-        cid = f"{t['client_order_id']}-{kind}-r{n}"
-        try:
-            if kind == "sl":
-                order = self._ex.place_sl(t["symbol"], t["side"], t["sl_price"], cid)
-                column = "sl_order_id"
-            else:
-                order = self._ex.place_tp(t["symbol"], t["side"], t["tp_price"], cid)
-                column = "tp_order_id"
-            with transaction(self._j):
-                self._j.execute(f"UPDATE trades SET {column}=? WHERE id=?", (order.exchange_id, t["id"]))
-            rep.replaced.append(key)
-            self._say(f"⚠️ {kind.upper()} переставлен: {t['symbol']} {t['side']} "
-                      "(ордер исчез при живой позиции)")
-        except Exception as e:  # noqa: BLE001 - голая позиция: громко и стоп новым входам
-            rep.errors.append(f"{key}: replace failed: {e}")
-            self._say(f"🛑 {t['symbol']} {t['side']} БЕЗ {kind.upper()}: переставить не удалось ({e})")
-            self._set_safe_mode(f"позиция {t['symbol']} без защиты")
 
     def _duration_stop(self, t: sqlite3.Row, rep: MonitorReport) -> None:
         order = self._ex.close_position(t["symbol"], t["side"])
@@ -420,7 +534,7 @@ class PositionMonitor:
         for t in self._trades("pending"):
             try:
                 try:
-                    st = self._ex.order_status(t["symbol"], client_order_id=t["client_order_id"])
+                    st = self._entry_state(t)
                     if not st.is_gone and not st.is_filled:
                         self._ex.cancel_order(t["symbol"], st.exchange_id)
                 except Exception as e:  # noqa: BLE001 - все равно снимаем защиту и закрываем запись
@@ -442,6 +556,9 @@ class PositionMonitor:
             try:
                 order = self._ex.close_position(t["symbol"], t["side"])
                 self._cancel_protection(t)
+                for o in self._ex.protection_orders(t["symbol"], t["side"]):  # прикрепленные без id
+                    if o.status == "open":
+                        self._ex.cancel_order(t["symbol"], o.exchange_id)
                 exit_price, fee = None, None
                 if order is not None and order.exchange_id:
                     try:
@@ -459,14 +576,24 @@ class PositionMonitor:
 
     # ---------------------------------------------------------------- thread
 
+    def _has_pending(self) -> bool:
+        return self._j.execute("SELECT 1 FROM trades WHERE status='pending' LIMIT 1").fetchone() is not None
+
     def run_forever(self) -> None:
-        logger.info("position monitor started (interval=%.0fs)", self._interval)
+        logger.info("position monitor started (interval=%.0fs, pending=%.0fs)",
+                    self._interval, self._fast_interval)
+        last_full = float("-inf")
         while not self._stop.is_set():
             try:
-                self.tick()
+                now = time.monotonic()
+                if now - last_full >= self._interval:
+                    self.tick()
+                    last_full = now
+                elif self._has_pending():
+                    self.tick_pending()
             except Exception as e:  # noqa: BLE001 - следующий тик попробует снова
                 logger.error("monitor tick failed: %s", e)
-            self._stop.wait(self._interval)
+            self._stop.wait(self._fast_interval)
 
     def start_thread(self) -> threading.Thread:
         t = threading.Thread(target=self.run_forever, name="oskar-monitor", daemon=True)

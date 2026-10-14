@@ -16,9 +16,11 @@ from oskar.data.symbols import canonical
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OrderNotFoundError,
     OrderState,
     PlacedOrder,
     PositionInfo,
+    ProtectiveOrder,
     Side,
 )
 
@@ -97,6 +99,8 @@ class PaperAdapter(ExchangeAdapter):
         *,
         entry_type: str = "market",
         price: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
     ) -> PlacedOrder:
         sym = canonical(symbol)
         key = (sym, side)
@@ -108,22 +112,30 @@ class PaperAdapter(ExchangeAdapter):
         )
         self._fills.append(PaperFill(sym, side, qty, fill_price, "entry"))
         oid = self._register(sym, side, "entry", "filled", client_order_id, fill_price, qty)
+        # прикрепленная защита: как у BingX — SL/TP появляются вместе с исполнением
+        # (внутренняя регистрация: вход и его защита — одно действие биржи)
+        if stop_loss is not None:
+            self._protect(sym, side, "sl", stop_loss, f"{oid}-attached-sl")
+        if take_profit is not None:
+            self._protect(sym, side, "tp", take_profit, f"{oid}-attached-tp")
         return PlacedOrder(oid, client_order_id, entry_type.upper(), "closed")
 
-    def place_sl(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
-        sym = canonical(symbol)
-        oid = self._register(sym, side, "sl", "open", client_order_id, stop_price)
+    def _protect(self, sym: str, side: Side, kind: str, stop_price: float, client_order_id: str) -> str:
+        oid = self._register(sym, side, kind, "open", client_order_id, stop_price)
         pos = self._positions.get((sym, side))
         if pos is not None:  # лимитка еще не исполнилась — условный ордер просто висит
-            pos.sl, pos.sl_order_id = stop_price, oid
+            if kind == "sl":
+                pos.sl, pos.sl_order_id = stop_price, oid
+            else:
+                pos.tp, pos.tp_order_id = stop_price, oid
+        return oid
+
+    def place_sl(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
+        oid = self._protect(canonical(symbol), side, "sl", stop_price, client_order_id)
         return PlacedOrder(oid, client_order_id, "STOP_MARKET", "open")
 
     def place_tp(self, symbol, side, stop_price, client_order_id) -> PlacedOrder:
-        sym = canonical(symbol)
-        oid = self._register(sym, side, "tp", "open", client_order_id, stop_price)
-        pos = self._positions.get((sym, side))
-        if pos is not None:
-            pos.tp, pos.tp_order_id = stop_price, oid
+        oid = self._protect(canonical(symbol), side, "tp", stop_price, client_order_id)
         return PlacedOrder(oid, client_order_id, "TAKE_PROFIT_MARKET", "open")
 
     def cancel_all(self, symbol: str) -> int:
@@ -159,13 +171,31 @@ class PaperAdapter(ExchangeAdapter):
             if matches:
                 exchange_id, o = matches[-1]
         if o is None:
-            raise RuntimeError(f"paper: unknown order {exchange_id or client_order_id}")
+            raise OrderNotFoundError(f"paper: unknown order {exchange_id or client_order_id}")
         filled = o.status == "filled"
         return OrderState(
             exchange_id=exchange_id, status=o.status,
             filled_qty=o.qty if filled else 0.0,
             avg_price=o.avg_price if filled else None,
         )
+
+    def protection_orders(
+        self, symbol: str, side: Side, *, include_closed: bool = False
+    ) -> list[ProtectiveOrder]:
+        sym = canonical(symbol)
+        out = []
+        for oid, o in self._orders.items():
+            if o.symbol != sym or o.side != side or o.kind not in ("sl", "tp"):
+                continue
+            if o.status != "open" and not include_closed:
+                continue
+            # у paper-ордеров защиты avg_price хранит триггер (и он же цена исполнения)
+            out.append(ProtectiveOrder(
+                exchange_id=oid, kind=o.kind, trigger_price=o.avg_price, status=o.status,
+                avg_price=o.avg_price if o.status == "filled" else None,
+                client_order_id=o.client_order_id,
+            ))
+        return out
 
     def close_position(self, symbol: str, side: Side) -> PlacedOrder | None:
         sym = canonical(symbol)

@@ -58,6 +58,43 @@ class OrderState:
         return self.status in ("canceled", "expired", "rejected")
 
 
+@dataclass(frozen=True)
+class ProtectiveOrder:
+    """Условный ордер защиты на бирже (SL/TP) — в том числе созданный САМОЙ
+    биржей из stopLoss/takeProfit, прикрепленных ко входу (их id заранее
+    неизвестны: монитор находит и «усыновляет» их после исполнения входа)."""
+
+    exchange_id: str
+    kind: str  # sl | tp
+    trigger_price: float | None
+    status: str  # open | filled | canceled | expired | rejected | unknown
+    avg_price: float | None = None
+    fee: float | None = None
+    timestamp_ms: int | None = None  # время исполнения/обновления (для истории)
+    client_order_id: str = ""
+
+
+class OrderNotFoundError(RuntimeError):
+    """Биржа ответила, что такого ордера нет. Отличается от сетевого сбоя:
+    «нет ордера» — факт для решений монитора, «не дозвонились» — повод повторить."""
+
+
+def pick_protection(orders: list[ProtectiveOrder], kind: str, target: float,
+                    tolerance_pct: float = 0.5) -> ProtectiveOrder | None:
+    """Ордер защиты нужного вида с триггером ближе всего к целевой цене плана.
+    Допуск отсекает чужие ордера на том же символе (ручные ордера Ивана)."""
+    best, best_diff = None, None
+    for o in orders:
+        if o.kind != kind or o.trigger_price is None:
+            continue
+        diff = abs(o.trigger_price - target)
+        if diff > abs(target) * tolerance_pct / 100.0:
+            continue
+        if best_diff is None or diff < best_diff:
+            best, best_diff = o, diff
+    return best
+
+
 class ExchangeAdapter(ABC):
     """Контракт исполнения. Реализации: BingXAdapter (VST/live), PaperAdapter,
     в будущем DexAdapter/Mt5Adapter."""
@@ -79,7 +116,12 @@ class ExchangeAdapter(ABC):
         *,
         entry_type: Literal["market", "limit"] = "market",
         price: float | None = None,
-    ) -> PlacedOrder: ...
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+    ) -> PlacedOrder:
+        """Вход. stop_loss/take_profit — защита, ПРИКРЕПЛЕННАЯ к ордеру: биржа
+        создает SL/TP сама в момент исполнения (у лимитки до исполнения позиции
+        нет, и отдельные closePosition-ордера BingX отвергает: 109420)."""
 
     @abstractmethod
     def place_sl(
@@ -115,3 +157,10 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     def cancel_order(self, symbol: str, exchange_id: str) -> bool:
         """Отмена одного ордера. True = отменен или его уже нет (идемпотентно)."""
+
+    @abstractmethod
+    def protection_orders(
+        self, symbol: str, side: Side, *, include_closed: bool = False
+    ) -> list[ProtectiveOrder]:
+        """SL/TP-ордера позиции symbol/side на бирже: открытые, а с include_closed —
+        и история (исполненные/снятые) для классификации закрытия."""
