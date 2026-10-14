@@ -55,6 +55,7 @@ CONFIRM_TICKS = 2  # отсутствие позиции / расхождени�
 UNKNOWN_ENTRY_TTL_SEC = 180  # вход после таймаута не найден за 3 мин — его нет
 PROTECT_RETRIES = 3  # 109420 сразу после исполнения: позиция еще не видна бирже
 POSITION_MISSING_CODE = "109420"
+ORPHAN_SCAN_SEC = 600  # поиск ордеров OSKAR без сделки в журнале — при старте и раз в 10 мин
 
 
 @dataclass
@@ -65,6 +66,7 @@ class MonitorReport:
     closed: list[tuple[str, str]] = field(default_factory=list)  # (decision_id, reason)
     replaced: list[str] = field(default_factory=list)  # поставленная монитором защита
     adopted: list[str] = field(default_factory=list)  # защита, найденная на бирже
+    orphans: list[str] = field(default_factory=list)  # снятые ордера OSKAR без сделки
     mismatches: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -72,7 +74,7 @@ class MonitorReport:
         return {
             "expired_cards": self.expired_cards, "filled": len(self.filled),
             "cancelled": len(self.cancelled), "closed": len(self.closed),
-            "replaced": len(self.replaced), "adopted": len(self.adopted),
+            "replaced": len(self.replaced), "adopted": len(self.adopted), "orphans": len(self.orphans),
             "mismatches": len(self.mismatches), "errors": len(self.errors),
         }
 
@@ -122,6 +124,7 @@ class PositionMonitor:
         self._missing: dict[str, int] = {}  # decision_id -> тиков подряд без позиции
         self._replaced: dict[str, int] = {}  # "<decision>:<sl|tp>" -> сколько раз ставили
         self._protect_fail: dict[str, int] = {}  # "<decision>:<sl|tp>" -> неудач подряд
+        self._orphan_scan_at: datetime | None = None
         self.last_report: dict = {}
         self.ticks = 0
         self._stop = threading.Event()
@@ -135,6 +138,7 @@ class PositionMonitor:
         for t in self._trades("open"):
             self._guard(rep, t["decision_id"], lambda t=t: self._check_open(t, rep))
         self._guard(rep, "reconcile", lambda: self._reconcile(rep))
+        self._guard(rep, "orphans", lambda: self._scan_orphans(rep))
         self.ticks += 1
         self.last_report = rep.as_dict()
         return rep
@@ -523,6 +527,41 @@ class PositionMonitor:
                 self._say(f"⚠️ reconcile: {m}")
                 self._set_safe_mode("журнал и биржа расходятся")
         self._reported_mismatches &= set(confirmed)  # ушло — можно сообщить снова
+
+    # --------------------------------------------------------------- orphans
+
+    def _scan_orphans(self, rep: MonitorReport) -> None:
+        """Открытые ордера OSKAR (clientOrderId «OSKAR-...»), которых журнал не знает:
+        процесс упал между отправкой входа и записью, или после закрытия сделки
+        остался ее SL/TP. Сирота-вход позже открыл бы позицию мимо журнала, а
+        забытый closePosition-стоп закрыл бы СЛЕДУЮЩУЮ позицию по символу — снимаем.
+        Чужие ордера (ручные, прикрепленные биржей без нашего cid) не трогаем."""
+        now = self._now()
+        last = self._orphan_scan_at
+        if last is not None and (now - last).total_seconds() < ORPHAN_SCAN_SEC:
+            return
+        self._orphan_scan_at = now
+        live = self._j.execute(
+            "SELECT client_order_id, entry_order_id, sl_order_id, tp_order_id FROM trades "
+            "WHERE status IN ('pending','open')"
+        ).fetchall()
+        known_ids = {x for r in live for x in (r["entry_order_id"], r["sl_order_id"], r["tp_order_id"]) if x}
+        known_cids = {str(r["client_order_id"]).lower() for r in live}
+        for o in self._ex.open_orders_all():
+            cid = o.client_order_id.lower()
+            if not cid.startswith("oskar-"):
+                continue
+            base = "-".join(cid.split("-")[:3])  # OSKAR-<run>-<hash>[-sl|-tp[-rN]]
+            if o.exchange_id in known_ids or base in known_cids:
+                continue
+            self._ex.cancel_order(o.symbol, o.exchange_id)
+            rep.orphans.append(f"{o.symbol}:{o.kind}:{o.exchange_id}")
+            if o.kind == "entry":
+                self._say(f"⚠️ снят вход-сирота {o.symbol} ({o.client_order_id}): "
+                          "ордер OSKAR без сделки в журнале")
+            else:
+                logger.info("orphan %s %s %s cancelled (%s)", o.kind, o.symbol, o.exchange_id,
+                            o.client_order_id)
 
     # ----------------------------------------------------------------- panic
 

@@ -123,6 +123,9 @@ class ScriptedExchange(ExchangeAdapter):
     def protection_orders(self, symbol, side, *, include_closed=False):
         return [o for o in self.protection if include_closed or o.status == "open"]
 
+    def open_orders_all(self):
+        return []
+
 
 def plan(**overrides) -> ExecutionPlan:
     base = dict(

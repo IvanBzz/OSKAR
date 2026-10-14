@@ -17,6 +17,7 @@ from oskar.data.symbols import canonical
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OpenOrderRef,
     OrderNotFoundError,
     OrderState,
     PlacedOrder,
@@ -275,6 +276,20 @@ class BingXAdapter(ExchangeAdapter):
             if any(b.__name__ == "OrderNotFound" for b in type(e).__mro__):
                 raise OrderNotFoundError(str(e)) from e
             raise
+
+    def open_orders_all(self) -> list[OpenOrderRef]:
+        self._ensure_markets()
+        out = []
+        for o in self._ex.fetch_open_orders():
+            raw_type = str((o.get("info") or {}).get("type") or "").upper()
+            kind = ("tp" if raw_type.startswith("TAKE_PROFIT")
+                    else "sl" if raw_type.startswith("STOP")
+                    else "entry" if raw_type in ("LIMIT", "MARKET") else "other")
+            out.append(OpenOrderRef(
+                symbol=canonical(o.get("symbol") or ""), exchange_id=str(o.get("id") or ""),
+                client_order_id=str(o.get("clientOrderId") or ""), kind=kind,
+            ))
+        return out
 
     def protection_orders(
         self, symbol: str, side: Side, *, include_closed: bool = False

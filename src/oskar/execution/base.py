@@ -74,6 +74,16 @@ class ProtectiveOrder:
     client_order_id: str = ""
 
 
+@dataclass(frozen=True)
+class OpenOrderRef:
+    """Открытый ордер на бирже (любой символ) — для поиска «сирот» OSKAR."""
+
+    symbol: str  # канонический
+    exchange_id: str
+    client_order_id: str
+    kind: str  # entry | sl | tp | other
+
+
 class OrderNotFoundError(RuntimeError):
     """Биржа ответила, что такого ордера нет. Отличается от сетевого сбоя:
     «нет ордера» — факт для решений монитора, «не дозвонились» — повод повторить."""
@@ -164,3 +174,7 @@ class ExchangeAdapter(ABC):
     ) -> list[ProtectiveOrder]:
         """SL/TP-ордера позиции symbol/side на бирже: открытые, а с include_closed —
         и история (исполненные/снятые) для классификации закрытия."""
+
+    @abstractmethod
+    def open_orders_all(self) -> list[OpenOrderRef]:
+        """Все открытые ордера аккаунта по всем символам (поиск сирот OSKAR)."""

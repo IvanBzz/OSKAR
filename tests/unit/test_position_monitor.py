@@ -7,6 +7,7 @@ from oskar.core.state import RuntimeState
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OpenOrderRef,
     OrderNotFoundError,
     OrderState,
     PlacedOrder,
@@ -32,6 +33,7 @@ class FakeAdapter(ExchangeAdapter):
         self.fail_symbols: set[str] = set()
         self.close_price = 97.0
         self.protection: list[ProtectiveOrder] = []  # SL/TP «на бирже» (в т.ч. прикрепленные)
+        self.open_list: list[OpenOrderRef] = []  # все открытые ордера аккаунта
 
     def normalize_qty(self, symbol, qty):
         return qty
@@ -73,6 +75,9 @@ class FakeAdapter(ExchangeAdapter):
 
     def protection_orders(self, symbol, side, *, include_closed=False):
         return [o for o in self.protection if include_closed or o.status == "open"]
+
+    def open_orders_all(self):
+        return list(self.open_list)
 
     def cancel_order(self, symbol, exchange_id):
         self.cancelled.append(exchange_id)
@@ -356,3 +361,32 @@ def test_bingx_adapter_order_status_mapping_and_fallbacks():
     assert by_cid.is_gone and by_cid.exchange_id == "9"
     assert ad.cancel_order(SYM, "5") and ex.cancelled == ["5"]
     assert ad.cancel_order(SYM, "gone")  # «уже нет» = успех
+
+
+def test_orphan_oskar_orders_cancelled_known_and_foreign_untouched(tmp_path):
+    """Ордер OSKAR без сделки в журнале снимается; свои ордера живой сделки и
+    чужие (ручные, прикрепленные биржей) — нет. Скан — раз в ORPHAN_SCAN_SEC."""
+    from oskar.core.position_monitor import ORPHAN_SCAN_SEC
+
+    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
+    add_trade(j, "d1")
+    ex.orders["d1-sl"] = OrderState("d1-sl", "open")
+    ex.orders["d1-tp"] = OrderState("d1-tp", "open")
+    ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 1.0)]
+    ex.open_list = [
+        OpenOrderRef(SYM, "d1-sl", "OSKAR-r1-d1-sl", "sl"),               # своя живая сделка
+        OpenOrderRef(SYM, "x9", "oskar-r1-d1-sl-r2", "sl"),               # та же сделка (база cid)
+        OpenOrderRef("A/USDT:USDT", "o1", "OSKAR-dead-abc123", "entry"),  # сирота-вход
+        OpenOrderRef("B/USDT:USDT", "o2", "OSKAR-old-def456-tp", "tp"),   # остаток закрытой сделки
+        OpenOrderRef("C/USDT:USDT", "m1", "manual-ivan", "entry"),         # ручной ордер Ивана
+        OpenOrderRef("C/USDT:USDT", "a1", "", "sl"),                       # прикрепленный биржей
+    ]
+    rep = mon.tick()
+    assert sorted(ex.cancelled) == ["o1", "o2"]
+    assert sorted(rep.orphans) == ["A/USDT:USDT:entry:o1", "B/USDT:USDT:tp:o2"]
+    assert any("сирота" in n for n in notes)
+
+    ex.cancelled.clear()
+    clock[0] = T0 + timedelta(seconds=ORPHAN_SCAN_SEC - 1)
+    mon.tick()
+    assert ex.cancelled == []  # до следующего скана не трогаем

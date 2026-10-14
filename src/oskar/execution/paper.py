@@ -16,6 +16,7 @@ from oskar.data.symbols import canonical
 from oskar.execution.base import (
     BalanceInfo,
     ExchangeAdapter,
+    OpenOrderRef,
     OrderNotFoundError,
     OrderState,
     PlacedOrder,
@@ -178,6 +179,13 @@ class PaperAdapter(ExchangeAdapter):
             filled_qty=o.qty if filled else 0.0,
             avg_price=o.avg_price if filled else None,
         )
+
+    def open_orders_all(self) -> list[OpenOrderRef]:
+        return [
+            OpenOrderRef(symbol=o.symbol, exchange_id=oid, client_order_id=o.client_order_id,
+                         kind=o.kind if o.kind in ("entry", "sl", "tp") else "other")
+            for oid, o in self._orders.items() if o.status == "open"
+        ]
 
     def protection_orders(
         self, symbol: str, side: Side, *, include_closed: bool = False
