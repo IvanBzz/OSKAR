@@ -34,10 +34,19 @@ closePosition-ордера SL/TP, пока позиции нет — 109420 «po
   цена бралась до долгой подготовки (плечо с сетевыми повторами);
 - после филла маркета R:R и стоп считаются по цене филла: вне капа с люфтом INV-004 — авария
   fill_out_of_caps (позиция с SL/TP не закрывается, алерт, предохранитель считает);
-- реестр in-flight знает символ и сторону входа: panic ждет его опустения, а не дождавшись —
-  снимает по бирже (core/emergency.py);
+- реестр in-flight знает символ, сторону и решение входа: panic ждет его опустения, а не
+  дождавшись — проверяет вход по clientOrderId (core/emergency.py; по symbol/side не закрывает);
 - equity для входа — не старше EQUITY_MAX_AGE_SEC, иначе свежий запрос к бирже
   (equity_guarded); по нему же защелка просадки — до исполнения.
+
+Ревью Codex H2/I, 2026-10-16:
+- флаги защиты перепроверяются ПОСЛЕ сети последнего рубежа (тикер, точность qty) — сразу
+  перед place_entry, в короткой критической секции с их взводом (emergency.ENTRY_GATE_LOCK):
+  флаг, взведенный, пока тикер отвечал, раньше вход не останавливал. Прошедший допуск вход
+  отмечается в реестре — panic ждет только такие;
+- слот позиции и symbol/side резервируются атомарно при нажатии (_reserve) и считаются вместе
+  с журналом: два approve разных решений (API+API, API+автомат) читали одинаковый пустой
+  журнал и оба входили мимо лимита и запрета дубля. Сеть — вне замка.
 
 Инварианты (ревью 2026-10-13, класс бага v1 с двойной позицией):
 - вход ушел на биржу (или мог уйти — таймаут) => запись в trades есть ВСЕГДА
@@ -58,7 +67,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from oskar.contracts.schemas import ExecutionPlan
-from oskar.core.emergency import panic_engaged, safe_mode_engaged
+from oskar.core.emergency import ENTRY_GATE_LOCK, panic_engaged, safe_mode_engaged
 from oskar.data.client import classify_error, exchange_error_code
 from oskar.execution.base import ExchangeAdapter, PlacedOrder, cid_base, pick_protection
 from oskar.journal.db import transaction
@@ -98,8 +107,18 @@ KIND_ERROR = "error"  # исключение/неожиданное
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()  # база clientOrderId (OSKAR-<run>-<hash>), нижний регистр
 # Символ и сторона входа «в процессе» (после чтения плана): panic, не дождавшийся записи,
-# закрывает позицию по ним (ревью Codex R1, 2026-10-16).
+# проверяет вход по clientOrderId на этой паре (ревью Codex R1; H3, 3-й круг — без закрытия по паре).
 _INFLIGHT_TARGETS: dict[str, tuple[str, str]] = {}
+# Решение входа «в процессе»: алерт panic и уровни плана для снятия его защиты (ревью H3, 3-й круг)
+_INFLIGHT_DECISIONS: dict[str, str] = {}
+# Прошли допуск к отправке (_admit под ENTRY_GATE_LOCK): вход ушел или уйдет на биржу.
+# Остальные после взвода panic отклонит допуск — panic ждет только эти (ревью Codex H2/I).
+_ADMITTED: set[str] = set()
+
+# Резервации слота позиции и symbol/side от нажатия до записи сделки (ревью Codex H2/I,
+# 2026-10-16): {база cid: (decision_id, symbol, side)}. Под замком — только журнал, без сети.
+_RESERVE_LOCK = threading.Lock()
+_RESERVED: dict[str, tuple[str, str, str]] = {}
 
 
 def inflight_client_ids() -> set[str]:
@@ -111,6 +130,23 @@ def inflight_entries() -> dict[str, tuple[str, str] | None]:
     """{база cid: (symbol, side) | None — план еще не прочитан} входов «в процессе»."""
     with _INFLIGHT_LOCK:
         return {key: _INFLIGHT_TARGETS.get(key) for key in _INFLIGHT}
+
+
+def admitted_entries() -> dict[str, tuple[str, str] | None]:
+    """{база cid: (symbol, side)} входов «в процессе», допущенных к отправке."""
+    with _INFLIGHT_LOCK:
+        return {key: _INFLIGHT_TARGETS.get(key) for key in _INFLIGHT if key in _ADMITTED}
+
+
+def inflight_decision(key: str) -> str | None:
+    """decision_id входа «в процессе» по базе cid; None — не в реестре."""
+    with _INFLIGHT_LOCK:
+        return _INFLIGHT_DECISIONS.get(key)
+
+
+def reserved_entries() -> dict[str, tuple[str, str, str]]:
+    with _RESERVE_LOCK:
+        return dict(_RESERVED)
 
 
 def _is_ambiguous(e: Exception) -> bool:
@@ -217,9 +253,31 @@ class ExecutionService:
 
     def _live_trades(self, exclude_decision: str) -> list[sqlite3.Row]:
         return self._j.execute(
-            "SELECT symbol, side FROM trades WHERE status IN ('open','pending') AND decision_id != ?",
+            "SELECT decision_id, symbol, side FROM trades WHERE status IN ('open','pending') "
+            "AND decision_id != ?",
             (exclude_decision,),
         ).fetchall()
+
+    def _reserve(self, plan: ExecutionPlan, key: str) -> str | None:
+        """Лимит позиций и дубль symbol/side по журналу И резервациям входов «в процессе»;
+        прошло — слот занят резервацией до конца execute() (запись сделки — раньше снятия).
+        Атомарно под _RESERVE_LOCK: чтение журнала, без сети (ревью Codex H2/I, 2026-10-16)."""
+        with _RESERVE_LOCK:
+            live = self._live_trades(plan.candidate_id)
+            recorded = {r["decision_id"] for r in live}
+            taken = [(r["symbol"], r["side"]) for r in live]
+            # резервация уже записанной сделки — та же позиция, не считаем дважды
+            reserved = [(s, sd) for k, (d, s, sd) in _RESERVED.items()
+                        if k != key and d != plan.candidate_id and d not in recorded]
+            total = len(taken) + len(reserved)
+            if self._max_open is not None and total >= self._max_open:
+                return f"лимит открытых позиций: {total}/{self._max_open}"
+            if (plan.symbol, plan.side) in taken:
+                return f"уже есть позиция {plan.symbol} {plan.side}"
+            if (plan.symbol, plan.side) in reserved:
+                return f"вход {plan.symbol} {plan.side} по другому решению уже в процессе"
+            _RESERVED[key] = (plan.candidate_id, plan.symbol, plan.side)
+        return None
 
     def _halt_reason(self) -> str | None:
         """panic, SAFE MODE, стоп по просадке — в памяти демона и в meta журнала (переживают
@@ -258,17 +316,15 @@ class ExecutionService:
         return (f"цена входа {entry_px:.6g} не между стопом {plan.sl:.6g} и целью "
                 f"{plan.tp:.6g} — вход отменен")
 
-    def _pre_checks(self, plan: ExecutionPlan, mode: str) -> tuple[str | None, float | None]:
+    def _pre_checks(self, plan: ExecutionPlan, mode: str, key: str) -> tuple[str | None, float | None]:
         """Мир на момент нажатия. Лестница видела его при создании карточки.
         Возвращает (причина отказа | None, текущая цена | None)."""
         halt = self._halt_reason()
         if halt is not None:
             return halt, None
-        live = self._live_trades(plan.candidate_id)
-        if self._max_open is not None and len(live) >= self._max_open:
-            return f"лимит открытых позиций: {len(live)}/{self._max_open}", None
-        if any(r["symbol"] == plan.symbol and r["side"] == plan.side for r in live):
-            return f"уже есть позиция {plan.symbol} {plan.side}", None
+        busy = self._reserve(plan, key)  # слот и symbol/side — до сети (ревью Codex H2/I)
+        if busy is not None:
+            return busy, None
         return self._price_checks(plan, mode)
 
     def _price_checks(self, plan: ExecutionPlan, mode: str) -> tuple[str | None, float | None]:
@@ -292,16 +348,17 @@ class ExecutionService:
                             f"({plan.entry_market:.6g} -> {px:.6g}) — план устарел"), px
         return self._rr_reason(plan, mode, self._entry_price(plan, mode, px)), px
 
-    def _send_gate(self, plan: ExecutionPlan, mode: str, qty: float) -> tuple[str | None, float]:
+    def _send_gate(self, plan: ExecutionPlan, mode: str, qty: float, key: str) -> tuple[str | None, float]:
         """Последний рубеж перед КАЖДОЙ отправкой входа, включая голый повтор (ревью Codex R1,
         2026-10-16): panic/SAFE MODE/просадка, свежая цена и R:R/стоп по ней, qty под эту цену —
         только вниз. Между нажатием и отправкой — плечо с сетевыми повторами, а между первой
         попыткой и повтором другой поток мог взвести panic и закончить flatten.
+        Флаги — еще раз ПОСЛЕ сети, в допуске (_admit): тикер мог отвечать, пока их взводили.
         Возвращает (причина отказа | None, qty к отправке)."""
         halt = self._halt_reason()
         if halt is not None:
             return halt, qty
-        reason, px = self._price_checks(plan, mode)
+        reason, px = self._price_checks(plan, mode)  # сеть
         if reason is not None:
             return reason, qty
         entry_px = self._entry_price(plan, mode, px)
@@ -313,7 +370,27 @@ class ExecutionService:
                 return f"qty не пересчитана: {short_error(e)}", qty
             if qty <= 0:
                 return f"qty после пересчета по цене {entry_px:.6g} = {qty}", qty
-        return None, qty
+        return self._admit(key), qty
+
+    def _admit(self, key: str) -> str | None:
+        """Допуск к отправке — сразу перед place_entry, после всей сети (ревью Codex H2/I,
+        2026-10-16). Флаги в meta (защелка просадки, panic/SAFE MODE с прошлого запуска) — здесь
+        же, чтение журнала. panic и SAFE MODE в памяти — под ENTRY_GATE_LOCK, под которым их и
+        взводят: взвод до допуска — отказ; после — вход уже отмечен допущенным, panic его ждет и
+        закрывает. Под замком — только память: panic не ждет ни сети, ни журнала."""
+        halt = self._halt_reason()
+        if halt is not None:
+            return halt
+        st = self._state
+        with ENTRY_GATE_LOCK:
+            if st is not None and st.panic_at is not None:
+                return "panic взведен — вход отменен"
+            if st is not None and st.safe_mode:
+                return "SAFE MODE взведен — вход отменен"
+            with _INFLIGHT_LOCK:
+                if key in _INFLIGHT:
+                    _ADMITTED.add(key)
+        return None
 
     def _fill_breach(self, plan: ExecutionPlan, fill_px: float | None) -> str | None:
         """R:R и стоп по ФАКТИЧЕСКОЙ цене филла маркета с люфтом INV-004 (ревью Codex R1,
@@ -359,12 +436,18 @@ class ExecutionService:
         key = cid_base(make_client_order_id(self._run_id, decision_id))
         with _INFLIGHT_LOCK:
             _INFLIGHT.add(key)
+            _INFLIGHT_DECISIONS[key] = decision_id
         try:
             return self._execute(decision_id, mode)
         finally:
+            # резервация снимается ПОСЛЕ записи сделки (_record внутри _execute): слот не пустеет
+            with _RESERVE_LOCK:
+                _RESERVED.pop(key, None)
             with _INFLIGHT_LOCK:
                 _INFLIGHT.discard(key)
                 _INFLIGHT_TARGETS.pop(key, None)
+                _INFLIGHT_DECISIONS.pop(key, None)
+                _ADMITTED.discard(key)
 
     def _execute(self, decision_id: str, mode: str) -> ExecutionOutcome:
         if mode not in ("market", "limit"):
@@ -384,7 +467,7 @@ class ExecutionService:
         if mode == "limit" and plan.entry_limit is None:
             return ExecutionOutcome(False, "лимитного уровня нет в плане — только маркет",
                                     kind=KIND_REFUSED)
-        reason, px = self._pre_checks(plan, mode)
+        reason, px = self._pre_checks(plan, mode, key)
         if reason is not None:
             logger.info("execution refused for %s: %s", decision_id, reason)
             return ExecutionOutcome(False, reason, kind=KIND_REFUSED)
@@ -500,7 +583,8 @@ class ExecutionService:
     def _place_entry(self, plan: ExecutionPlan, qty: float, cid: str, mode: str,
                      price: float) -> _EntryResult:
         kw = {"entry_type": mode, "price": None if mode == "market" else price}
-        reason, qty = self._send_gate(plan, mode, qty)
+        key = cid_base(cid)
+        reason, qty = self._send_gate(plan, mode, qty, key)
         if reason is not None:
             return _EntryResult(None, attached=True, qty=qty, refused=reason)
         try:
@@ -519,7 +603,7 @@ class ExecutionService:
                            cid, short_error(e))
         # Повтор — та же проверка заново (ревью Codex R1, 2026-10-16): пока биржа отвечала
         # отказом, другой поток мог взвести panic и закончить flatten, не видя этого входа.
-        reason, qty = self._send_gate(plan, mode, qty)
+        reason, qty = self._send_gate(plan, mode, qty, key)
         if reason is not None:
             return _EntryResult(None, attached=False, qty=qty, refused=reason)
         try:

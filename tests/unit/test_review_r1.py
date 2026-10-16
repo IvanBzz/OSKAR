@@ -21,6 +21,7 @@ from oskar.core.emergency import (
     restore_safe_mode,
     retry_safe_mode_persist,
     safe_mode_engaged,
+    unclear_entries,
 )
 from oskar.core.executor import (
     KIND_FILL_OUT_OF_CAPS,
@@ -139,7 +140,9 @@ def test_panic_waits_for_inflight_entry_and_closes_it_in_final_pass(tmp_path):
     assert executor_mod.inflight_entries() == {}
 
 
-def test_panic_without_inflight_makes_a_single_pass(tmp_path):
+def test_panic_without_inflight_still_makes_final_pass(tmp_path):
+    """Ревью Codex H2/I: финальный проход — всегда (вход мог записаться и выйти из реестра
+    между первым проходом и ожиданием; см. test_review_h2i)."""
     calls = []
 
     class Monitor:
@@ -148,12 +151,14 @@ def test_panic_without_inflight_makes_a_single_pass(tmp_path):
             return {"cancelled": 0, "closed": 0, "errors": []}
 
     out = engage_panic(RuntimeState(journal=connect(tmp_path / "j.db")), Monitor())
-    assert calls == [1] and out["exchange"] == {"cancelled": 0, "closed": 0, "errors": []}
+    assert calls == [1, 1] and out["exchange"] == {"cancelled": 0, "closed": 0, "errors": []}
 
 
-def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
-    """Вход так и не записан за окно: алерт и снятие по бирже по clientOrderId входа и его
-    символу/стороне. Чужие ордера (другой cid, ручные без cid) не трогаем."""
+def test_panic_checks_unfinished_inflight_entry_by_client_id(tmp_path):
+    """Вход так и не записан за окно: проверка по clientOrderId (ревью H3, 3-й круг — раньше
+    закрывалась позиция символа/стороны). Висящий вход снят по id; исполнения нет, а исполнитель
+    еще в процессе — исход неясен: позиция пары (она может быть ручной) НЕ закрывается, вход — в
+    списке неясных, алерт. Чужие ордера (другой cid, ручные без cid) не трогаем."""
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     cid = executor_mod.make_client_order_id("r9", "SOLUSDTUSDT-7-long")
     key = cid_base(cid)
@@ -163,11 +168,14 @@ def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
         OpenOrderRef(SYM, "x1", "OSKAR-r9-0123456789ab", "entry"),
         OpenOrderRef(SYM, "m1", "", "sl"),
     ]
+    ex.by_cid[cid] = OrderState("e1", "open")
+    ex.orders["e1"] = OrderState("e1", "canceled")  # после отмены
     ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 0.0)]
     t = [0.0]
-    with executor_mod._INFLIGHT_LOCK:
+    with executor_mod._INFLIGHT_LOCK:  # вход прошел допуск к отправке (ревью Codex H2/I)
         executor_mod._INFLIGHT.add(key)
         executor_mod._INFLIGHT_TARGETS[key] = (SYM, "long")
+        executor_mod._ADMITTED.add(key)
     try:
         out = engage_panic(state, mon, inflight_wait_sec=2.0,
                            sleep=lambda s: t.__setitem__(0, t[0] + s), clock=lambda: t[0])
@@ -175,12 +183,13 @@ def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
         with executor_mod._INFLIGHT_LOCK:
             executor_mod._INFLIGHT.discard(key)
             executor_mod._INFLIGHT_TARGETS.pop(key, None)
+            executor_mod._ADMITTED.discard(key)
     assert t[0] >= 2.0  # ждали окно целиком
-    assert sorted(ex.cancelled) == ["e1", "s1"]
-    assert ex.closed == [(SYM, "long")]
+    assert ex.cancelled == ["e1"] and ex.closed == []
     assert out["exchange"]["inflight_unfinished"] == [key]
-    assert out["exchange"]["cancelled"] == 2 and out["exchange"]["closed"] == 1
-    assert any("не записан за окно ожидания" in n for n in notes)
+    assert out["exchange"]["unclear"] == [key] and out["exchange"]["closed"] == 0
+    assert list(unclear_entries(j)) == [key]
+    assert sum("неясным исходом" in n and "SOL/USDT:USDT long" in n for n in notes) == 1
 
 
 # ============================================ P1-2: R:R перед отправкой и по филлу

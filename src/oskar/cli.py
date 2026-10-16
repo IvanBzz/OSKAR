@@ -227,6 +227,8 @@ def _cmd_daemon_api(command: str) -> int:
     if command == "panic-reset":
         print(f"panic reset: safe_mode={body.get('safe_mode')} paused={body.get('paused')} "
               "(pause stays - resume is a separate explicit decision)")
+        for key in body.get("unclear_dropped") or []:
+            print(f"  unclear panic entry dropped from watch: {_ascii(key)}")
         return 0
     if command == "drawdown-reset":
         return _print_drawdown_reset(body)
@@ -251,6 +253,9 @@ def _print_panic(result: dict) -> int:
         for err in errors:
             ok = False
             print(f"  error: {_ascii(err)}")
+        for entry in exchange.get("unclear") or []:  # ничего не закрыто по symbol/side
+            ok = False
+            print(f"  unclear entry (check the position manually): {_ascii(entry)}")
     if result.get("persist_error"):
         ok = False
         print(f"WARNING: panic flag not persisted ({_ascii(result['persist_error'])}) "

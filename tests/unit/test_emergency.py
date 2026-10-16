@@ -50,6 +50,8 @@ def test_engage_panic_sets_flags_before_persist_and_exchange(tmp_path):
 
     class Monitor:
         def panic_flatten(self):
+            if seen:  # финальный проход (всегда, ревью Codex H2/I): первый уже все снял
+                return {"cancelled": 0, "closed": 0, "errors": []}
             seen["flags"] = (state.safe_mode, state.paused, state.panic_at is not None)
             seen["persisted"] = panic_engaged(j) is not None
             return {"cancelled": 2, "closed": 1, "errors": []}
@@ -127,6 +129,7 @@ def test_telegram_panic_reaches_exchange_and_replies(tmp_path):
     add_trade(j, "pend", status="pending", symbol="A/USDT:USDT")
     add_trade(j, "open1", symbol="B/USDT:USDT")
     ex.by_cid["OSKAR-r1-pend"] = OrderState("e-pend", "open")
+    ex.orders["e-pend"] = OrderState("e-pend", "canceled")  # после отмены: panic перепроверяет по id
     ex.pos = [PositionInfo("B/USDT:USDT", "long", 2.0, 100.0, -1.0)]
     fake = FakeBotApi([message_update("/panic")])
     poller = ButtonPoller(

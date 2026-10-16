@@ -187,7 +187,13 @@ class ExchangeAdapter(ABC):
 
     @abstractmethod
     def close_position(self, symbol: str, side: Side) -> PlacedOrder | None:
-        """Рыночное закрытие позиции (duration-stop, panic). None = позиции нет."""
+        """Рыночное закрытие позиции целиком (duration-stop). None = позиции нет."""
+
+    @abstractmethod
+    def close_qty(self, symbol: str, side: Side, qty: float) -> PlacedOrder | None:
+        """Рыночное закрытие ровно qty позиции symbol/side — не больше самой позиции (panic:
+        закрывается только экспозиция, доказанная своей; ручная часть той же пары остается).
+        Только уменьшает позицию: закрывающая сторона + positionSide. None = позиции нет."""
 
     @abstractmethod
     def positions(self) -> list[PositionInfo]: ...

@@ -1,5 +1,6 @@
 """Монитор позиций: журнал догоняет биржу по состоянию ордеров (ст. 1)."""
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from oskar.core.position_monitor import PositionMonitor, _iso
@@ -30,6 +31,7 @@ class FakeAdapter(ExchangeAdapter):
         self.pos: list[PositionInfo] = []
         self.cancelled: list[str] = []
         self.closed: list[tuple[str, str]] = []
+        self.closed_qty: list[tuple[str, str, float]] = []  # close_qty: (symbol, side, qty)
         self.fail_symbols: set[str] = set()
         self.close_price = 97.0
         self.protection: list[ProtectiveOrder] = []  # SL/TP «на бирже» (в т.ч. прикрепленные)
@@ -57,6 +59,21 @@ class FakeAdapter(ExchangeAdapter):
         self.closed.append((symbol, side))
         self.pos = [p for p in self.pos if not (p.symbol == symbol and p.side == side)]
         self.orders["close-1"] = OrderState("close-1", "filled", 2.0, self.close_price, 0.2)
+        return PlacedOrder("close-1", "", "MARKET", "closed")
+
+    def close_qty(self, symbol, side, qty):
+        """Закрытие ровно qty (panic): позиция уменьшается, ручной остаток той же пары живет."""
+        match = [p for p in self.pos if p.symbol == symbol and p.side == side]
+        if not match or qty <= 0:
+            return None
+        done = min(qty, sum(p.qty for p in match))
+        self.closed.append((symbol, side))
+        self.closed_qty.append((symbol, side, done))
+        rest = round(sum(p.qty for p in match) - done, 10)
+        self.pos = [p for p in self.pos if p not in match]
+        if rest > 0:
+            self.pos.append(replace(match[0], qty=rest))
+        self.orders["close-1"] = OrderState("close-1", "filled", done, self.close_price, 0.2)
         return PlacedOrder("close-1", "", "MARKET", "closed")
 
     def positions(self):

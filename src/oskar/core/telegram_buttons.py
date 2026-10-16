@@ -113,6 +113,10 @@ def panic_reply(result: dict, waited_sec: float = 0.0) -> str:
         lines += [f"⚠️ {_esc(e)}" for e in errors[:3]]
         if len(errors) > 3:
             lines.append(f"…и еще {len(errors) - 3}")
+        unclear = exchange.get("unclear") or []
+        if unclear:  # ревью H3, 3-й круг: по symbol/side не закрываем — оператор проверяет сам
+            lines.append(f"⚠️ входов с неясным исходом: {len(unclear)} ({_esc(', '.join(unclear[:3]))}) — "
+                         "по symbol/side ничего не закрыто, проверь позиции вручную.")
     if result.get("persist_error"):
         lines.append(
             f"⚠️ флаг не записан в журнал ({_esc(result['persist_error'])}): "

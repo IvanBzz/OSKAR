@@ -176,8 +176,7 @@ class BingXAdapter(ExchangeAdapter):
             self._ex.cancel_order(o["id"], sym)
         return len(orders)
 
-    def close_position(self, symbol: str, side: Side) -> PlacedOrder | None:
-        sym = canonical(symbol)
+    def _position_qty(self, sym: str, side: Side) -> float | None:
         pos_qty = None
         for p in self._ex.fetch_positions([sym]):
             if str(p.get("side", "")).lower() == side:
@@ -185,12 +184,34 @@ class BingXAdapter(ExchangeAdapter):
                 size = float(p.get("contractSize") or 1.0)
                 if contracts > 0:
                     pos_qty = contracts * size
+        return pos_qty
+
+    def close_position(self, symbol: str, side: Side) -> PlacedOrder | None:
+        sym = canonical(symbol)
+        pos_qty = self._position_qty(sym, side)
         if pos_qty is None:
             return None
         params = self._guard_params({"positionSide": _POSITION_SIDE[side]})
         raw = self._ex.create_order(
             sym, "market", _CLOSE_ORDER_SIDE[side], pos_qty, None, params
         )
+        return self._placed(raw, "", "MARKET")
+
+    def close_qty(self, symbol: str, side: Side, qty: float) -> PlacedOrder | None:
+        """Закрытие ровно qty (panic по доказанному входу OSKAR, ревью H3 3-й круг). reduceOnly в
+        hedge mode BingX запрещен (109400) — уменьшение гарантирует закрывающая сторона с
+        positionSide: такой ордер не открывает противоположную позицию. qty — не больше позиции и
+        округляется биржей вниз (amount_to_precision ccxt усекает)."""
+        sym = canonical(symbol)
+        pos_qty = self._position_qty(sym, side)
+        if pos_qty is None or qty <= 0:
+            return None
+        self._ensure_markets()
+        amount = float(self._ex.amount_to_precision(sym, min(float(qty), pos_qty)))
+        if amount <= 0:
+            return None
+        params = self._guard_params({"positionSide": _POSITION_SIDE[side]})
+        raw = self._ex.create_order(sym, "market", _CLOSE_ORDER_SIDE[side], amount, None, params)
         return self._placed(raw, "", "MARKET")
 
     def positions(self) -> list[PositionInfo]:

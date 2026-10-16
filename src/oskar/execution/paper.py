@@ -217,6 +217,20 @@ class PaperAdapter(ExchangeAdapter):
         oid = self._register(sym, side, "close", "filled", "", price, pos.qty)
         return PlacedOrder(oid, "", "MARKET", "closed")
 
+    def close_qty(self, symbol: str, side: Side, qty: float) -> PlacedOrder | None:
+        sym = canonical(symbol)
+        pos = self._positions.get((sym, side))
+        if pos is None or qty <= 0:
+            return None
+        if qty >= pos.qty:
+            return self.close_position(sym, side)
+        price = self._price(sym)
+        pos.qty = round(pos.qty - qty, self._precision)
+        self._settle(sym, _PaperPosition(side=side, qty=qty, entry_price=pos.entry_price), price,
+                     "manual_close")
+        oid = self._register(sym, side, "close", "filled", "", price, qty)
+        return PlacedOrder(oid, "", "MARKET", "closed")
+
     def positions(self) -> list[PositionInfo]:
         out = []
         for (sym, _side), pos in self._positions.items():
