@@ -7,6 +7,8 @@
   с висящими исходами, не по вотчлисту (выпавший из топа символ иначе висел вечно)
 - каждые EQUITY_SEC (1 час): обновление equity с биржи; после сбоя — повтор через
   EQUITY_RETRY_SEC, а не через час (исполнение заблокировано, пока equity не с биржи)
+- каждые HEARTBEAT_SEC (5 мин): строка-пульс «heartbeat: tick N, ...» в лог — ее ищет
+  сторож супервизора (scripts/supervise.ps1) в data/oskard.log
 
 Устойчивость (правило v1): серия из consecutive_errors подряд неудачных тиков
 -> safe_mode + уведомление. Считаются сбои ЛОГИКИ и тики, где упали ВСЕ символы;
@@ -40,6 +42,10 @@ EQUITY_RETRY_SEC = 300.0
 DEFAULT_EQUITY_USD = 1000.0
 MAX_RESOLVE_SYMBOLS = 40  # за один проход: висящие исходы дорешиваются порциями
 NET_STREAK_FACTOR = 4  # сетевые сбои: серия в 4 раза длиннее (3 -> 12 тиков = 6 мин при 30с)
+# Пульс потока в лог. Строка тика пишется только при кандидатах: на тихом рынке лог молчал
+# по 25 мин (15.10) — сторож супервизора («лог не обновлялся 15 мин») срабатывал бы ложно.
+# Формат строки — контракт с scripts/supervise.ps1 ($HeartbeatPattern), см. тест.
+HEARTBEAT_SEC = 300.0
 
 
 class ShadowRunner:
@@ -89,6 +95,8 @@ class ShadowRunner:
         self._resolve_at = 0.0
         self._equity_at = -EQUITY_SEC
         self._equity_interval = EQUITY_SEC
+        self._heartbeat_at: float | None = None  # None — первый пульс сразу после старта потока
+        self._candidates_at: float | None = None  # последний тик с кандидатами (часы self._clock)
         self._stop = threading.Event()
 
     # ---------------------------------------------------------------- equity
@@ -248,6 +256,7 @@ class ShadowRunner:
             "errors": len(report.errors),
         }
         if report.candidates:
+            self._candidates_at = now
             logger.info("tick %d: %s", self.ticks, self.last_report)
         for e in report.errors:
             if e not in self._seen_cycle_errors:
@@ -268,12 +277,29 @@ class ShadowRunner:
         self._err_streak = 0
         self._net_streak = 0
 
+    def heartbeat(self) -> bool:
+        """Пульс раз в HEARTBEAT_SEC независимо от кандидатов, cooldown и сбоев цикла:
+        он говорит «поток жив и крутится», а не «рынок интересный». Зовется из цикла
+        потока ПОСЛЕ tick(): застрявший тик = нет пульса = алерт «демон завис» у
+        супервизора. True — строка записана."""
+        now = self._clock()
+        if self._heartbeat_at is not None and now - self._heartbeat_at < HEARTBEAT_SEC:
+            return False
+        self._heartbeat_at = now
+        if self._candidates_at is None:
+            last = "нет с запуска"
+        else:
+            last = f"{(now - self._candidates_at) / 60:.0f} мин назад"
+        logger.info("heartbeat: tick %d, last candidates %s", self.ticks, last)
+        return True
+
     # ---------------------------------------------------------------- thread
 
     def run_forever(self) -> None:
         logger.info("shadow runner started (tick=%.0fs, top=%d)", self._tick_sec, self._top_n)
         while not self._stop.is_set():
             self.tick()
+            self.heartbeat()
             self._stop.wait(self._tick_sec)
 
     def start_thread(self) -> threading.Thread:

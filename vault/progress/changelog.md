@@ -6,6 +6,27 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-10-16 — блок G: супервизор 24/7
+
+oskard и Hermes gateway запускались из сессии Claude и умирали вместе с ней: 15–16.10 — 19 ч простоя, ни одного сообщения в Telegram; 13–14.10 демон замораживал сон ПК (Kernel-Power 42). Теперь их держит отдельный супервизор с автозапуском при входе в Windows.
+- `scripts/supervise.ps1` (Windows PowerShell 5.1): бесконечный цикл надзора за oskard и hermes gateway. Старт с окружением ручного запуска (`PYTHONUTF8`, `NO_PROXY` = пользовательский + loopback/BingX, `HERMES_HOME`), вывод через `cmd /c >> log` (смерть супервизора не рвет stdout демона), без окон. Проверка: жив ли процесс + `GET /status` с `X-Oskar-Token` (5 с, без прокси). Рестарт 10 с -> 5 мин, сброс после 30 мин стабильности.
+- **Второй oskard не стартует**: любой процесс oskard на машине, слушающий порт API или занятый `data/oskard.lock` (тот же байт, что берет демон) = экземпляр есть, супервизор его только наблюдает (подхватывает и запущенный руками). Второй супервизор выходит по mutex. Hermes — так же (второй getUpdates = 409).
+- **Только на торговом ПК**: `scripts/trading_host.txt` (`DESKTOP-RGBK4KM`); на другой машине супервизор ничего не стартует, установка отказывает.
+- Алерты в Telegram (сигнальный бот, фоллбек — основной; маршрут: `HTTPS_PROXY` как у демона -> системный прокси -> напрямую) при падении и восстановлении, не чаще 1 в 10 мин на процесс — события сворачиваются. Токены и пароль прокси не логируются.
+- **Сторож зависания**: `heartbeat` в `data/oskard.log` старше 15 мин -> алерт «oskard завис?», без авто-kill. Для демона на старом коде (без пульса) — временно рост тиков `/status`.
+- **Keep-awake**: пока работает, `SetThreadExecutionState(ES_CONTINUOUS|ES_SYSTEM_REQUIRED)` раз в 5 мин — запрос процесса, настройки питания не тронуты, экран гаснет. Крышку ноутбука это не переживает: 24/7 — на ПК.
+- `-Once` (одна итерация), `-DryRun` (план без запуска и сети). Лог `data/supervisor.log` с ротацией 5 МБ x 3.
+- `scripts/install_autostart.ps1`: задача «OSKAR Supervisor» — при входе пользователя, задержка 1 мин, без лимита времени, перезапуск при сбое (1 мин x 999), один экземпляр, обычный приоритет (по умолчанию Task Scheduler дает «ниже обычного», его унаследовали бы демон и шлюз), скрыто через `conhost --headless` (в Windows 11 `-WindowStyle Hidden` не прячет окно Windows Terminal); `-Uninstall`. Запускает Иван сам.
+- `shadow_runner`: строка `heartbeat: tick N, last candidates M мин назад` раз в 5 мин независимо от кандидатов. Строка тика пишется только при кандидатах — на тихом рынке лог молчал по 25 мин (15.10), сторож срабатывал бы ложно.
+- `scripts/README_supervisor.md`: установка, проверка, остановка, логи, вторая машина.
+
+### Тесты
+- test_runner_heartbeat (4): пульс каждые 5 мин на тихом рынке, «последние кандидаты N мин назад», пульс при cooldown, пульс после тика в цикле потока. test_supervisor_scripts (6): оба .ps1 без ошибок парсера PS 5.1, оба в UTF-8 с BOM, DRY RUN ничего не пишет и не печатает токен/пароль прокси, контракт строки heartbeat с `$HeartbeatPattern`. Итого 469.
+- Смоук на фейках (порт 18321, временный корень, без Telegram): старт обоих, health с токеном, kill -> «упал» -> рестарт через 10 с -> «снова работает», пропавший heartbeat -> «завис?», подхват уже живых, занятый lock блокирует старт, второй супервизор выходит по mutex.
+
+### Затронутые файлы
+CREATE: scripts/{supervise.ps1,install_autostart.ps1,README_supervisor.md,trading_host.txt}, tests/unit/{test_runner_heartbeat,test_supervisor_scripts}.py; MODIFY: src/oskar/core/shadow_runner.py
+
 ## 2026-10-16 — блок H: защита капитала в автомате (R:R по фактической цене, стоп по просадке)
 
 Автомат ставит сделки без нажатия — защита капитала не должна зависеть от того, смотрит ли Иван. Блок закрывает подтвержденные дефекты аудита G1/G5 и пять находок по конституции.
@@ -26,6 +47,7 @@ date: 2026-08-25
 
 ### Затронутые файлы
 CREATE: src/oskar/risk/drawdown.py, src/oskar/core/env_gate.py, tests/unit/test_capital_protection.py; MODIFY: config/invariants.yaml, src/oskar/ops/invariants.py, tests/unit/test_invariants.py, src/oskar/risk/ladder.py, src/oskar/core/{executor,position_monitor,emergency,trading_mode,shadow_runner,telegram_out,telegram_buttons,api,daemon}.py, src/oskar/cli.py, src/oskar/data/client.py, src/oskar/sync/exchange_sync.py, config/settings.yaml (комментарий drawdown_pct), tests/unit/test_settings_drift.py
+
 
 ## 2026-10-16 — режим «автомат / с подтверждением» с переключателем в боте
 
