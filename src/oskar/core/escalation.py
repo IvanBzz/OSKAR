@@ -168,10 +168,17 @@ class Escalator:
         # Финальная лестница остается (ст. 2): мир мог измениться, пока думал Trader
         risk_ctx = self._risk_context()
         entry, sl, tp, entry_type = self._resolve(candidate, decision)
-        verdict = self._check(candidate, conf, entry, sl, tp, risk_ctx)
-        fallback = ""
-        if not verdict.passed:
+        chosen_ids = (decision.entry_option_id, decision.sl_option_id, decision.tp_option_id)
+        # Ревью Codex 2026-10-16 (P2): id проверялись по отдельности, и Trader мог склеить
+        # стоп одной пары с R-тейком другой (short 100 / SL 101.5 / TP от SL 104 -> R:R 5.35):
+        # лестница такую тройку пропускает, хотя перебор ее исключил. Тройка вне допустимых = fallback.
+        if chosen_ids in {c.ids for c in allowed}:
+            verdict = self._check(candidate, conf, entry, sl, tp, risk_ctx)
             failed = next((s.name for s in verdict.steps if not s.passed), "?")
+        else:
+            verdict, failed = None, "not_in_allowed_combos"
+        fallback = ""
+        if verdict is None or not verdict.passed:
             # 2026-10-16: выбор Trader'а не прошел — берем проходную по единому правилу
             # (choose_combo) из того же детерминированного меню; пометка в detail и в плане
             for combo in allowed:

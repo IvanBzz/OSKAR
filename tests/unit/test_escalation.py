@@ -303,3 +303,20 @@ def test_final_ladder_still_rejects_when_world_changed(tmp_path):
     assert res.outcome == "risk_rejected" and res.detail == "final_ladder: max_open_positions"
     n = state.journal.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
     assert n == 0
+
+
+def test_trader_cross_pair_triple_falls_back(tmp_path):
+    """Ревью Codex 2026-10-16 (P2): стоп одной пары + R-тейк другой — id существуют и
+    лестница такую тройку пропускает (R:R ~5.2), но перебор ее исключил -> fallback."""
+    cand = candidate().model_copy(update={
+        "sl_options": [PriceOption(id="s-swing", kind="swing_high", price=101.5),
+                       PriceOption(id="s-b", kind="swing_high", price=102.5)],
+        "tp_options": [PriceOption(id="t-liq", kind="liquidity_pool", price=96.0),
+                       PriceOption(id="t-r1-market-b", kind="r_multiple", price=92.0)],
+    })
+    esc, state = make(tmp_path, lambda c: sv(),
+                      lambda c, v, combos=None: td_ids(sl="s-swing", tp="t-r1-market-b"))
+    res = esc(cand)
+    assert res.outcome == "pending"
+    assert res.detail == "combo_fallback: e-market/s-swing/t-r1-market-b -> e-market/s-swing/t-liq"
+    assert res.prices == (100.0, 101.5, 96.0)

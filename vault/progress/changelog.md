@@ -23,6 +23,8 @@ date: 2026-08-25
 ### Затронутые файлы
 CREATE: src/oskar/risk/combos.py; MODIFY: src/oskar/core/{escalation,cycle,daemon}.py, src/oskar/detect/options.py, src/oskar/risk/sizing.py, src/oskar/agents/{trader,claude_cli}.py, src/oskar/agents/prompts/trader.md, src/oskar/journal/db.py, config/settings.yaml, tests/unit/{test_options,test_core,test_escalation,test_scout_trader,test_claude_cli,test_journal}.py
 
+- **Ревью Codex (через Claudexor), P2**: id выбора Trader'а проверялись по отдельности — он мог склеить стоп одной пары с R-тейком другой (short 100 / SL 101.5 / TP, посчитанный от SL 104: лестница пропускала R:R 5.35, хотя перебор тройку исключил). Теперь тройка вне допустимых = fallback по единому правилу (`not_in_allowed_combos`); тест.
+
 ## 2026-10-16 — блок G: супервизор 24/7
 
 oskard и Hermes gateway запускались из сессии Claude и умирали вместе с ней: 15–16.10 — 19 ч простоя, ни одного сообщения в Telegram; 13–14.10 демон замораживал сон ПК (Kernel-Power 42). Теперь их держит отдельный супервизор с автозапуском при входе в Windows.
