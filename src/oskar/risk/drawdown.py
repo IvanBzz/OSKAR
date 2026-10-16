@@ -116,7 +116,7 @@ class LiveEquity:
     запрос не держит тик, а следующий не плодит потоки, пока висит прежний."""
 
     def __init__(self, fetch_fn, *, timeout_sec: float = EQUITY_FETCH_TIMEOUT_SEC, clock=time.monotonic):
-        self._fetch = fetch_fn  # () -> float | None: snapshot_balance(view)["total"]; None — молчит
+        self._fetch = fetch_fn  # () -> float | None: snapshot_balance(view)["equity"]; None — молчит
         self._timeout = timeout_sec
         self._clock = clock
         self._lock = threading.Lock()

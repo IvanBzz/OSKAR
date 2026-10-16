@@ -56,28 +56,58 @@ class PositionDiff:
         )
 
 
+def _raw_equity(raw: dict, cur: str) -> float | None:
+    """Equity (кошелек + нереализованный PnL) из сырого ответа BingX swap: info.data[].equity.
+
+    2026-10-16, ночь: ccxt кладет в `total` перпа поле maxWithdrawAmount (сколько можно вывести).
+    Лимитка замораживает маржу -> «equity» падало на маржу ордера, и стоп по просадке взвелся
+    ложно (INIT limit: 121.71 -> 101.48, −16.6% без единой сделки). Капитал — поле `equity`."""
+    info = raw.get("info") if isinstance(raw, dict) else None
+    data = info.get("data") if isinstance(info, dict) else None
+    rows = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    for row in rows:
+        bal = row.get("balance") if isinstance(row, dict) and isinstance(row.get("balance"), dict) else row
+        if not isinstance(bal, dict) or bal.get("equity") is None:
+            continue
+        if str(bal.get("asset") or "").upper() == cur:
+            try:
+                return float(bal["equity"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def snapshot_balance(view: ExchangeView) -> dict:
-    """Баланс USDT или VST (демо-валюта BingX VST называется 'VST', не USDT)."""
+    """Баланс USDT или VST (демо-валюта BingX VST называется 'VST', не USDT).
+
+    `equity` — настоящий капитал для риска и стопа по просадке (см. _raw_equity); если биржа его
+    не отдала — `total` (как раньше). `total` ccxt у перпа = доступно к выводу, НЕ капитал."""
     raw = view.balance()
     for cur in ("USDT", "VST"):
         entry = raw.get(cur)
         if isinstance(entry, dict) and entry.get("total") is not None:
+            total = float(entry.get("total") or 0.0)
+            eq = _raw_equity(raw, cur)
             return {
                 "currency": cur,
-                "total": float(entry.get("total") or 0.0),
+                "total": total,
                 "free": float(entry.get("free") or 0.0),
                 "used": float(entry.get("used") or 0.0),
+                "equity": total if eq is None else eq,
             }
     totals = raw.get("total") or {}
     for cur in ("USDT", "VST"):
         if totals.get(cur) is not None:
+            total = float(totals.get(cur) or 0.0)
+            eq = _raw_equity(raw, cur)
             return {
                 "currency": cur,
-                "total": float(totals.get(cur) or 0.0),
+                "total": total,
                 "free": float((raw.get("free") or {}).get(cur) or 0.0),
                 "used": float((raw.get("used") or {}).get(cur) or 0.0),
+                "equity": total if eq is None else eq,
             }
-    return {"currency": "USDT", "total": 0.0, "free": 0.0, "used": 0.0}
+    return {"currency": "USDT", "total": 0.0, "free": 0.0, "used": 0.0, "equity": 0.0}
 
 
 def exchange_position_qty(pos: dict[str, Any]) -> float:

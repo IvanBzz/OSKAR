@@ -40,7 +40,7 @@ def journal_with_open(tmp_path: Path, rows):
 
 def test_balance_snapshot():
     b = snapshot_balance(FakeView())
-    assert b == {"currency": "USDT", "total": 100.0, "free": 80.0, "used": 20.0}
+    assert b == {"currency": "USDT", "total": 100.0, "free": 80.0, "used": 20.0, "equity": 100.0}
 
 
 def test_balance_snapshot_vst_demo():
@@ -48,6 +48,24 @@ def test_balance_snapshot_vst_demo():
     view = FakeView(bal={"VST": {"total": 121.71, "free": 121.71, "used": 0.0}})
     b = snapshot_balance(view)
     assert b["currency"] == "VST" and b["total"] == 121.71
+
+
+def test_equity_from_raw_not_withdrawable_total():
+    """2026-10-16: лимитка заморозила 20.2 VST маржи -> ccxt total (maxWithdrawAmount) 101.48,
+    а капитал (info.data[].equity) 121.71. Стоп по просадке обязан видеть капитал."""
+    raw = {
+        "VST": {"total": 101.4836, "free": 101.4836, "used": 0.0},
+        "info": {"code": 0, "data": [{"asset": "VST", "balance": "121.7093", "equity": "121.7093",
+                                      "unrealizedProfit": "0", "availableMargin": "101.4836",
+                                      "usedMargin": "0", "freezedMargin": "20.2257"}]},
+    }
+    b = snapshot_balance(FakeView(bal=raw))
+    assert b["equity"] == 121.7093 and b["total"] == 101.4836
+
+
+def test_equity_falls_back_to_total_without_raw():
+    b = snapshot_balance(FakeView(bal={"VST": {"total": 50.0, "free": 50.0, "used": 0.0}}))
+    assert b["equity"] == 50.0
 
 
 def test_contract_size_multiplication():

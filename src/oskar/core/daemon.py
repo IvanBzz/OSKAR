@@ -371,7 +371,7 @@ def _make_equity_fn(settings):
 
     def equity() -> float | None:
         try:
-            return snapshot_balance(view)["total"]
+            return snapshot_balance(view)["equity"]  # капитал, не «доступно к выводу» (2026-10-16)
         except Exception:  # noqa: BLE001 - сеть/биржа: остаемся на прежнем значении
             return None
 

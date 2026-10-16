@@ -317,7 +317,8 @@ def _cmd_sync(args) -> int:
 
     if args.sync_command == "balance":
         b = snapshot_balance(view)
-        print(f"{b['currency']} total={b['total']:.2f} free={b['free']:.2f} used={b['used']:.2f}")
+        print(f"{b['currency']} equity={b['equity']:.2f} total={b['total']:.2f} "
+              f"free={b['free']:.2f} used={b['used']:.2f}")
         return 0
     if args.sync_command == "positions":
         positions = view.positions()
