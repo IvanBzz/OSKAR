@@ -75,11 +75,39 @@ header{display:flex;flex-direction:column;gap:14px}
 .gate b{font-family:var(--mono)}
 
 /* architecture */
-.arch{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:16px;overflow-x:auto}
-.arch pre.mermaid{margin:0;min-width:760px;background:transparent}
 .legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:12.5px;color:var(--muted)}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .sw{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid var(--rule)}
+
+
+/* architecture (layered) */
+.arch2{display:flex;flex-direction:column;gap:6px}
+.xband{background:var(--accent-soft);border-radius:10px;padding:14px 18px;display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center}
+.xband b{font-size:17px}
+.xband .flowtag{font-family:var(--mono);font-size:12.5px;color:var(--muted)}
+.xband .flowtag i{font-style:normal;color:var(--accent);font-weight:600}
+.lane{display:grid;grid-template-columns:132px minmax(0,1fr);gap:14px;align-items:center;padding:12px 0}
+.lane+.lane{border-top:1px dashed var(--rule)}
+.lane-label{display:flex;flex-direction:column;gap:2px}
+.lane-label b{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}
+.lane-label span{font-size:12px;color:var(--faint)}
+.flow{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px}
+.node{--c:var(--none);flex:1 1 170px;min-width:0;background:var(--panel);border:1px solid var(--rule);border-left:5px solid var(--c);border-radius:8px;padding:11px 14px;display:flex;flex-direction:column;gap:4px}
+.node b{font-size:15.5px;line-height:1.25}
+.node span{font-size:13px;color:var(--muted);line-height:1.35}
+.node em{font-style:normal;font-family:var(--mono);font-size:11px;color:var(--c);font-weight:600;letter-spacing:.03em}
+.node.ok{--c:var(--ok)} .node.warn{--c:var(--warn)} .node.wip{--c:var(--wip)} .node.risk{--c:var(--risk)}
+.node.none{--c:var(--none);border-style:dashed;border-left-style:solid;background:transparent}
+.arw{flex:none;align-self:center;color:var(--faint);font-size:20px;line-height:1}
+.handoff{font-family:var(--mono);font-size:12px;color:var(--faint);padding-left:146px}
+.handoff::before{content:"↓ ";color:var(--accent)}
+.archbox{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:8px 18px 14px}
+@media (max-width:700px){
+  .lane{grid-template-columns:1fr;gap:8px}
+  .handoff{padding-left:0}
+  .node{flex-basis:100%}
+  .arw{transform:rotate(90deg);margin-inline:auto}
+}
 
 /* blocks */
 .layer{display:flex;flex-direction:column;gap:10px}
@@ -189,60 +217,39 @@ footer{font-size:12px;color:var(--faint);font-family:var(--mono)}
 </section>
 
 <section aria-labelledby="h-arch">
-  <div class="sec-head"><h2 id="h-arch">Архитектура</h2><span class="label">один процесс oskard + шлюзы</span></div>
-  <div class="arch">
-<pre class="mermaid">
-flowchart LR
-  subgraph EXCH["BingX VST"]
-    BX[("REST · ccxt")]
-  end
-  subgraph OSK["oskard · 127.0.0.1:8321"]
-    direction LR
-    SCAN["Сканер<br/>555 пар → топ-20"] --> SMC["SMC-детекторы<br/>FVG · OB · BOS · свипы"]
-    SMC --> MENU["Меню опций<br/>тройки вход/SL/TP"]
-    MENU --> L1["Риск-лестница<br/>15 шагов"]
-    L1 --> SCOUT["Scout<br/>claude -p"]
-    SCOUT --> TRADER["Trader<br/>вето + выбор"]
-    TRADER --> L2["Финальная лестница"]
-    L2 --> MODE{"Режим<br/>авто / подтвержд."}
-    MODE -- авто --> EXE["Исполнитель<br/>вход + SL/TP"]
-    MODE -- подтвержд. --> CARD["Карточка<br/>с кнопками"]
-    CARD -- кнопка --> EXE
-    EXE --> MON["Монитор позиций<br/>5 с / 60 с"]
-    MON --> REC["Сверка<br/>по филлам"]
-    GUARD["Защита капитала<br/>просадка · гейт реала"] -.-> EXE
-    JR[("Журнал SQLite<br/>решения · сделки · CF")]
-  end
-  BX --> SCAN
-  EXE --> BX
-  MON <--> BX
-  REC <--> BX
-  SIG["Signals-бот<br/>/mode /status /panic"] <--> CARD
-  HER["Hermes gateway<br/>основной бот"] --> OSK
-  SUP["Супервизор 24/7"] -.-> OSK
-  SUP -.-> HER
-  SENT["Sentinel"] -.-> SCOUT
-  AN["Analyst"] -.-> JR
-  VAULT["Obsidian vault"]
-  classDef ok fill:#d9efe2,stroke:#2e8a57,color:#14261c
-  classDef warn fill:#f6ebcc,stroke:#b98309,color:#2b2108
-  classDef wip fill:#dce7fb,stroke:#2c66c9,color:#0f1d38
-  classDef none fill:#eceae5,stroke:#9aa1a9,color:#3a4048,stroke-dasharray:4 3
-  classDef risk fill:#f8dcd5,stroke:#c0432f,color:#3a130d
-  class BX,SCAN,JR,L1 ok
-  class SMC,SCOUT,MODE,CARD,MON,REC,SIG,VAULT warn
-  class MENU,TRADER wip
-  class L2,EXE,GUARD,SUP warn
-  class HER risk
-  class SENT,AN none
-</pre>
+  <div class="sec-head"><h2 id="h-arch">Архитектура</h2><span class="label">слои одного процесса oskard</span></div>
+  <div class="arch2">
+    <div class="xband"><b>BingX VST</b><span class="flowtag">единственная правда (ст. 1)</span>
+      <span class="flowtag"><i>↓</i> свечи → сканер</span><span class="flowtag"><i>↑</i> вход + SL/TP ← исполнитель</span><span class="flowtag"><i>↕</i> позиции и филлы ↔ монитор, сверка</span></div>
+    <div class="archbox">
+    <div class="lane"><div class="lane-label"><b>Сигнал</b><span>каждые 30 с</span></div><div class="flow">
+      <div class="node ok"><em>работает</em><b>Сканер</b><span>555 пар → топ-20 по ликвидности</span></div><span class="arw" aria-hidden="true">→</span><div class="node warn"><em>не проверено вживую</em><b>SMC-детекторы</b><span>FVG · OB · BOS/CHoCH · свипы, без look-ahead</span></div><span class="arw" aria-hidden="true">→</span><div class="node wip"><em>ветка F</em><b>Меню опций</b><span>тройки вход / SL / TP, net-R тейки</span></div><span class="arw" aria-hidden="true">→</span><div class="node ok"><em>работает</em><b>Риск-лестница</b><span>15 шагов: стоп, R:R с комиссиями, confluence, риск 1%</span></div>
+    </div></div>
+    <div class="handoff">прошел лестницу → эскалация к LLM</div>
+    <div class="lane"><div class="lane-label"><b>Решение</b><span>claude -p, ~50 с</span></div><div class="flow">
+      <div class="node warn"><em>не проверено вживую</em><b>Scout</b><span>take / pass по структуре; 84% pass — не видит событий</span></div><span class="arw" aria-hidden="true">→</span><div class="node wip"><em>ветка F</em><b>Trader</b><span>вето + выбор одной из проходящих троек</span></div><span class="arw" aria-hidden="true">→</span><div class="node warn"><em>не проверено вживую</em><b>Финальная лестница</b><span>мир мог измениться, пока думал Trader</span></div><span class="arw" aria-hidden="true">→</span><div class="node warn"><em>не проверено вживую</em><b>Режим</b><span>авто → сразу в исполнение; подтверждение → карточка</span></div>
+    </div></div>
+    <div class="handoff">план исполнения</div>
+    <div class="lane"><div class="lane-label"><b>Исполнение</b><span>VST</span></div><div class="flow">
+      <div class="node warn"><em>не проверено вживую</em><b>Исполнитель</b><span>R:R и стоп по фактической цене, SL/TP прикреплены ко входу</span></div><span class="arw" aria-hidden="true">→</span><div class="node warn"><em>не проверено вживую</em><b>Монитор позиций</b><span>5 с pending · 60 с полный тик · duration-stop 3 ч</span></div><span class="arw" aria-hidden="true">→</span><div class="node warn"><em>не проверено вживую</em><b>Сверка по филлам</b><span>P&L, комиссии, reconciled=1</span></div>
+    </div></div>
+    <div class="lane"><div class="lane-label"><b>Контроль</b><span>над всеми слоями</span></div><div class="flow">
+      <div class="node warn"><em>не проверено вживую</em><b>Защита капитала</b><span>стоп по просадке 10% (пик 121.71) · гейт реала · SAFE MODE</span></div><div class="node warn"><em>не проверено вживую</em><b>Emergency stop</b><span>/panic из бота, CLI, API</span></div><div class="node risk"><em>частично</em><b>Инварианты ст. 5</b><span>INV-004/005 объявлены; демон их пока не гоняет</span></div><div class="node warn"><em>не проверено вживую</em><b>Супервизор 24/7</b><span>рестарт, запрет сна, heartbeat — ждет установки</span></div>
+    </div></div>
+    <div class="lane"><div class="lane-label"><b>Каналы и память</b><span>Иван ↔ система</span></div><div class="flow">
+      <div class="node warn"><em>не проверено вживую</em><b>Signals-бот</b><span>карточки, кнопки, /mode /status /panic</span></div><div class="node risk"><em>сломано</em><b>Hermes gateway</b><span>основной бот; нет LLM с 11.10 (auth Nous)</span></div><div class="node ok"><em>работает</em><b>Журнал SQLite</b><span>решения, сделки, counterfactuals, LLM-вызовы</span></div><div class="node ok"><em>работает</em><b>Obsidian vault</b><span>changelog, задачи, библиотека SMC</span></div>
+    </div></div>
+    <div class="lane"><div class="lane-label"><b>Дальше</b><span>фазы 3–5</span></div><div class="flow">
+      <div class="node none"><em>план</em><b>Календарь событий</b><span>сессии, FOMC, CPI — режим рынка</span></div><div class="node none"><em>план</em><b>Pulsar</b><span>соцсети и новости, наблюдатель</span></div><div class="node none"><em>план</em><b>Analyst + критик</b><span>уроки по когортам, без вето</span></div><div class="node none"><em>план</em><b>Самоэволюция</b><span>Ouroboros · после гейта реала</span></div>
+    </div></div>
+    </div>
   </div>
   <div class="legend">
     <span><i class="sw" style="background:var(--ok-soft);border-color:var(--ok)"></i>работает, подтверждено вживую</span>
     <span><i class="sw" style="background:var(--warn-soft);border-color:var(--warn)"></i>код есть, вживую не проверено</span>
     <span><i class="sw" style="background:var(--wip-soft);border-color:var(--wip)"></i>готово в ветке F, ждет зеленого R1</span>
     <span><i class="sw" style="background:var(--risk-soft);border-color:var(--risk)"></i>сломано / требует Ивана</span>
-    <span><i class="sw" style="background:var(--none-soft);border-color:var(--none)"></i>не начато</span>
+    <span><i class="sw" style="background:transparent;border:1px dashed var(--none)"></i>план</span>
   </div>
 </section>
 
