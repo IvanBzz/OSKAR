@@ -11,7 +11,7 @@ from pathlib import Path
 
 from oskar.agents.budget import BudgetLimits, CallBudget, check_budget
 from oskar.agents.claude_cli import AgentCallResult, call_claude, extract_json_block
-from oskar.contracts.schemas import SetupCandidate, SetupVerdict, TradeDecision
+from oskar.contracts.schemas import PROMPT_EXCLUDE, SetupCandidate, SetupVerdict, TradeDecision
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -50,7 +50,8 @@ def _combos_block(combos) -> str:
 def build_prompt(candidate: SetupCandidate, scout_verdict: SetupVerdict, combos=None) -> str:
     return (
         _template()
-        .replace("{candidate_json}", candidate.model_dump_json(indent=2))
+        # блок J: тень свечей в промпт не идет — промпт тот же, что без нее
+        .replace("{candidate_json}", candidate.model_dump_json(indent=2, exclude=PROMPT_EXCLUDE))
         .replace("{scout_verdict}", scout_verdict.model_dump_json(indent=2))
         .replace("{entry_options}", _options_line(candidate.entry_options))
         .replace("{sl_options}", _options_line(candidate.sl_options))

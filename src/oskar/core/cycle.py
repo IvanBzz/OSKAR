@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 from oskar.core.state import RuntimeState
 from oskar.data.candles import CandleCache
+from oskar.detect.candles import shadow_or_none
 from oskar.detect.indicators import IndicatorSet, compute, multi_tf_trend
 from oskar.detect.options import build_candidate
 from oskar.detect.score import score_opportunity
@@ -127,8 +128,10 @@ class ShadowCycle:
                 return
 
         per_tf: dict[str, IndicatorSet] = {cfg.signal_timeframe: compute(df)}
+        frames = {cfg.signal_timeframe: df}  # свечи для тени паттернов (блок J)
         for tf in cfg.context_timeframes:
-            per_tf[tf] = compute(self._cache.get(symbol, tf, 260))
+            frames[tf] = self._cache.get(symbol, tf, 260)
+            per_tf[tf] = compute(frames[tf])
         mtf = multi_tf_trend(per_tf)
         ind = per_tf[cfg.signal_timeframe]
 
@@ -139,8 +142,12 @@ class ShadowCycle:
         if opp.score < cfg.min_score:
             return
 
+        # Блок J (2026-10-16): тень свечных паттернов по последним закрытым свечам уже
+        # загруженных ТФ (новых запросов нет). Только журнал: candle_pattern пуст, гейт и
+        # промпты ее не видят; сбой детектора -> None, символ из цикла не выпадает.
         candidate = build_candidate(
-            symbol, cfg.signal_timeframe, snapshot, ind, opp, mtf, bar_ts=bar_ts
+            symbol, cfg.signal_timeframe, snapshot, ind, opp, mtf, bar_ts=bar_ts,
+            candle_shadow=shadow_or_none(frames),
         )
         if candidate is None:
             return

@@ -40,7 +40,7 @@ def test_candidate_roundtrip():
     c = make_candidate()
     restored = SetupCandidate.model_validate_json(c.model_dump_json())
     assert restored == c
-    assert restored.schema_version == 1
+    assert restored.schema_version == 2  # v2: features.candle_patterns_shadow (блок J)
 
 
 def test_confidence_cap_enforced_at_schema_level():

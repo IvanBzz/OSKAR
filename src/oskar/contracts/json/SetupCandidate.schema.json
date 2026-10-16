@@ -1,5 +1,105 @@
 {
   "$defs": {
+    "CandleFrame": {
+      "additionalProperties": false,
+      "description": "Разметка последней закрытой свечи одного ТФ (detect/candles.py).",
+      "properties": {
+        "at_extreme": {
+          "anyOf": [
+            {
+              "enum": [
+                "low",
+                "high",
+                "both"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "At Extreme"
+        },
+        "bar_ts": {
+          "title": "Bar Ts",
+          "type": "integer"
+        },
+        "patterns": {
+          "items": {
+            "enum": [
+              "doji",
+              "dragonfly_doji",
+              "gravestone_doji",
+              "pin_bar_bull",
+              "pin_bar_bear",
+              "engulfing_bull",
+              "engulfing_bear",
+              "inside_bar",
+              "harami_bull",
+              "harami_bear",
+              "morning_star",
+              "evening_star",
+              "marubozu_bull",
+              "marubozu_bear"
+            ],
+            "type": "string"
+          },
+          "title": "Patterns",
+          "type": "array"
+        },
+        "prior_move_atr": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prior Move Atr"
+        }
+      },
+      "required": [
+        "bar_ts"
+      ],
+      "title": "CandleFrame",
+      "type": "object"
+    },
+    "CandleShadow": {
+      "additionalProperties": false,
+      "description": "Теневая разметка свечных паттернов (блок J, 2026-10-16) — В РЕШЕНИЯ НЕ ИДЕТ.\n\nГейт лестницы смотрит только candle_pattern (детектор его не заполняет), промпты\nScout/Trader это поле исключают (PROMPT_EXCLUDE). Зачем: замер 16.10 — доджи у\nэкстремума без контекста не лучше случайной свечи; сначала когорты «с паттерном /\nбез» по журналу, решение о гейте — отдельным коммитом с инвариантом (ст. 5).",
+      "properties": {
+        "detector": {
+          "title": "Detector",
+          "type": "string"
+        },
+        "frames": {
+          "additionalProperties": {
+            "$ref": "#/$defs/CandleFrame"
+          },
+          "propertyNames": {
+            "enum": [
+              "1m",
+              "5m",
+              "15m",
+              "1h",
+              "4h",
+              "1d"
+            ]
+          },
+          "title": "Frames",
+          "type": "object"
+        }
+      },
+      "required": [
+        "detector",
+        "frames"
+      ],
+      "title": "CandleShadow",
+      "type": "object"
+    },
     "FvgInfo": {
       "additionalProperties": false,
       "properties": {
@@ -132,6 +232,17 @@
           "default": null,
           "title": "Candle Pattern"
         },
+        "candle_patterns_shadow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CandleShadow"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "fvg": {
           "anyOf": [
             {
@@ -201,7 +312,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "Кандидат сетапа от детерминированного ядра. Вход Scout'а.",
+  "description": "Кандидат сетапа от детерминированного ядра. Вход Scout'а.\n\nv2 (блок J, 2026-10-16): features.candle_patterns_shadow — теневая разметка свечей.",
   "properties": {
     "detector_versions": {
       "additionalProperties": {
@@ -234,8 +345,8 @@
       "type": "string"
     },
     "schema_version": {
-      "const": 1,
-      "default": 1,
+      "const": 2,
+      "default": 2,
       "title": "Schema Version",
       "type": "integer"
     },

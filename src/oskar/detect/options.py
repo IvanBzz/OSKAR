@@ -10,6 +10,7 @@ Id кандидата детерминирован (symbol-bar-direction) — р
 from datetime import UTC, datetime
 
 from oskar.contracts.schemas import (
+    CandleShadow,
     FvgInfo,
     ObInfo,
     PriceOption,
@@ -47,8 +48,12 @@ def build_candidate(
     opp: Opportunity,
     mtf_trend: str,
     bar_ts: int | None = None,  # ms открытия последней закрытой свечи — ключ id
+    candle_shadow: CandleShadow | None = None,  # блок J: тень свечей, в решения не идет
 ) -> SetupCandidate | None:
-    """None, если структур не хватает на осмысленное меню (нет SL-якоря)."""
+    """None, если структур не хватает на осмысленное меню (нет SL-якоря).
+
+    candle_shadow пишется в features.candle_patterns_shadow как есть; candle_pattern
+    (голос confluence-гейта) остается None — паттерны в тени до валидации (блок J)."""
     price = ind.close
     atr = ind.atr
     direction = opp.direction
@@ -156,6 +161,7 @@ def build_candidate(
         fvg=_fvg_info(fvg, timeframe),
         ob=_ob_info(ob, timeframe),
         swept_liquidity=swept,
+        candle_patterns_shadow=candle_shadow,
     )
 
     setup_type = _setup_type(fvg, ob, swept)

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from oskar.agents.budget import BudgetLimits, CallBudget, check_budget
 from oskar.agents.claude_cli import AgentCallResult, call_claude, extract_json_block
-from oskar.contracts.schemas import SetupCandidate, SetupVerdict
+from oskar.contracts.schemas import PROMPT_EXCLUDE, SetupCandidate, SetupVerdict
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 NEUTRAL_CONTEXT = "regime: neutral (Sentinel не запущен — торгуй по структуре, без макро-ставок)"
@@ -37,7 +37,8 @@ def build_prompt(
 ) -> str:
     return (
         _template()
-        .replace("{candidate_json}", candidate.model_dump_json(indent=2))
+        # блок J: тень свечей в промпт не идет — промпт тот же, что без нее
+        .replace("{candidate_json}", candidate.model_dump_json(indent=2, exclude=PROMPT_EXCLUDE))
         .replace("{market_context}", market_context or NEUTRAL_CONTEXT)
         .replace("{knowledge}", knowledge or "(библиотека недоступна)")
     )

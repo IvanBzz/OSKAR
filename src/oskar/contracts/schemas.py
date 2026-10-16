@@ -53,6 +53,41 @@ class ObInfo(_Contract):
     timeframe: Timeframe
 
 
+# Блок J (2026-10-16): фиксированное меню имен свечных паттернов. Новый паттерн =
+# изменение схемы (ст. 2 п. 4). Порядок = порядок вывода детектора detect/candles.py.
+CandlePattern = Literal[
+    "doji", "dragonfly_doji", "gravestone_doji",
+    "pin_bar_bull", "pin_bar_bear",
+    "engulfing_bull", "engulfing_bear",
+    "inside_bar", "harami_bull", "harami_bear",
+    "morning_star", "evening_star",
+    "marubozu_bull", "marubozu_bear",
+]
+
+
+class CandleFrame(_Contract):
+    """Разметка последней закрытой свечи одного ТФ (detect/candles.py)."""
+
+    bar_ts: int  # ms открытия размеченной свечи — сверка с реплеем (нет look-ahead)
+    patterns: list[CandlePattern] = Field(default_factory=list)
+    # последние 3 свечи касаются минимума/максимума 20 свечей; None — нет (или мало истории)
+    at_extreme: Literal["low", "high", "both"] | None = None
+    # движение к свече: close[i-1] - close[i-11] в ATR(14) до свечи; знак = направление
+    prior_move_atr: float | None = None
+
+
+class CandleShadow(_Contract):
+    """Теневая разметка свечных паттернов (блок J, 2026-10-16) — В РЕШЕНИЯ НЕ ИДЕТ.
+
+    Гейт лестницы смотрит только candle_pattern (детектор его не заполняет), промпты
+    Scout/Trader это поле исключают (PROMPT_EXCLUDE). Зачем: замер 16.10 — доджи у
+    экстремума без контекста не лучше случайной свечи; сначала когорты «с паттерном /
+    без» по журналу, решение о гейте — отдельным коммитом с инвариантом (ст. 5)."""
+
+    detector: str  # версия детектора, напр. "candles-1"
+    frames: dict[Timeframe, CandleFrame]  # сигнальный ТФ первым, затем контекстные
+
+
 class SetupFeatures(_Contract):
     rsi: float | None = None
     atr_pct: float | None = None
@@ -60,13 +95,21 @@ class SetupFeatures(_Contract):
     fvg: FvgInfo | None = None
     ob: ObInfo | None = None
     swept_liquidity: bool | None = None
-    candle_pattern: str | None = None
+    candle_pattern: str | None = None  # голос confluence-гейта; блок J его НЕ заполняет
+    candle_patterns_shadow: CandleShadow | None = None  # v2 (блок J): тень, только журнал
+
+
+# Поля кандидата, которые НЕ попадают в промпты агентов: тень паттернов не имеет права
+# влиять на решения до валидации (блок J, 2026-10-16). Промпт = кандидат v1 + версия схемы.
+PROMPT_EXCLUDE = {"features": {"candle_patterns_shadow"}}
 
 
 class SetupCandidate(_Contract):
-    """Кандидат сетапа от детерминированного ядра. Вход Scout'а."""
+    """Кандидат сетапа от детерминированного ядра. Вход Scout'а.
 
-    schema_version: Literal[1] = 1
+    v2 (блок J, 2026-10-16): features.candle_patterns_shadow — теневая разметка свечей."""
+
+    schema_version: Literal[2] = 2
     id: str
     ts: datetime
     symbol: str  # канонический ccxt: "SOL/USDT:USDT"

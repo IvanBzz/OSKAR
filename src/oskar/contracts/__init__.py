@@ -6,6 +6,9 @@ bump версии + ревью-коммит (CONSTITUTION.md ст. 2 п. 4).
 """
 
 from oskar.contracts.schemas import (
+    PROMPT_EXCLUDE,
+    CandleFrame,
+    CandleShadow,
     ExecutionPlan,
     ExecutionReport,
     Fill,
@@ -27,6 +30,9 @@ from oskar.contracts.versions import CONTRACT_VERSIONS
 
 __all__ = [
     "CONTRACT_VERSIONS",
+    "PROMPT_EXCLUDE",
+    "CandleFrame",
+    "CandleShadow",
     "ExecutionPlan",
     "ExecutionReport",
     "Fill",
