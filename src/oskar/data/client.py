@@ -181,6 +181,12 @@ class MarketDataClient:
         self._prune_errors(self._clock())
         return len(self._symbol_errors)
 
+    def is_blacklisted(self, symbol: str) -> bool:
+        """Символ в черном списке (приговор не истек): fetch откажет без сети.
+        Кеш свечей сверяется с этим, чтобы не отдавать окно мертвого символа (блок K)."""
+        until = self.dead_symbols.get(canonical(symbol))
+        return until is not None and until > self._clock()
+
     def health(self) -> dict:
         """Срез для /status: видно, почему вотчлист пуст или данные стоят.
         Только чтение: вызывается из потока API параллельно сканеру."""

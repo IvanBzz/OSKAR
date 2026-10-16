@@ -155,9 +155,14 @@ class ShadowRunner:
         return float(fn()) if callable(fn) else 0.0
 
     def data_health(self) -> dict:
-        """Срез клиента данных для /status (пустой, если клиент его не ведет)."""
+        """Срез клиента данных для /status (пустой, если клиент его не ведет) + счетчики
+        кеша свечей: запросы к бирже / попадания (блок K, 2026-10-16)."""
         fn = getattr(self._client, "health", None)
-        return dict(fn()) if callable(fn) else {}
+        out = dict(fn()) if callable(fn) else {}
+        stats = getattr(self._cache, "stats", None)
+        if callable(stats):
+            out["candle_cache"] = stats()
+        return out
 
     def _refresh_watchlist(self, now: float) -> None:
         universe = self._client.universe()

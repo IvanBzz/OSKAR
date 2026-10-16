@@ -132,21 +132,24 @@ def test_universe_filters_and_caches():
     assert ex.markets_calls == 2
 
 
-def test_candle_cache_ttl():
-    t = [0.0]
-    ex = FakeExchange(make_raw(301))
-    cache = CandleCache(make_client(ex), clock=lambda: t[0])
+def test_candle_cache_refreshes_after_bar_close():
+    """Блок K (2026-10-16): TTL заменен закрытием бара — подробно в test_candle_cache.py."""
+    raw = make_raw(301)
+    forming_open = raw[-1][0] / 1000  # последняя сырая свеча — формирующаяся
+    t = [forming_open + 60.0]
+    ex = FakeExchange(raw)
+    cache = CandleCache(make_client(ex), clock=lambda: t[0], wall=lambda: t[0])
 
     cache.get("SOL/USDT:USDT", "15m", 100)
     cache.get("SOL-USDT", "15m", 100)  # тот же символ в другом формате — кеш-хит
     assert ex.ohlcv_calls == 1
 
-    t[0] = 29.0
-    cache.get("SOL/USDT:USDT", "15m", 100)  # TTL 15m = 30с — еще хит
+    t[0] = forming_open + 900 + 2.0  # бар закрылся, люфт 3 с не истек — еще хит
+    cache.get("SOL/USDT:USDT", "15m", 100)
     assert ex.ohlcv_calls == 1
 
-    t[0] = 31.0
-    cache.get("SOL/USDT:USDT", "15m", 100)  # протух — перезапрос
+    t[0] = forming_open + 900 + 3.0
+    cache.get("SOL/USDT:USDT", "15m", 100)  # закрылся новый бар — перезапрос
     assert ex.ohlcv_calls == 2
 
 
