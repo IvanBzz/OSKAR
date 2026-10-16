@@ -42,6 +42,7 @@ ERROR_BUDGET = 6  # наш потолок — заметно ниже бирже
 DEFAULT_COOLDOWN_SEC = 900.0  # если retry-after из ответа не распарсился
 RATE_LIMIT_COOLDOWN_SEC = 60.0
 COOLDOWN_MARGIN_SEC = 5.0
+CLOCK_SYNC_MAX_RTT_SEC = 2.0  # замер смещения часов с ответом дольше — брак (ошибка до RTT/2)
 
 COOLDOWN_CODES = frozenset({"109429"})
 TRANSIENT_CODES = frozenset({"100410"})
@@ -186,6 +187,25 @@ class MarketDataClient:
         Кеш свечей сверяется с этим, чтобы не отдавать окно мертвого символа (блок K)."""
         until = self.dead_symbols.get(canonical(symbol))
         return until is not None and until > self._clock()
+
+    def server_time_offset(self) -> float | None:
+        """Часы биржи минус наши wall, сек (+ — биржа впереди): один запрос server time,
+        середина интервала запроса. Не kline-эндпоинт: черный список и бюджет ошибок не
+        трогает, в cooldown не ходит. None — эндпоинта нет, сбой или ответ дольше
+        CLOCK_SYNC_MAX_RTT_SEC. Кеш свечей считает по нему границы баров: отстающие часы
+        Windows задерживали каждое обновление незаметно (ревью блока K, 2026-10-16)."""
+        fn = getattr(self._ex, "fetch_time", None)
+        if not callable(fn) or self.cooldown_remaining() > 0:
+            return None
+        t0 = self._wall()
+        try:
+            server_ms = fn()
+        except Exception:  # noqa: BLE001 - замер необязательный: живем на прошлом смещении
+            return None
+        t1 = self._wall()
+        if server_ms is None or not 0.0 <= t1 - t0 <= CLOCK_SYNC_MAX_RTT_SEC:
+            return None
+        return float(server_ms) / 1000.0 - (t0 + t1) / 2.0
 
     def health(self) -> dict:
         """Срез для /status: видно, почему вотчлист пуст или данные стоят.

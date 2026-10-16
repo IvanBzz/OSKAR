@@ -13,6 +13,11 @@ import pandas_ta as ta
 TF_WEIGHTS = {"15m": 1.0, "1h": 2.0, "4h": 3.5, "1d": 5.0}
 
 
+class InsufficientHistory(ValueError):
+    """Истории меньше минимума — свойство символа (молодой листинг), а не битые данные:
+    кеш свечей запись не сбрасывает (data.candles.drop_on_data_error, ревью блока K 2026-10-16)."""
+
+
 @dataclass(frozen=True)
 class IndicatorSet:
     rsi: float
@@ -30,7 +35,7 @@ class IndicatorSet:
 def compute(df: pd.DataFrame) -> IndicatorSet:
     """Индикаторы по одному ТФ. Минимум ~60 закрытых свечей."""
     if len(df) < 60:
-        raise ValueError(f"need >=60 closed candles, got {len(df)}")
+        raise InsufficientHistory(f"need >=60 closed candles, got {len(df)}")
     close = df["close"]
 
     rsi = ta.rsi(close, length=14)

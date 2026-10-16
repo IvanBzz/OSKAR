@@ -168,3 +168,43 @@ def test_cache_smaller_limit_served_from_cache():
     cache.get("SOL/USDT:USDT", "15m", 300)
     small = cache.get("SOL/USDT:USDT", "15m", 100)
     assert len(small) == 100 and ex.ohlcv_calls == 1
+
+
+def test_server_time_offset_measured_once_and_safely():
+    """Ревью блока K, P2-3б: смещение часов к бирже — по server time, середина запроса.
+    Сбой, долгий ответ (> CLOCK_SYNC_MAX_RTT_SEC), cooldown или нет эндпоинта — None,
+    без приговора символам и без расхода бюджета ошибок."""
+    from oskar.data.client import CLOCK_SYNC_MAX_RTT_SEC
+
+    w = [1_700_000_000.0]
+    calls = []
+
+    def fetch_time():
+        calls.append(w[0])
+        w[0] += 0.4  # запрос шел 0.4 с; биржа ответила на середине — впереди на 2.5 с
+        return int((w[0] - 0.2 + 2.5) * 1000)
+
+    ex = FakeExchange()
+    ex.fetch_time = fetch_time
+    client = MarketDataClient(ex, clock=lambda: w[0], wall=lambda: w[0], sleep=lambda s: None)
+    assert client.server_time_offset() == pytest.approx(2.5, abs=1e-3)
+
+    def slow():
+        w[0] += CLOCK_SYNC_MAX_RTT_SEC + 0.1
+        return int(w[0] * 1000)
+
+    ex.fetch_time = slow
+    assert client.server_time_offset() is None  # ошибка замера до RTT/2 — брак
+
+    def down():
+        raise ConnectionError("reset")
+
+    ex.fetch_time = down
+    assert client.server_time_offset() is None
+    assert client.dead_symbols == {} and client.errors_in_window() == 0
+
+    ex.fetch_time = fetch_time
+    client._enter_cooldown(w[0] + 60, "exchange ban 109429")
+    n = len(calls)
+    assert client.server_time_offset() is None and len(calls) == n  # в cooldown не ходим
+    assert MarketDataClient(FakeExchange(), sleep=lambda s: None).server_time_offset() is None

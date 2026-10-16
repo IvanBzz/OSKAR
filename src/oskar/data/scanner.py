@@ -15,6 +15,7 @@ ExchangeCooldown — kline-эндпоинт на паузе (бан 109429 / б�
 from collections import Counter
 from dataclasses import dataclass, field
 
+from oskar.data.candles import drop_on_data_error
 from oskar.data.client import ExchangeCooldown
 from oskar.detect.indicators import compute, tf_trend
 
@@ -91,7 +92,9 @@ def quick_score_one(
             summary.illiquid += 1
         return None
     try:
-        ind = compute(df)
+        # битое окно — запись кеша долой (1h общий с циклом); мало истории — остается
+        with drop_on_data_error(cache, symbol, QUICK_TIMEFRAME):
+            ind = compute(df)
     except Exception as e:  # noqa: BLE001 - мало истории и т.п.
         if summary is not None:
             summary.note_error(symbol, e)

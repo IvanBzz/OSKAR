@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from oskar.core.state import RuntimeState
-from oskar.data.candles import CandleCache
+from oskar.data.candles import CandleCache, drop_on_data_error
 from oskar.detect.indicators import IndicatorSet, compute, multi_tf_trend
 from oskar.detect.options import build_candidate
 from oskar.detect.score import score_opportunity
@@ -28,6 +28,43 @@ EXPIRED_FLAT_BARS = 48  # counterfactual без исхода за 48 баров 
 
 def _iso_to_ms(iso: str) -> float:
     return datetime.fromisoformat(iso).timestamp() * 1000.0
+
+
+def _cf_outcome(df, r) -> str | None:
+    """Исход counterfactual-строки r по закрытым свечам df: sl_hit | tp_hit | expired_flat |
+    None (еще не решен). Без записи в журнал: под drop_on_data_error — только разбор окна."""
+    cand = json.loads(r["candidate_json"])
+    direction = cand["direction"]
+    # только бары, ОТКРЫВШИЕСЯ ПОСЛЕ создания кандидата (анти-look-ahead) и
+    # в пределах горизонта: старые уровни против сегодняшних цен — не исход
+    created_ms = _iso_to_ms(cand["ts"])
+    bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 900_000
+    horizon_ms = created_ms + EXPIRED_FLAT_BARS * bar_ms
+    future = df[(df["ts"] > created_ms) & (df["ts"] <= horizon_ms)]
+    # лимитный вход сначала должен быть ДОСТИГНУТ: иначе TP засчитывался
+    # сетапу, в который никто бы не вошел (Codex 2026-10-13: limit 90, бар 98-106 -> tp_hit)
+    market_px = next(
+        (o["price"] for o in cand.get("entry_options", []) if o.get("kind") == "market"), None
+    )
+    entered = market_px is None or abs(float(r["entry_price"]) - float(market_px)) < 1e-12
+    for i in range(len(future)):
+        hi, lo = float(future["high"].iloc[i]), float(future["low"].iloc[i])
+        if not entered:
+            touched = lo <= r["entry_price"] if direction == "long" else hi >= r["entry_price"]
+            if not touched:
+                continue
+            entered = True
+        if direction == "long":
+            sl_hit, tp_hit = lo <= r["sl_price"], hi >= r["tp_price"]
+        else:
+            sl_hit, tp_hit = hi >= r["sl_price"], lo <= r["tp_price"]
+        if sl_hit:
+            return "sl_hit"
+        if tp_hit:
+            return "tp_hit"
+    if int(df["ts"].iloc[-1]) >= horizon_ms:
+        return "expired_flat"  # горизонт прошел без касания SL/TP (или без данных)
+    return None
 
 
 def best_passing_combo(candidate, caps, profile, *, confidence, equity_usd,
@@ -128,19 +165,25 @@ class ShadowCycle:
         report.scanned += 1
 
         df = self._cache.get(symbol, cfg.signal_timeframe, cfg.candles_limit)
-        snapshot = analyze(df, cfg.smc)
+        # окно уронило анализ (битые данные) — запись кеша долой, следующий тик идет к
+        # бирже, а не доедает то же окно до закрытия бара (ревью блока K, 2026-10-16)
+        with drop_on_data_error(self._cache, symbol, cfg.signal_timeframe):
+            snapshot = analyze(df, cfg.smc)
 
-        # Ключ бара — таймстамп открытия: bar_index скользящего окна всегда 299
-        # (кулдаун «299-299<2» не истекал никогда, id решений совпадали)
-        bar_ts = int(df["ts"].iloc[-1])
-        bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 0
+            # Ключ бара — таймстамп открытия: bar_index скользящего окна всегда 299
+            # (кулдаун «299-299<2» не истекал никогда, id решений совпадали)
+            bar_ts = int(df["ts"].iloc[-1])
+            bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 0
         if symbol in self._last_bar:
             if bar_ts - self._last_bar[symbol] < cfg.cooldown_bars * bar_ms:
                 return
 
-        per_tf: dict[str, IndicatorSet] = {cfg.signal_timeframe: compute(df)}
+        with drop_on_data_error(self._cache, symbol, cfg.signal_timeframe):
+            per_tf: dict[str, IndicatorSet] = {cfg.signal_timeframe: compute(df)}
         for tf in cfg.context_timeframes:
-            per_tf[tf] = compute(self._cache.get(symbol, tf, 260))
+            ctx = self._cache.get(symbol, tf, 260)
+            with drop_on_data_error(self._cache, symbol, tf):
+                per_tf[tf] = compute(ctx)
         mtf = multi_tf_trend(per_tf)
         ind = per_tf[cfg.signal_timeframe]
 
@@ -241,43 +284,13 @@ class ShadowCycle:
         ).fetchall()
         if not rows:
             return 0
-        df = self._cache.get(symbol, self._cfg.signal_timeframe, self._cfg.candles_limit)
+        tf = self._cfg.signal_timeframe
+        df = self._cache.get(symbol, tf, self._cfg.candles_limit)
         resolved = 0
         for r in rows:
-            cand = json.loads(r["candidate_json"])
-            direction = cand["direction"]
-            # только бары, ОТКРЫВШИЕСЯ ПОСЛЕ создания кандидата (анти-look-ahead) и
-            # в пределах горизонта: старые уровни против сегодняшних цен — не исход
-            created_ms = _iso_to_ms(cand["ts"])
-            bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 900_000
-            horizon_ms = created_ms + EXPIRED_FLAT_BARS * bar_ms
-            future = df[(df["ts"] > created_ms) & (df["ts"] <= horizon_ms)]
-            # лимитный вход сначала должен быть ДОСТИГНУТ: иначе TP засчитывался
-            # сетапу, в который никто бы не вошел (Codex 2026-10-13: limit 90, бар 98-106 -> tp_hit)
-            market_px = next(
-                (o["price"] for o in cand.get("entry_options", []) if o.get("kind") == "market"), None
-            )
-            entered = market_px is None or abs(float(r["entry_price"]) - float(market_px)) < 1e-12
-            outcome = None
-            for i in range(len(future)):
-                hi, lo = float(future["high"].iloc[i]), float(future["low"].iloc[i])
-                if not entered:
-                    touched = lo <= r["entry_price"] if direction == "long" else hi >= r["entry_price"]
-                    if not touched:
-                        continue
-                    entered = True
-                if direction == "long":
-                    sl_hit, tp_hit = lo <= r["sl_price"], hi >= r["tp_price"]
-                else:
-                    sl_hit, tp_hit = hi >= r["sl_price"], lo <= r["tp_price"]
-                if sl_hit:
-                    outcome = "sl_hit"
-                    break
-                if tp_hit:
-                    outcome = "tp_hit"
-                    break
-            if outcome is None and int(df["ts"].iloc[-1]) >= horizon_ms:
-                outcome = "expired_flat"  # горизонт прошел без касания SL/TP (или без данных)
+            # окно уронило разбор исхода — запись кеша долой (ревью блока K, 2026-10-16)
+            with drop_on_data_error(self._cache, symbol, tf):
+                outcome = _cf_outcome(df, r)
             if outcome is not None:
                 j.execute(
                     "UPDATE counterfactuals SET hypothetical_outcome=?, "
