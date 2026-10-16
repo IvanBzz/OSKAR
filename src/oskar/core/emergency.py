@@ -38,6 +38,11 @@ SAFE MODE (блок H, 2026-10-16) тоже переживает рестарт:
   отсутствие экспозиции не подтверждено: биржа могла принять запрос уже после окна;
 - Telegram — после биржевых действий и вне _FLATTEN_LOCK, одним сообщением: недоступный
   Telegram (2 таймаута по 15 с на сообщение) держал замок и откладывал закрытие позиций.
+
+Ревью Codex H2/I, 2-й круг (2026-10-16): слежение — за ВСЕМИ входами, допущенными к отправке
+на момент взвода (снимок под ENTRY_GATE_LOCK вместе с флагами), а не только за незавершенными
+к концу окна: вход, завершившийся внутри окна со статусом pending (таймаут ccxt 10 с < окна
+15 с), выходит из реестра, и биржа может принять его позже.
 """
 
 import contextlib
@@ -91,6 +96,7 @@ def _merge_passes(*parts: dict) -> dict:
     if parts and all("error" in part for part in parts):
         return dict(parts[0])  # биржа недоступна целиком — ответ прежней формы {"error": ...}
     out = {"cancelled": 0, "closed": 0, "errors": []}
+    watching: set[str] = set()  # pending-входы с неясным исходом: запись не снята, монитор следит
     for part in parts:
         if "error" in part:
             out["errors"].append(str(part["error"]))
@@ -98,6 +104,9 @@ def _merge_passes(*parts: dict) -> dict:
         out["cancelled"] += int(part.get("cancelled", 0))
         out["closed"] += int(part.get("closed", 0))
         out["errors"].extend(part.get("errors") or [])
+        watching.update(part.get("watching") or [])
+    if watching:
+        out["watching"] = sorted(watching)
     return out
 
 
@@ -121,6 +130,9 @@ def _panic_summary(exchange: dict, left: dict) -> str:
             f"{exchange.get('closed', 0)}, ошибок {len(exchange.get('errors') or [])}")
     if left:
         text += f"; входов в процессе после окна: {len(left)} — слежу до подтвержденного закрытия"
+    if exchange.get("watching"):
+        text += (f"; входов с неясным исходом: {len(exchange['watching'])} — запись не снята, "
+                 "слежу по бирже")
     return text
 
 
@@ -128,8 +140,13 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
                  sleep=time.sleep, clock=time.monotonic) -> dict:
     """Ст. 6 п. 1: немедленно и безусловно. Ответ — тот же JSON, что отдавал `/panic`:
     exchange=None — монитора нет (нет ключей биржи), биржа не тронута."""
+    from oskar.core.executor import admitted_entries  # executor импортирует этот модуль
+
     with ENTRY_GATE_LOCK:  # флаги ПЕРВЫМИ; замок — только против допуска входа, без сети
         state.panic()
+        # Снимок допущенных входов — в той же секции: позже допуска нет, а вход, завершившийся
+        # внутри окна, выходит из реестра (ревью Codex H2/I, 2-й круг, 2026-10-16). Только память.
+        admitted = admitted_entries()
     result = {"panic": True, "safe_mode": True, "paused": True, "exchange": None}
     try:  # флаг переживает рестарт — восстановление только явной командой
         with transaction(state.journal):
@@ -158,10 +175,13 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
             logger.critical("panic: %d entr(ies) still in flight after %.0fs: %s",
                             len(left), inflight_wait_sec, sorted(left))
             parts.append(_flatten_pass(lambda: monitor.panic_flatten_inflight(left)))
-            # биржа может принять запрос и после окна — монитор преследует до подтверждения
-            chase = getattr(monitor, "chase_after_panic", None)
-            if chase is not None:
-                chase(left)
+        # Биржа может принять запрос и после окна — монитор преследует до подтверждения. Все
+        # допущенные на момент взвода, а не только left (ревью Codex H2/I, 2-й круг, 2026-10-16):
+        # финальный проход мог не застать позицию (биржа еще не показала) или найти pending без id.
+        watch = {**admitted, **left}
+        chase = getattr(monitor, "chase_after_panic", None)
+        if watch and chase is not None:
+            chase(watch)
         result["exchange"] = _merge_passes(*parts)
         if left:
             result["exchange"]["inflight_unfinished"] = sorted(left)

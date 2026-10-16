@@ -243,6 +243,9 @@ def test_startup_untracked_position_without_decision_keeps_own_protection(tmp_pa
     ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 0.0)]
     ex.open_list = [OpenOrderRef(SYM, "s1", "OSKAR-r1-0123456789ab-sl", "sl"),
                     OpenOrderRef("A/USDT:USDT", "o1", "OSKAR-r1-aaaaaaaaaaaa-sl", "sl")]
+    # s1 — защита ИМЕННО этой позиции (protection_orders по symbol/side; ревью H3, 2-й круг)
+    ex.protection = [ProtectiveOrder("s1", "sl", 98.0, "open", client_order_id="OSKAR-r1-0123456789ab-sl",
+                                     close_position=True)]
     mon.startup_check()
     assert ex.cancelled == ["o1"] and ex.closed == []
     assert state.safe_mode and trades_count(j) == 0
