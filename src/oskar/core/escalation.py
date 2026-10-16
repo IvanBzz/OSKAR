@@ -43,7 +43,7 @@ def open_positions_from_journal(journal) -> list[OpenPosition]:
 
 @dataclass(frozen=True)
 class EscalationResult:
-    outcome: str  # scout_pass | trader_decline | risk_rejected | pending | error
+    outcome: str  # scout_pass | trader_decline | risk_rejected | pending | executed | error
     scout_json: str | None = None
     trade_json: str | None = None
     detail: str = ""
@@ -63,6 +63,7 @@ class Escalator:
         card_sink=None,  # (candidate, verdict, scout_verdict) -> None
         open_positions_fn=lambda: [],
         equity_fn=lambda: 1000.0,
+        auto_executor=None,  # AutoExecutor: в режиме «автомат» сделка ставится без нажатия
     ):
         self._state = state
         self._caps = caps
@@ -74,6 +75,7 @@ class Escalator:
         self._card_sink = card_sink
         self._open_positions = open_positions_fn
         self._equity = equity_fn
+        self._auto = auto_executor
 
     def __call__(self, candidate: SetupCandidate) -> EscalationResult:
         try:
@@ -130,9 +132,18 @@ class Escalator:
             (candidate.id, plan.model_dump_json(), expires),
         )
         j.commit()
+        # Режим «автомат» (Иван 2026-10-16): тот же план и те же проверки, что у кнопки, но без
+        # нажатия. Не исполнилось (проверки/биржа) — карточка уходит с кнопками, решение за Иваном.
+        auto = None
+        if self._auto is not None and self._auto.mode.is_auto():
+            auto = self._auto.run(candidate.id, entry_type)
         if self._card_sink is not None:
             try:
-                message_id = self._card_sink(candidate, verdict, scout_verdict, plan)
+                if auto is None:
+                    message_id = self._card_sink(candidate, verdict, scout_verdict, plan)
+                else:
+                    message_id = self._card_sink(candidate, verdict, scout_verdict, plan,
+                                                 note=auto.note, buttons=not auto.executed)
                 if message_id is False:  # Telegram отверг карточку: решение без карточки = TTL fail-closed
                     raise RuntimeError("telegram refused the card")
                 if message_id:  # монитор снимет кнопки с карточки по истечении TTL
@@ -143,7 +154,10 @@ class Escalator:
                     j.commit()
             except Exception as e:  # noqa: BLE001 - TTL fail-closed прикроет
                 logger.error("card sink failed for %s: %s", candidate.id, e)
-        return EscalationResult(outcome="pending", scout_json=sj, trade_json=tj)
+        if auto is not None and auto.executed:
+            return EscalationResult(outcome="executed", scout_json=sj, trade_json=tj, detail=auto.note)
+        return EscalationResult(outcome="pending", scout_json=sj, trade_json=tj,
+                                detail=auto.note if auto is not None else "")
 
 
 def build_plan(

@@ -28,7 +28,8 @@ from oskar.core.emergency import (  # noqa: F401 - PANIC_META_KEY/panic_engaged:
 from oskar.core.state import RuntimeState
 
 
-def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | None = None) -> FastAPI:
+def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | None = None,
+              trading_mode=None) -> FastAPI:
     hardened = bool(api_token)
 
     def require_token(x_oskar_token: str = Header(default="")):
@@ -130,6 +131,22 @@ def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | N
             raise HTTPException(423, "panic engaged: manual operator reset required")
         state.paused = False
         return {"paused": False}
+
+    @app.get("/mode")
+    def get_mode():
+        if trading_mode is None:
+            return {"mode": "confirm", "auto_allowed": False}
+        return {"mode": trading_mode.get(), "auto_allowed": trading_mode.allowed}
+
+    @app.post("/mode/{mode}")
+    def set_mode(mode: str):
+        """Переключатель «автомат / с подтверждением» (то же, что /mode в боте)."""
+        if trading_mode is None:
+            raise HTTPException(409, "режим не подключен (нет ключей биржи)")
+        try:
+            return {"mode": trading_mode.set(mode)}
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
 
     @app.post("/panic")
     def panic():

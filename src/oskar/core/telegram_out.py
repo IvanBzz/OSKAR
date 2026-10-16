@@ -66,9 +66,13 @@ class TelegramSender:
         ttl_minutes: int,
         scout_verdict=None,
         plan=None,
+        note: str | None = None,  # строка-итог (автомат: «исполнено ...» / «не исполнил ...»)
+        buttons: bool = True,  # автомат исполнил — нажимать нечего
     ) -> SentMessage:
         text = render_card_text(candidate, verdict, ttl_minutes, scout_verdict, plan)
-        keyboard = {"inline_keyboard": build_keyboard(candidate.id, plan)}
+        if note:
+            text += "\n\n<b>" + html.escape(note[:300]) + "</b>"
+        keyboard = {"inline_keyboard": build_keyboard(candidate.id, plan) if buttons else []}
         if chart_png is not None:
             r = self._http.post(
                 f"{self._base}/sendPhoto",

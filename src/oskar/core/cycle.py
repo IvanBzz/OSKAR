@@ -182,6 +182,7 @@ class ShadowCycle:
                 "trader_decline": "trader_decline",
                 "risk_rejected": "risk_rejected",
                 "pending": "shadow",
+                "executed": "shadow",  # автомат: counterfactual рядом с реальной сделкой
                 "error": "shadow",
             }[esc.outcome]
 

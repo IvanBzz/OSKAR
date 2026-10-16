@@ -49,6 +49,27 @@ PING_ANSWER = "Кнопки работают ✅"
 ALLOWED_UPDATES = '["callback_query","message"]'
 PANIC_COMMAND = "panic"
 STATUS_COMMAND = "status"
+MODE_COMMAND = "mode"
+MODE_VERB = "mode"
+BOT_COMMANDS = [
+    {"command": "mode", "description": "режим: автомат / с подтверждением"},
+    {"command": "status", "description": "состояние OSKAR одной строкой"},
+    {"command": "panic", "description": "EMERGENCY STOP: снять входы, закрыть позиции"},
+]
+
+
+def mode_message(current: str) -> tuple[str, dict]:
+    """Сообщение-«ползунок» режима: текст + две кнопки, активная отмечена."""
+    auto = current == "auto"
+    text = ("Режим исполнения: <b>автомат</b> — сделки ставятся сами (VST), карточки приходят "
+            "уведомлением." if auto else
+            "Режим исполнения: <b>с подтверждением</b> — каждую сделку подтверждаешь кнопкой.")
+    keyboard = {"inline_keyboard": [[
+        {"text": ("● " if auto else "○ ") + "🤖 Автомат", "callback_data": "oskar:mode:auto"},
+        {"text": ("○ " if auto else "● ") + "✋ С подтверждением",
+         "callback_data": "oskar:mode:confirm"},
+    ]]}
+    return text, keyboard
 STALE_COMMAND_SEC = 60  # /panic старше — ждал в очереди Telegram, пока демон лежал
 
 
@@ -149,6 +170,7 @@ class ButtonPoller:
         allowed_user_ids: set[str] | None = None,  # по умолчанию = chat id (личный чат Ивана)
         on_panic=None,  # () -> dict (ответ engage_panic); демон передает engage_panic(state, monitor)
         on_status=None,  # () -> str: одна строка для /status
+        on_mode=None,  # (new_mode | None) -> текущий режим; None — переключателя нет
     ):
         if not token or not allowed_chat_id:
             raise ValueError("signals bot token and chat id are required")
@@ -162,6 +184,7 @@ class ButtonPoller:
         # биржу трогает только engage_panic с монитором (его передает демон)
         self._on_panic = on_panic or (lambda: engage_panic(state))
         self._on_status = on_status or (lambda: status_line(state))
+        self._on_mode = on_mode
         self._offset = 0
         self.not_ok_streak = 0
         self._stop = threading.Event()
@@ -233,6 +256,12 @@ class ButtonPoller:
             self._reply(self._run_panic(msg))
         elif command == STATUS_COMMAND:
             self._reply(self._run_status())
+        elif command == MODE_COMMAND:
+            if self._on_mode is None:
+                self._reply("переключатель режима не подключен (нет ключей биржи)")
+            else:
+                text, keyboard = mode_message(self._on_mode(None))
+                self._reply(text, keyboard)
         # не команда / неизвестная команда — молча
 
     def _run_panic(self, msg: dict) -> str:
@@ -270,12 +299,16 @@ class ButtonPoller:
 
         parts = data.split(":", 2)
         known = len(parts) == 3 and parts[0] == "oskar" and (
-            parts[1] in VERB_ACTIONS or parts[1] == PING_VERB
+            parts[1] in VERB_ACTIONS or parts[1] in (PING_VERB, MODE_VERB)
         )
         if not known:
             self._answer(cb_id, "не понял кнопку")
             return
         verb, decision_id = parts[1], parts[2]
+
+        if verb == MODE_VERB:
+            self._switch_mode(cb_id, msg, decision_id)
+            return
 
         if verb == PING_VERB:
             self._answer(cb_id, PING_ANSWER)
@@ -339,13 +372,35 @@ class ButtonPoller:
         except Exception as e:  # noqa: BLE001
             logger.warning("answerCallbackQuery failed: %s", e)
 
-    def _reply(self, text: str) -> None:
-        """Ответ на команду в allowlist-чат (HTML; динамика уже экранирована)."""
+    def _switch_mode(self, cb_id: str, msg: dict, target: str) -> None:
+        """Ползунок режима: переключить, ответить всплывашкой, перерисовать сообщение."""
+        if self._on_mode is None:
+            self._answer(cb_id, "переключатель не подключен")
+            return
         try:
-            r = self._http.post(
-                f"{self._base}/sendMessage",
-                json={"chat_id": self._chat, "text": text, "parse_mode": "HTML"},
-            )
+            current = self._on_mode(target)
+        except Exception as e:  # noqa: BLE001 - например, автомат вне paper
+            self._answer(cb_id, f"не переключил: {e}")
+            return
+        label = "автомат" if current == "auto" else "с подтверждением"
+        self._answer(cb_id, f"режим: {label}")
+        text, keyboard = mode_message(current)
+        try:
+            self._http.post(f"{self._base}/editMessageText", json={
+                "chat_id": self._chat, "message_id": msg.get("message_id"), "text": text,
+                "parse_mode": "HTML", "reply_markup": keyboard,
+            })
+        except Exception as e:  # noqa: BLE001 - косметика
+            logger.warning("mode message edit failed: %s", e)
+        logger.warning("execution mode switched via Telegram -> %s", current)
+
+    def _reply(self, text: str, keyboard: dict | None = None) -> None:
+        """Ответ на команду в allowlist-чат (HTML; динамика уже экранирована)."""
+        body = {"chat_id": self._chat, "text": text, "parse_mode": "HTML"}
+        if keyboard is not None:
+            body["reply_markup"] = keyboard
+        try:
+            r = self._http.post(f"{self._base}/sendMessage", json=body)
             if not r.json().get("ok"):
                 logger.warning("command reply refused: %s", str(r.json())[:200])
         except Exception as e:  # noqa: BLE001 - ответ вторичен, команда уже исполнена
@@ -373,8 +428,16 @@ class ButtonPoller:
 
     # ---------------------------------------------------------------- thread
 
+    def register_commands(self) -> None:
+        """Меню команд сигнального бота (/mode /status /panic) — подсказка в Telegram."""
+        try:
+            self._http.post(f"{self._base}/setMyCommands", json={"commands": BOT_COMMANDS})
+        except Exception as e:  # noqa: BLE001 - меню вторично
+            logger.warning("setMyCommands failed: %s", e)
+
     def run_forever(self) -> None:
         logger.info("button poller started (signals bot)")
+        self.register_commands()
         while not self._stop.is_set():
             try:
                 if self.poll_once() < 0:

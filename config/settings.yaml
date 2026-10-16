@@ -8,6 +8,12 @@
 
 mode: paper                        # paper (BingX VST) | live — live откроется только через гейт Фазы 5
 
+execution:
+  # Режим исполнения по умолчанию (если не переключен в боте /mode): auto | confirm.
+  # auto — сделки ставятся без нажатия, ТОЛЬКО на paper/VST (Иван 2026-10-16: «пока что
+  # запускаем автоматический режим»). Переключатель в боте сохраняется в журнале.
+  default_mode: auto
+
 exchange:
   id: bingx                        # не подключен: код только под BingX
   sandbox: true                    # true = VST (open-api-vst.bingx.com), реальные цены

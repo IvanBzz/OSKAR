@@ -153,7 +153,7 @@ def _connect_journal(db_path: Path):
         return connect(db_path)
 
 
-def _make_escalator(state, caps, profile_settings, settings, runner, cache):
+def _make_escalator(state, caps, profile_settings, settings, runner, cache, auto_executor=None):
     """Escalator строится, только если claude CLI и Telegram доступны."""
     import os
     import shutil
@@ -200,14 +200,15 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
         sender = TelegramSender(token, chat)
         ttl_min = profile_settings.approval_ttl_seconds // 60
 
-        def card_sink(candidate, verdict, scout_verdict, plan=None):  # noqa: F811
+        def card_sink(candidate, verdict, scout_verdict, plan=None, note=None, buttons=True):  # noqa: F811
             png = None
             try:
                 df = cache.get(candidate.symbol, candidate.timeframe, 200)
                 png = render_chart(df, candidate, plan)
             except Exception:  # noqa: BLE001 - карточка без графика лучше отсутствия
                 pass
-            sent = sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan)
+            sent = sender.send_setup_card(candidate, verdict, png, ttl_min, scout_verdict, plan,
+                                          note=note, buttons=buttons)
             if not sent.ok:
                 return False  # эскалатор увидит отказ Telegram, а не промолчит
             # message_id -> pending_approvals: монитор снимет кнопки по истечении TTL
@@ -227,6 +228,7 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache):
         # не срабатывали никогда (ревью 2026-10-13)
         open_positions_fn=lambda: open_positions_from_journal(state.journal),
         equity_fn=lambda: runner.equity_usd,
+        auto_executor=auto_executor,
     )
 
 
@@ -422,7 +424,29 @@ def main() -> int:
         equity_fn=_make_equity_fn(settings),
         notify=alert,
     )
-    cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache)
+    # Исполнитель и режим — ДО эскалатора: в режиме «автомат» сделку ставит сам цикл.
+    from oskar.core.trading_mode import AutoExecutor, TradingMode
+
+    executor = _make_executor(state, settings, caps, client)
+    guarded_execute = None
+    if executor is not None:
+        from oskar.core.executor import equity_guarded
+
+        guarded_execute = equity_guarded(
+            executor.execute, lambda: runner.equity_source,
+            equity_fn=lambda: runner.equity_usd, plan_fn=executor.plan_for,
+            risk_cap_pct=caps.risk_per_trade_pct,
+        )
+    # автомат — только paper/VST (реал закрыт гейтом Фазы 5); по умолчанию — из настроек
+    trading_mode = TradingMode(
+        journal, allowed=(mode == "paper" and _sandbox(settings) and guarded_execute is not None),
+        default=str((settings.get("execution") or {}).get("default_mode", "confirm")),
+    )
+    auto_executor = (AutoExecutor(trading_mode, state, guarded_execute, notify=alert)
+                     if guarded_execute is not None else None)
+    print(f"execution mode: {trading_mode.get()} (auto allowed: {trading_mode.allowed})", flush=True)
+    cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache,
+                                       auto_executor=auto_executor)
     runner_thread = runner.start_thread()
 
     # Монитор — ДО поллера: Telegram /panic зовет monitor.panic_flatten(), а /panic,
@@ -435,31 +459,28 @@ def main() -> int:
     if signals_token and chat_id:
         from oskar.core.telegram_buttons import ButtonPoller, status_line
 
-        executor = _make_executor(state, settings, caps, client)
-        on_resolution = None
-        if executor is not None:
-            from oskar.core.executor import equity_guarded
+        on_resolution = guarded_execute
 
-            on_resolution = equity_guarded(
-                executor.execute, lambda: runner.equity_source,
-                equity_fn=lambda: runner.equity_usd, plan_fn=executor.plan_for,
-                risk_cap_pct=caps.risk_per_trade_pct,
-            )
+        def on_mode(target):
+            return trading_mode.set(target) if target else trading_mode.get()
+
         # ст. 6: Telegram /panic — та же функция, что у API и CLI (флаги -> meta -> биржа)
         poller = ButtonPoller(
             signals_token, chat_id, state, on_resolution=on_resolution,
             on_panic=lambda: engage_panic(state, monitor),
-            on_status=lambda: status_line(state, runner),
+            on_status=lambda: f"{status_line(state, runner)} · режим: {trading_mode.get()}",
+            on_mode=on_mode if auto_executor is not None else None,
         )
         poller_thread = poller.start_thread()
-        print(f"button poller: ON (signals bot, /panic /status), execution: "
+        print(f"button poller: ON (signals bot, /mode /panic /status), execution: "
               f"{'ON' if executor is not None else 'OFF (no keys)'}", flush=True)
 
     # токен API: страница в браузере на этой же машине не должна жать panic/approve
     api_token = os.getenv("OSKAR_API_TOKEN", "") or secrets.token_hex(16)
     token_path = REPO_ROOT / "data" / "oskard.token"
     token_path.write_text(api_token, encoding="ascii")  # читают Hermes-скиллы и CLI
-    app = build_app(state, shadow=runner, monitor=monitor, api_token=api_token)
+    app = build_app(state, shadow=runner, monitor=monitor, api_token=api_token,
+                    trading_mode=trading_mode)
     print(
         f"oskard starting: run_id={state.run_id} profile={profile.name} "
         f"mode={mode} sandbox={_sandbox(settings)} api=http://{api_host}:{api_port} "
