@@ -10,16 +10,20 @@ client_order_id для точной реконсиляции; reconciled-фла�
 - trade_lessons — уроки post-trade Analyst
 - pending_approvals — карточки, ждущие Telegram-подтверждения (TTL)
 - counterfactuals   — сетапы и их гипотетический исход (когорты shadow/pass/reject/...,
-                      с v4 — и эскалированные executed/pending/error по выбранной комбинации)
+                      с v4 — и эскалированные executed/pending/error по выбранной комбинации;
+                      с v5 — версия резолвера, R после комиссий, детали исхода, эпизод)
 - sync_snapshots    — результаты реконсиляций
 """
 
 import sqlite3
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 4  # v4: counterfactuals.cohort + executed/pending/error (2026-10-16)
+from oskar.journal.episodes import backfill_episodes
+
+SCHEMA_VERSION = 5  # v5: counterfactuals резолвера v2 — версия, R, детали, эпизод (2026-10-16)
 
 # Миграции «вперед»: версия -> ADD COLUMN (имя, определение). Журнал хранит
 # датасет решений и counterfactuals — стирать его при смене схемы нельзя
@@ -30,14 +34,23 @@ MIGRATIONS: dict[int, list[tuple[str, str, str]]] = {
         ("trades", "entry_type", "TEXT"),
     ],
     4: [],  # только пересоздание таблицы (REBUILDS)
+    5: [],  # пересоздание counterfactuals: новые колонки и CHECK исходов приходят из DDL
 }
 
 # Миграции «вперед», которые ALTER не умеет (CHECK в SQLite не меняется): версия ->
 # таблицы, пересоздаваемые по актуальному DDL с переносом данных (_rebuild_table).
 # 2026-10-16, v4: CHECK counterfactuals.cohort не пускал executed/pending/error —
 # эскалированные сетапы писались в 'shadow' вперемешку с чистым shadow.
+# 2026-10-16, v5 (блок R3): резолвер v2 — исходы no_data/unfilled/duration_stop/horizon_close
+# не проходили CHECK; resolver_version старых строк = 1 (DEFAULT), их исходы не переписываются.
 REBUILDS: dict[int, list[str]] = {
     4: ["counterfactuals"],
+    5: ["counterfactuals"],
+}
+
+# Перенос данных после пересоздания, в той же транзакции миграции: версия -> функции(conn).
+BACKFILLS: dict[int, list[Callable[[sqlite3.Connection], object]]] = {
+    5: [backfill_episodes],  # episode_id старым строкам тем же правилом, что у живой записи
 }
 
 COUNTERFACTUALS_DDL = """
@@ -53,9 +66,15 @@ CREATE TABLE IF NOT EXISTS {name} (
     sl_price REAL NOT NULL,
     tp_price REAL NOT NULL,
     hypothetical_outcome TEXT CHECK (hypothetical_outcome IS NULL OR hypothetical_outcome IN
-        ('tp_hit','sl_hit','expired_flat')),         -- NULL = еще отслеживается
+        ('tp_hit','sl_hit','expired_flat',           -- expired_flat: только резолвер v1
+         'no_data','unfilled','duration_stop','horizon_close')),  -- v5: резолвер v2
+                                                     -- NULL = еще отслеживается
     resolved_at TEXT,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    resolver_version INTEGER NOT NULL DEFAULT 1,     -- v5: версия правил, давших исход (1 = до v5)
+    outcome_detail TEXT,                             -- v5: JSON резолвера v2 (покрытие, вход, выход)
+    realized_r REAL,                                 -- v5: R после комиссий в риск-единицах сайзинга
+    episode_id TEXT                                  -- v5: серия символ|направление|начало
 );
 """
 
@@ -241,6 +260,8 @@ def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
             for table in REBUILDS.get(version, []):
                 _rebuild_table(conn, table)
+            for backfill in BACKFILLS.get(version, []):
+                backfill(conn)
             conn.execute(
                 "UPDATE meta SET value=? WHERE key='schema_version'", (str(version),)
             )

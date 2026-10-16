@@ -307,7 +307,54 @@ def entry_price_violations(
     return Measurement(len(bad), len(trades), full and not unknown, detail + _shortfall(window, trades))
 
 
+def cf_v2_coverage_violations(
+    journal: sqlite3.Connection, window: Window, now: datetime, ctx: Context
+) -> Measurement:
+    """INV-006 (блок R3, 2026-10-16): CF резолвера v2 с исходом имеют полное покрытие окна.
+
+    v1 превращал отсутствие свечей в expired_flat. v2 пишет исход только при барах подряд от
+    начала окна до бара исхода и доказательство в outcome_detail (start_ms, last_bar_ms, bars,
+    tf_ms); метрика перепроверяет его по журналу. no_data — честное «не измерено», не в счет.
+    Окно: {hours: N} — разрешенные за N часов; {closed_trades: N} — последние N разрешенных."""
+    from oskar.core.cf_resolver import CF_RESOLVER_VERSION, COVERED_OUTCOMES, coverage_problem
+
+    cols = {r[1] for r in journal.execute("PRAGMA table_info(counterfactuals)")}
+    if "resolver_version" not in cols:
+        return Measurement(None, 0, False, "журнал до v5: колонок резолвера v2 нет")
+    marks = ",".join("?" * len(COVERED_OUTCOMES))
+    rows = [
+        r for r in journal.execute(
+            "SELECT id, hypothetical_outcome, outcome_detail, realized_r, resolved_at "
+            f"FROM counterfactuals WHERE resolver_version = ? AND hypothetical_outcome IN ({marks})",
+            (CF_RESOLVER_VERSION, *COVERED_OUTCOMES),
+        ).fetchall()
+        if (_parse_iso(r["resolved_at"]) or _EPOCH) <= now
+    ]
+    rows.sort(key=lambda r: (_parse_iso(r["resolved_at"]) or _EPOCH, r["id"]), reverse=True)
+    if window.closed_trades is not None:
+        picked = rows[: window.closed_trades]
+        full = len(picked) >= window.closed_trades
+    else:
+        cutoff = now - timedelta(hours=float(window.hours or 0))
+        picked = [r for r in rows if (_parse_iso(r["resolved_at"]) or _EPOCH) >= cutoff]
+        full = len(picked) >= MIN_TRADES_IN_HOURS_WINDOW
+    bad = []
+    for r in picked:
+        why = coverage_problem(r["outcome_detail"], r["hypothetical_outcome"])
+        if why is None and r["realized_r"] is None:
+            why = "нет realized_r"
+        if why is not None:
+            bad.append(f"#{r['id']} {r['hypothetical_outcome']}: {why}")
+    detail = f"{len(bad)} из {len(picked)} исходов CF v2 без доказанного полного покрытия"
+    if bad:
+        detail += " (" + "; ".join(bad[:10]) + (f" и еще {len(bad) - 10}" if len(bad) > 10 else "") + ")"
+    if not full:
+        detail += "; в окне нет разрешенных CF v2" if not picked else "; окно неполное"
+    return Measurement(len(bad), len(picked), full, detail)
+
+
 METRICS: dict[str, MetricFn] = {
+    "cf_v2_coverage_violations": cf_v2_coverage_violations,
     "entry_price_violations": entry_price_violations,
     "close_reason_unknown_count": close_reason_unknown_count,
     "loser_overhold_count": loser_overhold_count,

@@ -54,3 +54,13 @@ invariants:
     window: { closed_trades: 5 }
     expect: "== 0"
     status: pending
+
+  # --- R3 (2026-10-16): резолвер counterfactuals v2. Только измерение — торговое поведение
+  # не меняется; инвариант держит честность датасета когорт (v1: нет свечей -> expired_flat).
+  - id: INV-006
+    commit: pending
+    description: "CF резолвера v2 с исходом (кроме no_data) имеют полное покрытие свечами окна от начала до бара исхода"
+    metric: cf_v2_coverage_violations
+    window: { hours: 48 }
+    expect: "== 0"
+    status: pending

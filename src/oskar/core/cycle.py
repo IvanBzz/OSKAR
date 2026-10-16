@@ -4,7 +4,7 @@
 (с дефолтной confidence) -> журнал decisions + counterfactuals (cohort=shadow).
 Эскалация к Scout/Trader и исполнение подключаются в Фазе 2 — цикл уже сейчас
 накапливает counterfactual-датасет: «что бы система выбрала и чем бы это
-кончилось» (исходы дорешивает поздний проход по свечам).
+кончилось» (исходы дорешивает поздний проход по свечам — core/cf_resolver.py, v2).
 
 Look-ahead дисциплина: cache отдает только закрытые свечи (client отбросил
 формирующуюся), analyze видит только префикс.
@@ -14,21 +14,19 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from oskar.core.cf_resolver import CF_RESOLVER_VERSION, ResolverParams, resolve
 from oskar.core.state import RuntimeState
 from oskar.data.candles import CandleCache
 from oskar.detect.indicators import IndicatorSet, compute, multi_tf_trend
 from oskar.detect.options import build_candidate
 from oskar.detect.score import score_opportunity
 from oskar.detect.smc import DEFAULT_CONFIG, SmcConfig, analyze
+from oskar.journal.db import transaction
+from oskar.journal.episodes import TIMEFRAME_MS, assign_episode
 from oskar.risk.combos import choose_combo, evaluate_combos, most_advanced
 from oskar.risk.ladder import Caps, ProfileLimits
 
 SHADOW_CONFIDENCE = 68  # фиксированная confidence shadow-режима (в границах [60..75])
-EXPIRED_FLAT_BARS = 48  # counterfactual без исхода за 48 баров (12ч на 15м) -> expired_flat
-
-
-def _iso_to_ms(iso: str) -> float:
-    return datetime.fromisoformat(iso).timestamp() * 1000.0
 
 
 def best_passing_combo(candidate, caps, profile, *, confidence, equity_usd,
@@ -64,6 +62,9 @@ class CycleConfig:
     min_score: int = 70
     cooldown_bars: int = 30
     approval_ttl_seconds: int = 1200  # profiles.yaml: intraday 20 мин
+    # 2026-10-16 (блок R3): жизненный цикл живой системы для резолвера CF v2 (profiles.yaml)
+    limit_entry_ttl_seconds: int = 3600
+    max_loss_hold_seconds: int = 10800
     smc: SmcConfig = DEFAULT_CONFIG
 
 
@@ -190,10 +191,16 @@ class ShadowCycle:
                 scout_json, trade_json, verdict.model_dump_json(), outcome, detail,
             ),
         )
+        # v5 (блок R3): версия резолвера, которым будет посчитан исход, и серия сетапа
+        episode = assign_episode(
+            j, candidate.symbol, candidate.direction,
+            int(candidate.ts.timestamp() * 1000), candidate.timeframe,
+        )
         j.execute(
             "INSERT OR IGNORE INTO counterfactuals (decision_id, cohort, candidate_json, "
-            "entry_price, sl_price, tp_price) VALUES (?,?,?,?,?,?)",
-            (candidate.id, cohort, candidate.model_dump_json(), entry, sl, tp),
+            "entry_price, sl_price, tp_price, resolver_version, episode_id) VALUES (?,?,?,?,?,?,?,?)",
+            (candidate.id, cohort, candidate.model_dump_json(), entry, sl, tp,
+             CF_RESOLVER_VERSION, episode),
         )
         if verdict.passed and self._card_sink is not None and self._escalator is None:
             expires = (
@@ -214,17 +221,25 @@ class ShadowCycle:
 
     def unresolved_symbols(self) -> list[str]:
         """Символы с висящими counterfactuals — дорешивать надо их, а не вотчлист
-        (символ выпал из топа -> исход не записывался никогда; 32/82 висели с августа)."""
+        (символ выпал из топа -> исход не записывался никогда; 32/82 висели с августа).
+
+        Порядок — от самой старой висящей строки (2026-10-16, R3): runner берет первые
+        MAX_RESOLVE_SYMBOLS, и при алфавитном порядке хвост алфавита мог ждать, пока окно не
+        уйдет из кеша свечей — у резолвера v2 это no_data навсегда."""
         rows = self._state.journal.execute(
-            "SELECT DISTINCT json_extract(candidate_json, '$.symbol') AS symbol "
-            "FROM counterfactuals WHERE hypothetical_outcome IS NULL"
+            "SELECT json_extract(candidate_json, '$.symbol') AS symbol, MIN(id) AS first_id "
+            "FROM counterfactuals WHERE hypothetical_outcome IS NULL "
+            "GROUP BY symbol ORDER BY first_id, symbol"
         ).fetchall()
-        return sorted(r["symbol"] for r in rows if r["symbol"])
+        return [r["symbol"] for r in rows if r["symbol"]]
 
     def resolve_counterfactuals(self, symbol: str) -> int:
-        """Дорешивает висящие counterfactuals символа по свежим закрытым свечам.
+        """Дорешивает висящие counterfactuals символа резолвером v2 (core/cf_resolver.py).
 
-        Ни SL, ни TP за EXPIRED_FLAT_BARS баров -> expired_flat (сетап протух)."""
+        Свечи — тот же вызов кеша, что у цикла (без новых запросов к бирже): последние
+        candles_limit закрытых баров. Окно не покрыто — строка ждет; окно старше кеша или
+        дыра в свечах — no_data. Исход пишется с resolver_version=2, R после комиссий и
+        деталями (покрытие, вход, выход, ambiguous) в outcome_detail."""
         j = self._state.journal
         # Ревью 2026-10-13, E.4: отбор в SQL не загружает весь хвост на каждый символ.
         rows = j.execute(
@@ -235,49 +250,35 @@ class ShadowCycle:
         ).fetchall()
         if not rows:
             return 0
-        df = self._cache.get(symbol, self._cfg.signal_timeframe, self._cfg.candles_limit)
-        resolved = 0
+        params = ResolverParams(
+            limit_entry_ttl_seconds=self._cfg.limit_entry_ttl_seconds,
+            max_loss_hold_seconds=self._cfg.max_loss_hold_seconds,
+        )
+        frames: dict[str, object] = {}
+        results = []
         for r in rows:
-            cand = json.loads(r["candidate_json"])
-            direction = cand["direction"]
-            # только бары, ОТКРЫВШИЕСЯ ПОСЛЕ создания кандидата (анти-look-ahead) и
-            # в пределах горизонта: старые уровни против сегодняшних цен — не исход
-            created_ms = _iso_to_ms(cand["ts"])
-            bar_ms = int(df["ts"].iloc[-1] - df["ts"].iloc[-2]) if len(df) >= 2 else 900_000
-            horizon_ms = created_ms + EXPIRED_FLAT_BARS * bar_ms
-            future = df[(df["ts"] > created_ms) & (df["ts"] <= horizon_ms)]
-            # лимитный вход сначала должен быть ДОСТИГНУТ: иначе TP засчитывался
-            # сетапу, в который никто бы не вошел (Codex 2026-10-13: limit 90, бар 98-106 -> tp_hit)
-            market_px = next(
-                (o["price"] for o in cand.get("entry_options", []) if o.get("kind") == "market"), None
-            )
-            entered = market_px is None or abs(float(r["entry_price"]) - float(market_px)) < 1e-12
-            outcome = None
-            for i in range(len(future)):
-                hi, lo = float(future["high"].iloc[i]), float(future["low"].iloc[i])
-                if not entered:
-                    touched = lo <= r["entry_price"] if direction == "long" else hi >= r["entry_price"]
-                    if not touched:
-                        continue
-                    entered = True
-                if direction == "long":
-                    sl_hit, tp_hit = lo <= r["sl_price"], hi >= r["tp_price"]
-                else:
-                    sl_hit, tp_hit = hi >= r["sl_price"], lo <= r["tp_price"]
-                if sl_hit:
-                    outcome = "sl_hit"
-                    break
-                if tp_hit:
-                    outcome = "tp_hit"
-                    break
-            if outcome is None and int(df["ts"].iloc[-1]) >= horizon_ms:
-                outcome = "expired_flat"  # горизонт прошел без касания SL/TP (или без данных)
-            if outcome is not None:
-                j.execute(
-                    "UPDATE counterfactuals SET hypothetical_outcome=?, "
-                    "resolved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
-                    (outcome, r["id"]),
+            try:
+                cand = json.loads(r["candidate_json"])
+            except (TypeError, ValueError):
+                cand = None
+            cand = cand if isinstance(cand, dict) else {}
+            if not cand.get("timeframe"):  # ТФ свечей и ТФ резолвера — один и тот же
+                cand["timeframe"] = self._cfg.signal_timeframe
+            tf = cand["timeframe"]
+            if tf in TIMEFRAME_MS and tf not in frames:  # обычно один ТФ — один вызов кеша, как в v1
+                frames[tf] = self._cache.get(symbol, tf, self._cfg.candles_limit)
+            # неизвестный ТФ — без запроса к бирже: resolve() вернет no_data (bad_candidate)
+            res = resolve(cand, r["entry_price"], r["sl_price"], r["tp_price"], frames.get(tf), params)
+            if res is not None:
+                results.append((res.outcome, res.detail_json(), res.realized_r, CF_RESOLVER_VERSION,
+                                r["id"]))
+        if results:
+            with transaction(j):
+                j.executemany(
+                    "UPDATE counterfactuals SET hypothetical_outcome=?, outcome_detail=?, "
+                    "realized_r=?, resolver_version=?, "
+                    "resolved_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE id=? AND hypothetical_outcome IS NULL",
+                    results,
                 )
-                resolved += 1
-        j.commit()
-        return resolved
+        return len(results)

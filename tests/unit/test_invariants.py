@@ -321,3 +321,67 @@ def test_inv004_missing_levels_is_not_green(tmp_path):
     add(j, "nolevels")
     m = _entry_one(j, Window(closed_trades=1))
     assert m.value == 0 and not m.sufficient
+
+
+# ------------------------------------------------------------- INV-006 (R3)
+
+
+def _cf(j, did, outcome, *, version=2, resolved=NOW - timedelta(hours=1), detail=None, r=0.5):
+    j.execute(
+        "INSERT INTO counterfactuals (decision_id, cohort, candidate_json, entry_price, sl_price, tp_price, "
+        "hypothetical_outcome, resolver_version, outcome_detail, realized_r, resolved_at) "
+        "VALUES (?, 'shadow', '{}', 100, 98, 104, ?, ?, ?, ?, ?)",
+        (did, outcome, version, detail, r, iso(resolved)),
+    )
+    j.commit()
+
+
+def _resolved_detail(outcome):
+    """Деталь, которую пишет резолвер v2 — настоящим прогоном на синтетике."""
+    import pandas as pd
+
+    from oskar.core.cf_resolver import resolve
+
+    start = 1_791_889_200_000
+    cand = {"id": "x", "direction": "long", "timeframe": "15m", "ts": "2026-10-13T11:00:00Z"}
+    df = pd.DataFrame({"ts": [start + k * 900_000 for k in range(60)], "open": 100.0, "high": 100.5,
+                       "low": 99.5, "close": 100.2})
+    if outcome == "tp_hit":
+        df.loc[3, "high"] = 105.0
+    res = resolve(cand, 100.0, 98.0, 104.0, df)
+    assert res.outcome == outcome
+    return res.detail_json()
+
+
+def test_inv006_v2_outcomes_with_coverage_green(tmp_path):
+    j = connect(tmp_path / "j.db")
+    _cf(j, "tp", "tp_hit", detail=_resolved_detail("tp_hit"))
+    _cf(j, "hz", "horizon_close", detail=_resolved_detail("horizon_close"))
+    _cf(j, "nd", "no_data", detail='{"reason": "gap"}', r=None)  # честное «не измерено» — не в счет
+    _cf(j, "v1", "expired_flat", version=1, detail=None, r=None)  # v1 не проверяется
+    _cf(j, "old", "tp_hit", resolved=NOW - timedelta(hours=72))  # вне окна 48 ч
+    v = one(j, inv("cf_v2_coverage_violations", {"hours": 48}))
+    assert v.status == GREEN and v.value == 0 and v.n == 2
+
+
+def test_inv006_outcome_without_proven_coverage_is_red(tmp_path):
+    import json
+
+    j = connect(tmp_path / "j.db")
+    _cf(j, "ok", "tp_hit", detail=_resolved_detail("tp_hit"))
+    bad = json.loads(_resolved_detail("horizon_close"))
+    bad["bars"] = 40  # «горизонт закрыт» по 40 барам из 48 — выдумка
+    _cf(j, "short", "horizon_close", detail=json.dumps(bad))
+    _cf(j, "bare", "sl_hit", detail=None)
+    v = one(j, inv("cf_v2_coverage_violations", {"hours": 48}))
+    assert v.status == RED and v.value == 2
+    assert "horizon_close" in v.detail and "нет записи о покрытии" in v.detail
+
+
+def test_inv006_no_resolved_v2_is_insufficient(tmp_path):
+    j = connect(tmp_path / "j.db")
+    _cf(j, "nd", "no_data", detail='{"reason": "gap"}', r=None)
+    v = one(j, inv("cf_v2_coverage_violations", {"hours": 48}))
+    assert v.status == INSUFFICIENT and v.n == 0
+    declared = {i["id"]: i for i in load_invariants()}
+    assert declared["INV-006"]["metric"] == "cf_v2_coverage_violations"

@@ -43,6 +43,8 @@ def test_cycle_config_derived():
     assert cfg.smc.swing_length == 5     # detect.swing_length
     assert cfg.cooldown_bars == 2        # 1800с кулдауна / 900с бар
     assert "15m" not in cfg.context_timeframes
+    # резолвер CF v2 (R3) — жизненный цикл живого профиля
+    assert cfg.limit_entry_ttl_seconds == 3600 and cfg.max_loss_hold_seconds == 10800
 
 
 # -------------------------------------------------------------------- runner

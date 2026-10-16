@@ -38,6 +38,15 @@ def main() -> int:
     p_inv = sub.add_parser("invariants", help="Art. 5 verdicts from the journal (exit 1 on red)")
     p_inv.add_argument("--no-note", action="store_true", help="do not write a note to vault/runs/")
 
+    from oskar.ops.cohorts import DEFAULT_BOOT, DEFAULT_SEED  # stdlib-only, без pandas
+
+    p_coh = sub.add_parser(
+        "cohorts", help="counterfactual cohorts by resolver version: outcomes, mean R, CI (read-only)"
+    )
+    p_coh.add_argument("--db", help="journal path (default: settings.journal.db_path)")
+    p_coh.add_argument("--boot", type=int, default=DEFAULT_BOOT, help="bootstrap resamples")
+    p_coh.add_argument("--seed", type=int, default=DEFAULT_SEED, help="bootstrap seed")
+
     sub.add_parser(
         "buttons-ping",
         help="send a self-test card via the signals bot (press -> 'buttons work')",
@@ -56,6 +65,9 @@ def main() -> int:
 
     if args.command == "invariants":
         return _cmd_invariants(args)
+
+    if args.command == "cohorts":
+        return _cmd_cohorts(args)
 
     if args.command == "knowledge":
         from oskar.knowledge.index import build_index, search
@@ -283,6 +295,15 @@ def _cmd_invariants(args) -> int:
     from oskar.ops.invariants import cli_main
 
     return cli_main(_journal_db(), write_note=not args.no_note)
+
+
+def _cmd_cohorts(args) -> int:
+    """Сводка counterfactual-когорт (блок R3, 2026-10-16): журнал открывается только на чтение."""
+    from pathlib import Path
+
+    from oskar.ops.cohorts import cli_main
+
+    return cli_main(Path(args.db) if args.db else _journal_db(), n_boot=args.boot, seed=args.seed)
 
 
 def _cmd_sync(args) -> int:

@@ -103,5 +103,8 @@ def build_cycle_config(
         min_score=scanner.min_opportunity_score,
         cooldown_bars=max(1, scanner.per_symbol_cooldown_seconds // tf_sec),
         approval_ttl_seconds=profile.approval_ttl_seconds,
+        # резолвер CF v2 (блок R3) меряет исход по жизненному циклу живого профиля
+        limit_entry_ttl_seconds=profile.limit_entry_ttl_seconds,
+        max_loss_hold_seconds=profile.max_loss_hold_seconds,
         smc=SmcConfig(swing_length=swing),
     )

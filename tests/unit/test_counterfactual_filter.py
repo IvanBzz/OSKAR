@@ -1,4 +1,6 @@
-"""Ревью 2026-10-13, E.4: SQL отбирает только неразрешенные исходы нужного символа."""
+"""Ревью 2026-10-13, E.4: SQL отбирает только неразрешенные исходы нужного символа.
+
+2026-10-16 (R3): исходы — резолвером v2, свечи покрывают окно полностью."""
 
 import json
 from datetime import UTC, datetime
@@ -6,9 +8,10 @@ from datetime import UTC, datetime
 import pandas as pd
 import pytest
 
-from oskar.core.cycle import EXPIRED_FLAT_BARS, ShadowCycle
+from oskar.core.cycle import ShadowCycle
 from oskar.core.state import RuntimeState
 from oskar.journal.db import connect
+from oskar.journal.episodes import HORIZON_BARS
 from tests.unit.test_core import CAPS, PROFILE
 
 SYMBOL = "SOL/USDT:USDT"
@@ -38,12 +41,22 @@ def add_counterfactual(journal, decision_id, symbol, direction="long", outcome=N
     )
 
 
+def flat_bars(n, last_high=101, last_low=99):
+    """n баров 15м подряд от начала окна (CREATED_MS — граница бара): 99-101, последний — свой."""
+    highs = [101] * (n - 1) + [last_high]
+    lows = [99] * (n - 1) + [last_low]
+    return pd.DataFrame({
+        "ts": [CREATED_MS + i * 900_000 for i in range(n)],
+        "open": [100.0] * n, "high": highs, "low": lows, "close": [100.0] * n,
+    })
+
+
 @pytest.mark.parametrize(("direction", "high", "low", "bars", "outcome"), [
-    ("long", 106, 99, 1, "tp_hit"),
-    ("long", 106, 97, 1, "sl_hit"),
-    ("short", 101, 94, 1, "tp_hit"),
-    ("short", 103, 94, 1, "sl_hit"),
-    ("long", 101, 99, EXPIRED_FLAT_BARS, "expired_flat"),
+    ("long", 106, 99, 2, "tp_hit"),
+    ("long", 106, 97, 2, "sl_hit"),
+    ("short", 101, 94, 2, "tp_hit"),
+    ("short", 103, 94, 2, "sl_hit"),
+    ("long", 101, 99, HORIZON_BARS, "horizon_close"),
 ])
 def test_only_requested_unresolved_symbol_is_loaded(tmp_path, direction, high, low, bars, outcome):
     journal = connect(tmp_path / "j.db")
@@ -63,12 +76,10 @@ def test_only_requested_unresolved_symbol_is_loaded(tmp_path, direction, high, l
         return original_factory(cursor, row)
 
     journal.row_factory = track_rows
-    cache = Cache(pd.DataFrame({
-        "ts": [CREATED_MS + (bars - 1) * 900_000, CREATED_MS + bars * 900_000],
-        "high": [101, high], "low": [99, low],
-    }))
+    cache = Cache(flat_bars(bars, high, low))
     cycle = ShadowCycle(cache, RuntimeState(journal=journal), CAPS, PROFILE)
-    assert cycle.unresolved_symbols() == ["BTC/USDT:USDT", SYMBOL]
+    # от самой старой висящей строки: target вставлен первым
+    assert cycle.unresolved_symbols() == [SYMBOL, "BTC/USDT:USDT"]
     assert cycle.resolve_counterfactuals(SYMBOL) == 1
     assert returned == ["target"] and cache.calls == [SYMBOL]
     outcomes = dict(journal.execute("SELECT decision_id, hypothetical_outcome FROM counterfactuals"))
