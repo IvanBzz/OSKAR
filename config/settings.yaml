@@ -46,8 +46,9 @@ telegram:
 
 agents:                            # model_cmd не подключен (claude_cli зовет `claude -p` сам),
                                    # analyst не подключен (агента еще нет); бюджеты scout/trader читаются
-  scout:  { model_cmd: "claude -p", daily_budget: 30, hourly_budget: 6 }
-  trader: { model_cmd: "claude -p", daily_budget: 20 }
+  # Иван 2026-10-16: ускорение, больше реальных кейсов (было scout 30/6, trader 20)
+  scout:  { model_cmd: "claude -p", daily_budget: 60, hourly_budget: 10 }
+  trader: { model_cmd: "claude -p", daily_budget: 30 }
   analyst: { model_cmd: "claude -p", daily_budget: 3 }
   # Sentinel живет в Hermes, бюджет там
 
