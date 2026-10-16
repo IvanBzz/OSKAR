@@ -50,7 +50,8 @@ def _combos_block(combos) -> str:
 def build_prompt(candidate: SetupCandidate, scout_verdict: SetupVerdict, combos=None) -> str:
     return (
         _template()
-        # блок J: тень свечей в промпт не идет — промпт тот же, что без нее
+        # блок J: тень свечей в промпт не идет — промпт тот же, что без нее; от промпта
+        # до J отличается одной строкой "schema_version": 2 (эталон в tests/unit/test_candles)
         .replace("{candidate_json}", candidate.model_dump_json(indent=2, exclude=PROMPT_EXCLUDE))
         .replace("{scout_verdict}", scout_verdict.model_dump_json(indent=2))
         .replace("{entry_options}", _options_line(candidate.entry_options))

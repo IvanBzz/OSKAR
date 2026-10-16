@@ -37,7 +37,8 @@ def build_prompt(
 ) -> str:
     return (
         _template()
-        # блок J: тень свечей в промпт не идет — промпт тот же, что без нее
+        # блок J: тень свечей в промпт не идет — промпт тот же, что без нее; от промпта
+        # до J отличается одной строкой "schema_version": 2 (эталон в tests/unit/test_candles)
         .replace("{candidate_json}", candidate.model_dump_json(indent=2, exclude=PROMPT_EXCLUDE))
         .replace("{market_context}", market_context or NEUTRAL_CONTEXT)
         .replace("{knowledge}", knowledge or "(библиотека недоступна)")

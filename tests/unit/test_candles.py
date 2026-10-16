@@ -1,14 +1,18 @@
 """Блок J: теневой детектор свечных паттернов.
 
-Эталонные свечи (позитив/негатив) на каждый паттерн, границы порогов, сверка с pandas-ta,
-контекст (экстремум, движение в ATR), отсутствие look-ahead и главное — инвариант ст. 5:
-тень не меняет торгового поведения (candle_pattern пуст, вердикт лестницы, журнал цикла и
-промпты Scout/Trader те же, что без блока J, бит-в-бит).
+Эталонные свечи (позитив/негатив) на каждый паттерн, границы порогов, сверка с pandas-ta
+(и где определения расходятся намеренно), контекст (экстремум, движение в ATR), отсутствие
+look-ahead и главное — инвариант ст. 5: тень не меняет торгового поведения (candle_pattern
+пуст; вердикт лестницы, журнал цикла и промпты Scout/Trader с тенью и без нее одинаковы
+бит-в-бит). Промпт против промпта ДО блока J — отличие ровно в строке "schema_version"
+(2 вместо 1, bump контракта по ст. 2 п. 4): эталонный тест на JSON, снятый кодом до J.
 """
 
+import difflib
 import json
 import logging
 import re
+from datetime import UTC, datetime
 from typing import get_args
 
 import numpy as np
@@ -23,7 +27,11 @@ from oskar.contracts.schemas import (
     CandleFrame,
     CandlePattern,
     CandleShadow,
+    FvgInfo,
+    ObInfo,
+    PriceOption,
     SetupCandidate,
+    SetupFeatures,
 )
 from oskar.core import cycle as cycle_mod
 from oskar.core.cycle import CycleConfig, ShadowCycle
@@ -237,6 +245,8 @@ def test_doji_matches_pandas_ta_on_equal_ranges():
 
 
 def test_inside_bar_matches_pandas_ta():
+    """Только на непрерывных ценах, где равные границы — мера нуль. Совпадающая граница
+    (там определения расходятся) — тесты ниже."""
     import pandas_ta as ta
 
     df = _random_ohlc(400, 2, lambda rng, n: rng.uniform(0.2, 2.0, n))
@@ -244,6 +254,78 @@ def test_inside_bar_matches_pandas_ta():
     mine = np.array(["inside_bar" in detect_patterns(df, i) for i in range(len(df))])
     assert mine[1:].sum() >= 10
     assert (mine[1:] == lib[1:]).all()  # [0] у pandas-ta сравнивается с последней (np.roll)
+
+
+def _lib_flag(fn, df: pd.DataFrame) -> bool:
+    """Флаг pandas-ta на последней свече."""
+    return bool(fn(df.open, df.high, df.low, df.close).iloc[-1] != 0)
+
+
+def test_inside_bar_equal_boundary_diverges_from_pandas_ta_on_purpose():
+    """Ревью J (2026-10-16): pandas-ta cdl_inside строг с обеих сторон (high < и low >), у нас
+    хватает одной строгой границы: равная high или low у нас inside, у pandas-ta нет.
+    Намеренно — определение price action (high <= и low >= предыдущей)."""
+    import pandas_ta as ta
+
+    mother = (100, 105, 95, 102)
+    cases = {  # вторая свеча: (у нас inside, у pandas-ta inside)
+        "equal_high": ((101, 105, 96, 102.5), True, False),  # пример из ревью
+        "equal_low": ((101, 104, 95, 102.5), True, False),
+        "both_equal": ((101, 105, 95, 102.5), False, False),
+        "strict": ((101, 104, 96, 102.5), True, True),
+        "high_outside": ((101, 105.5, 96, 102.5), False, False),
+    }
+    for name, (bar, mine, lib) in cases.items():
+        df = bars(mother, bar)
+        assert ("inside_bar" in detect_patterns(df)) is mine, name
+        assert _lib_flag(ta.cdl_inside, df) is lib, name
+
+
+def _tick_ohlc(n: int, seed: int, tick: float = 0.25) -> pd.DataFrame:
+    """Цены на сетке тика, как на бирже: равные high/low соседних свечей — обычное дело."""
+    rng = np.random.default_rng(seed)
+    mid = 400 + np.cumsum(rng.integers(-2, 3, n))
+    low, high = mid - rng.integers(1, 4, n), mid + rng.integers(1, 4, n)
+    open_, close = rng.integers(low, high + 1), rng.integers(low, high + 1)
+    return pd.DataFrame({"ts": T0 + np.arange(n) * M15, "open": open_ * tick, "high": high * tick,
+                         "low": low * tick, "close": close * tick, "volume": 1000.0})
+
+
+def test_inside_bar_on_tick_prices_differs_from_pandas_ta_only_on_one_equal_boundary():
+    """На тиковой сетке расхождение с pandas-ta есть и ровно там, где одна граница равна,
+    другая строго внутри, — и всегда в сторону «у нас inside» (у нас срабатывает чаще)."""
+    import pandas_ta as ta
+
+    df = _tick_ohlc(600, 5)
+    lib = (ta.cdl_inside(df.open, df.high, df.low, df.close) != 0).to_numpy()[1:]
+    mine = np.array(["inside_bar" in detect_patterns(df, i) for i in range(1, len(df))])
+    h, lo = df["high"].to_numpy(), df["low"].to_numpy()
+    within = (h[1:] <= h[:-1]) & (lo[1:] >= lo[:-1])
+    one_equal = within & ((h[1:] == h[:-1]) != (lo[1:] == lo[:-1]))
+    assert ((mine != lib) == one_equal).all()
+    assert mine[one_equal].all() and not lib[one_equal].any()
+    assert one_equal.sum() >= 10 and (mine & lib).sum() >= 10  # проверка не пустая
+
+
+def test_doji_differs_from_pandas_ta_by_design():
+    """Ревью J (2026-10-16): pandas-ta cdl_doji — тело < 10% СРЕДНЕГО диапазона 10 свечей
+    (строго), у нас — <= 10% диапазона самой свечи. Совпадают только при равных диапазонах
+    (тест выше); вне этого расхождения в обе стороны."""
+    import pandas_ta as ta
+
+    narrow, wide = (100, 100.5, 99.5, 100.3), (100, 105, 95, 103)
+    cases = {  # последняя свеча: (у нас доджи, у pandas-ta доджи)
+        # тело 8% своего диапазона, но 0.8 > 10% среднего (1.9)
+        "wide_doji_among_narrow": ([narrow] * 9 + [(100, 105, 95, 100.8)], True, False),
+        # тело 40% своего диапазона, но 0.4 < 10% среднего (9.1)
+        "narrow_bar_among_wide": ([wide] * 9 + [(100, 100.5, 99.5, 100.4)], False, True),
+        # ровно 10%: у нас граница включительна, у pandas-ta строгая
+        "exactly_10pct": ([wide] * 9 + [(100, 105, 95, 101)], True, False),
+    }
+    for name, (rows, mine, lib) in cases.items():
+        df = bars(*rows)
+        assert ("doji" in detect_patterns(df)) is mine, name
+        assert _lib_flag(ta.cdl_doji, df) is lib, name
 
 
 # ------------------------------------------------------------------- контекст
@@ -415,6 +497,8 @@ def test_shadow_is_not_a_confluence_vote_but_candle_pattern_would_be():
 
 
 def test_agent_prompts_identical_with_shadow():
+    """Промпт с тенью == промпт того же кандидата v2 без тени. Против промпта ДО блока J —
+    эталонные тесты ниже."""
     plain = agent_candidate()
     j = with_shadow(plain)
     for p_plain, p_j in (
@@ -425,6 +509,151 @@ def test_agent_prompts_identical_with_shadow():
         assert "candle_patterns_shadow" not in p_j and '"candle_pattern": null' in p_j
         slim = j.model_dump_json(indent=2, exclude=PROMPT_EXCLUDE)
         assert slim in p_j and set(json.loads(slim)["features"]) == V1_FEATURE_KEYS
+
+
+# Эталон (ревью J, 2026-10-16): JSON кандидата golden_candidate() в промпте ДО блока J — снят
+# кодом 0937dbe (родитель J, SetupCandidate v1). НЕ перегенерировать текущим кодом: смысл
+# эталона — сравнение с промптом до J.
+PRE_J_CANDIDATE_JSON = """{
+  "schema_version": 1,
+  "id": "SOLUSDTUSDT-1700000000000-short",
+  "ts": "2026-10-16T09:30:00Z",
+  "symbol": "SOL/USDT:USDT",
+  "direction": "short",
+  "setup_type": "confluence",
+  "timeframe": "15m",
+  "score": 78,
+  "features": {
+    "rsi": 61.25,
+    "atr_pct": 0.842,
+    "trend_mtf": "bearish",
+    "fvg": {
+      "top": 101.8,
+      "bottom": 100.9,
+      "mitigated": false,
+      "timeframe": "15m"
+    },
+    "ob": {
+      "top": 102.6,
+      "bottom": 101.9,
+      "tested": true,
+      "timeframe": "1h"
+    },
+    "swept_liquidity": true,
+    "candle_pattern": null
+  },
+  "entry_options": [
+    {
+      "id": "e-market",
+      "kind": "market",
+      "price": 100.0,
+      "note": ""
+    },
+    {
+      "id": "e-fvg",
+      "kind": "limit_fvg_edge",
+      "price": 101.8,
+      "note": "край FVG"
+    }
+  ],
+  "sl_options": [
+    {
+      "id": "s-swing",
+      "kind": "swing_high",
+      "price": 103.5,
+      "note": ""
+    }
+  ],
+  "tp_options": [
+    {
+      "id": "t-liq",
+      "kind": "liquidity_pool",
+      "price": 95.0,
+      "note": ""
+    },
+    {
+      "id": "t-r2",
+      "kind": "r_multiple",
+      "price": 93.0,
+      "note": ""
+    }
+  ],
+  "detector_versions": {
+    "smc": "smc-1",
+    "score": "score-1"
+  }
+}"""
+SCHEMA_LINE_ONLY = ['-   "schema_version": 1,', '+   "schema_version": 2,']  # ndiff: "- " + строка
+
+
+def golden_candidate() -> SetupCandidate:
+    """Кандидат эталона: все поля v1 заполнены, ts фиксирован."""
+    return SetupCandidate(
+        id="SOLUSDTUSDT-1700000000000-short",
+        ts=datetime(2026, 10, 16, 9, 30, tzinfo=UTC),
+        symbol=SYM,
+        direction="short",
+        setup_type="confluence",
+        timeframe="15m",
+        score=78,
+        features=SetupFeatures(
+            rsi=61.25, atr_pct=0.842, trend_mtf="bearish",
+            fvg=FvgInfo(top=101.8, bottom=100.9, mitigated=False, timeframe="15m"),
+            ob=ObInfo(top=102.6, bottom=101.9, tested=True, timeframe="1h"),
+            swept_liquidity=True,
+        ),
+        entry_options=[PriceOption(id="e-market", kind="market", price=100.0),
+                       PriceOption(id="e-fvg", kind="limit_fvg_edge", price=101.8, note="край FVG")],
+        sl_options=[PriceOption(id="s-swing", kind="swing_high", price=103.5)],
+        tp_options=[PriceOption(id="t-liq", kind="liquidity_pool", price=95.0),
+                    PriceOption(id="t-r2", kind="r_multiple", price=93.0)],
+        detector_versions={"smc": "smc-1", "score": "score-1"},
+    )
+
+
+class _PreJCandidate:
+    """Кандидат, который рендерится в промпт как до блока J: model_dump_json отдает эталон
+    v1, остальное (меню опций) — от настоящего. Шаблоны и прочие подстановки блок J не
+    трогал (git diff 0937dbe..15d0ee0), поэтому build_prompt(_PreJCandidate(c)) = промпт до J.
+    Сверено 2026-10-16 и полным рендером кодом 0937dbe: отличие — та же одна строка."""
+
+    def __init__(self, c: SetupCandidate):
+        self._c = c
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def model_dump_json(self, **_kw) -> str:
+        return PRE_J_CANDIDATE_JSON
+
+
+def _changed_lines(before: str, after: str) -> list[str]:
+    return [ln for ln in difflib.ndiff(before.splitlines(), after.splitlines()) if ln[:1] in "+-"]
+
+
+def test_prompt_candidate_json_equals_pre_j_except_schema_version():
+    c = golden_candidate()
+    for cand in (c, with_shadow(c)):
+        now = cand.model_dump_json(indent=2, exclude=PROMPT_EXCLUDE)
+        assert _changed_lines(PRE_J_CANDIDATE_JSON, now) == SCHEMA_LINE_ONLY
+    # контроль чувствительности: без PROMPT_EXCLUDE тень протекла бы в промпт
+    leaked = with_shadow(c).model_dump_json(indent=2)
+    assert len(_changed_lines(PRE_J_CANDIDATE_JSON, leaked)) > len(SCHEMA_LINE_ONLY)
+
+
+def _agent_prompts(c) -> dict[str, str]:
+    return {"scout": scout_mod.build_prompt(c, "ctx", "kn"),
+            "trader": trader_mod.build_prompt(c, scout_verdict())}
+
+
+def test_agent_prompts_equal_pre_j_except_schema_version():
+    """Ревью J (2026-10-16): промпты Scout/Trader с тенью против промптов ДО блока J —
+    отличие ровно в строке "schema_version" (поэтому prompt_sha у новых вызовов другой)."""
+    c = with_shadow(golden_candidate())
+    now, pre = _agent_prompts(c), _agent_prompts(_PreJCandidate(c))
+    for agent in ("scout", "trader"):
+        assert PRE_J_CANDIDATE_JSON in pre[agent]  # эталон реально подставлен в шаблон
+        assert _changed_lines(pre[agent], now[agent]) == SCHEMA_LINE_ONLY, agent
 
 
 # ------------------------------------------------------------------- цикл
@@ -478,10 +707,17 @@ def _no_ts(prompt: str) -> str:
     return re.sub(r'"ts": "[^"]+"', '"ts": "<now>"', prompt)  # ts кандидата — время создания
 
 
+def _prompt_shape(c: SetupCandidate) -> tuple:
+    """Версия и ключи JSON кандидата в промпте (верхний уровень и features)."""
+    d = json.loads(c.model_dump_json(exclude=PROMPT_EXCLUDE))
+    return d["schema_version"], set(d), set(d["features"])
+
+
 def _recording_escalator(prompts: list):
     def esc(c):
         prompts.append((_no_ts(scout_mod.build_prompt(c, "", "")),
-                        _no_ts(trader_mod.build_prompt(c, scout_verdict()))))
+                        _no_ts(trader_mod.build_prompt(c, scout_verdict())),
+                        _prompt_shape(c)))
         return EscalationResult(outcome="scout_pass", detail="stub")
     return esc
 
@@ -489,7 +725,8 @@ def _recording_escalator(prompts: list):
 def test_cycle_behaviour_identical_without_block_j(tmp_path, monkeypatch):
     """Ст. 5: тот же рынок с тенью и без нее -> те же отчеты, решения, когорты, цены
     counterfactual, вердикты лестницы, промпты эскалации и запросы свечей. Отличие в
-    журнале — только само поле тени."""
+    журнале — только само поле тени. JSON кандидата в промптах эскалации — той же формы,
+    что до блока J (ключи эталона, schema_version 2); побайтно с до-J — эталонные тесты."""
     full = market_df(160, seed=3)
     runs = {}
     for name in ("j", "no_j"):
@@ -519,6 +756,8 @@ def test_cycle_behaviour_identical_without_block_j(tmp_path, monkeypatch):
     reports = [r[0] for r in runs["j"]]
     assert any(r.risk_passed for r in reports) and any(r.candidates > r.risk_passed for r in reports)
     assert sum(len(r[2]) for r in runs["j"]) >= 1  # эскалация была и промпт сверен
+    pre_j_shape = (2, set(json.loads(PRE_J_CANDIDATE_JSON)), V1_FEATURE_KEYS)
+    assert all(p[2] == pre_j_shape for r in runs["j"] for p in r[2])
 
 
 def test_cycle_shadow_marks_signal_bar(tmp_path):
