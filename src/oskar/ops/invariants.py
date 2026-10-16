@@ -313,9 +313,13 @@ def cf_v2_coverage_violations(
     """INV-006 (блок R3, 2026-10-16): CF резолвера v2 с исходом имеют полное покрытие окна.
 
     v1 превращал отсутствие свечей в expired_flat. v2 пишет исход только при барах подряд от
-    начала окна до бара исхода и доказательство в outcome_detail (start_ms, last_bar_ms, bars,
-    tf_ms); метрика перепроверяет его по журналу. no_data — честное «не измерено», не в счет.
-    Окно: {hours: N} — разрешенные за N часов; {closed_trades: N} — последние N разрешенных."""
+    бара решения до бара исхода и доказательство в outcome_detail; метрика перепроверяет его
+    по журналу (core/cf_resolver.coverage_problem). Ревью 2026-10-16: проверка «бары = окно» по
+    индексу цикла была тождеством — теперь bars резолвер считает по самим свечам, а время
+    разрешения сверяется с часами БД (resolved_at не раньше закрытия бара исхода и конца окна
+    у horizon_close/unfilled). no_data — честное «не измерено», не в счет: их число по причинам
+    — в detail для сведения. Окно: {hours: N} — разрешенные за N часов; {closed_trades: N} —
+    последние N разрешенных."""
     from oskar.core.cf_resolver import CF_RESOLVER_VERSION, COVERED_OUTCOMES, coverage_problem
 
     cols = {r[1] for r in journal.execute("PRAGMA table_info(counterfactuals)")}
@@ -334,13 +338,16 @@ def cf_v2_coverage_violations(
     if window.closed_trades is not None:
         picked = rows[: window.closed_trades]
         full = len(picked) >= window.closed_trades
+        since = min((_parse_iso(r["resolved_at"]) or _EPOCH for r in picked), default=None)
     else:
-        cutoff = now - timedelta(hours=float(window.hours or 0))
-        picked = [r for r in rows if (_parse_iso(r["resolved_at"]) or _EPOCH) >= cutoff]
+        since = now - timedelta(hours=float(window.hours or 0))
+        picked = [r for r in rows if (_parse_iso(r["resolved_at"]) or _EPOCH) >= since]
         full = len(picked) >= MIN_TRADES_IN_HOURS_WINDOW
     bad = []
     for r in picked:
-        why = coverage_problem(r["outcome_detail"], r["hypothetical_outcome"])
+        resolved = _parse_iso(r["resolved_at"])
+        resolved_ms = None if resolved is None else int(resolved.timestamp() * 1000)
+        why = coverage_problem(r["outcome_detail"], r["hypothetical_outcome"], resolved_ms)
         if why is None and r["realized_r"] is None:
             why = "нет realized_r"
         if why is not None:
@@ -350,7 +357,32 @@ def cf_v2_coverage_violations(
         detail += " (" + "; ".join(bad[:10]) + (f" и еще {len(bad) - 10}" if len(bad) > 10 else "") + ")"
     if not full:
         detail += "; в окне нет разрешенных CF v2" if not picked else "; окно неполное"
+    detail += _cf_no_data_note(journal, CF_RESOLVER_VERSION, since, now)
     return Measurement(len(bad), len(picked), full, detail)
+
+
+def _cf_no_data_note(journal: sqlite3.Connection, version: int, since: datetime | None, now: datetime) -> str:
+    """no_data CF v2 за окно по причинам (gap — качество свечей, window_before_cache — старые
+    висящие строки): для сведения, в значение INV-006 не входит."""
+    if since is None:
+        return ""
+    reasons: dict[str, int] = {}
+    for r in journal.execute(
+        "SELECT outcome_detail, resolved_at FROM counterfactuals "
+        "WHERE resolver_version = ? AND hypothetical_outcome = 'no_data'",
+        (version,),
+    ):
+        if not since <= (_parse_iso(r["resolved_at"]) or _EPOCH) <= now:
+            continue
+        try:
+            reason = str(json.loads(r["outcome_detail"] or "").get("reason") or "?")
+        except (TypeError, ValueError, AttributeError):
+            reason = "?"
+        reasons[reason] = reasons.get(reason, 0) + 1
+    if not reasons:
+        return "; no_data за окно: 0"
+    parts = ", ".join(f"{k} {v}" for k, v in sorted(reasons.items()))
+    return f"; no_data за окно: {sum(reasons.values())} ({parts})"
 
 
 METRICS: dict[str, MetricFn] = {

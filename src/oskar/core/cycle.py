@@ -14,7 +14,13 @@ import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from oskar.core.cf_resolver import CF_RESOLVER_VERSION, ResolverParams, resolve
+from oskar.core.cf_resolver import (
+    CF_RESOLVER_VERSION,
+    GAP_CONFIRM_BARS,
+    Resolution,
+    ResolverParams,
+    resolve,
+)
 from oskar.core.state import RuntimeState
 from oskar.data.candles import CandleCache
 from oskar.detect.indicators import IndicatorSet, compute, multi_tf_trend
@@ -100,6 +106,9 @@ class ShadowCycle:
         self._card_sink = card_sink
         self._escalator = escalator
         self._last_bar: dict[str, int] = {}  # symbol -> bar_index последнего кандидата
+        # ревью R3 2026-10-16: дыра в свечах CF -> (missing_ms, последний бар кеша при первой
+        # встрече). no_data пишется, только когда дыра пережила GAP_CONFIRM_BARS новых баров
+        self._cf_gaps: dict[int, tuple[int, int]] = {}
 
     def run_once(self, symbols: list[str], equity_usd: float) -> CycleReport:
         report = CycleReport()
@@ -237,8 +246,11 @@ class ShadowCycle:
         """Дорешивает висящие counterfactuals символа резолвером v2 (core/cf_resolver.py).
 
         Свечи — тот же вызов кеша, что у цикла (без новых запросов к бирже): последние
-        candles_limit закрытых баров. Окно не покрыто — строка ждет; окно старше кеша или
-        дыра в свечах — no_data. Исход пишется с resolver_version=2, R после комиссий и
+        candles_limit закрытых баров. Окно не покрыто — строка ждет; окно старше кеша — no_data.
+        Дыра в свечах — тоже ждет (ревью 2026-10-16: одиночный неполный ответ klines навсегда
+        превращал строку в no_data): no_data(gap), только если та же дыра осталась, пока кеш
+        продвинулся на GAP_CONFIRM_BARS баров. Память о дырах — в процессе: рестарт демона
+        лишь продлевает ожидание. Исход пишется с resolver_version=2, R после комиссий и
         деталями (покрытие, вход, выход, ambiguous) в outcome_detail."""
         j = self._state.journal
         # Ревью 2026-10-13, E.4: отбор в SQL не загружает весь хвост на каждый символ.
@@ -269,6 +281,7 @@ class ShadowCycle:
                 frames[tf] = self._cache.get(symbol, tf, self._cfg.candles_limit)
             # неизвестный ТФ — без запроса к бирже: resolve() вернет no_data (bad_candidate)
             res = resolve(cand, r["entry_price"], r["sl_price"], r["tp_price"], frames.get(tf), params)
+            res = self._confirm_gap(r["id"], res)
             if res is not None:
                 results.append((res.outcome, res.detail_json(), res.realized_r, CF_RESOLVER_VERSION,
                                 r["id"]))
@@ -282,3 +295,18 @@ class ShadowCycle:
                     results,
                 )
         return len(results)
+
+    def _confirm_gap(self, row_id: int, res: Resolution | None) -> Resolution | None:
+        """no_data(gap) -> None, пока та же дыра не пережила GAP_CONFIRM_BARS новых баров кеша
+        (каждый новый бар — свежий ответ klines); иначе исход как есть."""
+        if res is None or res.outcome != "no_data" or res.detail.get("reason") != "gap":
+            self._cf_gaps.pop(row_id, None)
+            return res
+        missing, last = int(res.detail["missing_ms"]), int(res.detail["cache_last_ms"])
+        seen = self._cf_gaps.get(row_id)
+        if seen is None or seen[0] != missing:
+            seen = self._cf_gaps[row_id] = (missing, last)
+        if last - seen[1] < GAP_CONFIRM_BARS * int(res.detail["tf_ms"]):
+            return None  # ждем: дыра могла быть разовым неполным ответом биржи
+        self._cf_gaps.pop(row_id, None)
+        return Resolution(res.outcome, None, {**res.detail, "gap_first_seen_last_ms": seen[1]})

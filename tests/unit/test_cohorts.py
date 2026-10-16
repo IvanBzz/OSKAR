@@ -25,8 +25,10 @@ def iso(dt: datetime) -> str:
 
 
 def add(j, did, *, cohort="shadow", outcome=None, r=None, version=2, at=T0, episode=None,
-        ambiguous=False, direction="long"):
-    detail = json.dumps({"ambiguous": ["sl_tp_same_bar"] if ambiguous else []})
+        ambiguous=False, direction="long", flags=None):
+    if flags is None:
+        flags = ["sl_tp_same_bar"] if ambiguous else []
+    detail = json.dumps({"ambiguous": flags})
     j.execute(
         "INSERT INTO counterfactuals (decision_id, cohort, candidate_json, entry_price, sl_price, tp_price, "
         "hypothetical_outcome, resolver_version, realized_r, outcome_detail, episode_id) "
@@ -128,6 +130,31 @@ def test_cli_render_v2_lines(journal, capsys):
     assert "shadow v2: n=7 resolved=6 pending=1 episodes=5 ambiguous=1" in out
     assert "tp_hit 33.3% | sl_hit 33.3% | unfilled 16.7% | no_data 16.7%" in out
     assert "R per trade  : n=5 mean R +0.400" in out and "R per episode: n=3 mean R +0.333" in out
+
+
+def test_pre_decision_rows_get_separate_r_line(tmp_path, capsys):
+    """Ревью 2026-10-16 (P1): строки pre_ts/entry_stale — исход мог взять цену до решения —
+    считаются в общей строке R и дополнительно показывается строка R без них."""
+    db = tmp_path / "j.db"
+    j = connect(db)
+    add(j, "p1", outcome="tp_hit", r=2.0, flags=["pre_ts"])
+    add(j, "p2", outcome="tp_hit", r=1.5, at=T0 + timedelta(days=1), flags=["entry_stale"])
+    add(j, "c1", outcome="sl_hit", r=-1.0, at=T0 + timedelta(days=2))
+    add(j, "c2", outcome="tp_hit", r=1.0, at=T0 + timedelta(days=3), flags=["sl_tp_same_bar"])
+    j.commit()
+    j.close()
+    conn = open_readonly(db)
+    (g,) = summarize(load_rows(conn), n_boot=100)
+    conn.close()
+    assert g.flags == {"pre_ts": 1, "entry_stale": 1, "sl_tp_same_bar": 1} and g.ambiguous == 3
+    assert g.trades.n == 4 and g.trades.mean == pytest.approx(3.5 / 4)
+    assert g.clean_trades.n == 2 and g.clean_trades.mean == pytest.approx(0.0)  # c1, c2
+    assert g.clean_episodes.n == 2
+    assert cli_main(db, n_boot=100) == 0
+    out = capsys.readouterr().out
+    assert "ambiguous=3 (entry_stale 1, pre_ts 1, sl_tp_same_bar 1)" in out
+    assert "R per trade   w/o pre_ts,entry_stale: n=2 mean R +0.000" in out
+    assert "R per episode w/o pre_ts,entry_stale: n=2" in out and out.isascii()
 
 
 def test_cli_missing_journal(tmp_path, capsys):

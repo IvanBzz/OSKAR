@@ -41,24 +41,26 @@ def add_counterfactual(journal, decision_id, symbol, direction="long", outcome=N
     )
 
 
-def flat_bars(n, last_high=101, last_low=99):
-    """n баров 15м подряд от начала окна (CREATED_MS — граница бара): 99-101, последний — свой."""
+def flat_bars(n, last_high=101, last_low=99, low=99):
+    """n баров 15м подряд от начала окна (CREATED_MS — граница бара): low-101, последний — свой."""
     highs = [101] * (n - 1) + [last_high]
-    lows = [99] * (n - 1) + [last_low]
+    lows = [low] * (n - 1) + [last_low]
     return pd.DataFrame({
         "ts": [CREATED_MS + i * 900_000 for i in range(n)],
         "open": [100.0] * n, "high": highs, "low": lows, "close": [100.0] * n,
     })
 
 
-@pytest.mark.parametrize(("direction", "high", "low", "bars", "outcome"), [
-    ("long", 106, 99, 2, "tp_hit"),
-    ("long", 106, 97, 2, "sl_hit"),
-    ("short", 101, 94, 2, "tp_hit"),
-    ("short", 103, 94, 2, "sl_hit"),
-    ("long", 101, 99, HORIZON_BARS, "horizon_close"),
+@pytest.mark.parametrize(("direction", "high", "low", "bars", "base_low", "outcome"), [
+    ("long", 106, 99, 2, 99, "tp_hit"),
+    ("long", 106, 97, 2, 99, "sl_hit"),
+    ("short", 101, 94, 2, 99, "tp_hit"),
+    ("short", 103, 94, 2, 99, "sl_hit"),
+    # ни разу не ниже входа 100 — по времени не режется (ревью 2026-10-16: duration-stop по
+    # экстремуму бара, как тики монитора), горизонт закрывается по close
+    ("long", 101, 100, HORIZON_BARS, 100, "horizon_close"),
 ])
-def test_only_requested_unresolved_symbol_is_loaded(tmp_path, direction, high, low, bars, outcome):
+def test_only_requested_unresolved_symbol_is_loaded(tmp_path, direction, high, low, bars, base_low, outcome):
     journal = connect(tmp_path / "j.db")
     add_counterfactual(journal, "target", SYMBOL, direction)
     add_counterfactual(journal, "resolved", SYMBOL, direction, "tp_hit")
@@ -76,7 +78,7 @@ def test_only_requested_unresolved_symbol_is_loaded(tmp_path, direction, high, l
         return original_factory(cursor, row)
 
     journal.row_factory = track_rows
-    cache = Cache(flat_bars(bars, high, low))
+    cache = Cache(flat_bars(bars, high, low, low=base_low))
     cycle = ShadowCycle(cache, RuntimeState(journal=journal), CAPS, PROFILE)
     # от самой старой висящей строки: target вставлен первым
     assert cycle.unresolved_symbols() == [SYMBOL, "BTC/USDT:USDT"]

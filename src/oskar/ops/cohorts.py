@@ -14,6 +14,11 @@
 R — после комиссий в риск-единицах сайзинга (стоп = -1R), unfilled = 0R (не вошли — нет
 P&L). У резолвера v1 R нет: старые исходы не переписываются.
 Цифры отсюда в промпты агентов не идут (ст. 3 п. 4: статистика — только для анализа).
+
+Ревью 2026-10-16 (P1): движение цены до wall-clock ts кандидата — чужое прошлое. Строки с
+пометками pre_ts (выход/касание лимитки в баре решения) и entry_stale (market-вход по close
+сигнального бара при лаге > 5 мин) показываются отдельной строкой R «без них». pre_ts
+зависит от момента исхода, поэтому эта строка — проверка чувствительности, не замена общей.
 """
 
 import json
@@ -31,6 +36,8 @@ CI_LEVEL = 0.95
 # обязательные колонки долей; прочие исходы (duration_stop, horizon_close, expired_flat) — если есть
 MAIN_OUTCOMES = ("tp_hit", "sl_hit", "unfilled", "no_data")
 OUTCOME_ORDER = MAIN_OUTCOMES + ("duration_stop", "horizon_close", "expired_flat")
+# пометки core/cf_resolver.py: исход мог зависеть от цены до решения (модуль без pandas)
+PRE_DECISION_FLAGS = ("pre_ts", "entry_stale")
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,11 @@ class CfRow:
     ts_ms: int  # время кандидата (порядок внутри эпизода)
     block: str  # UTC-сутки начала эпизода — блок бутстрепа
     ambiguous: bool
+    flags: tuple[str, ...] = ()  # пометки ambiguous из outcome_detail
+
+    @property
+    def pre_decision(self) -> bool:
+        return any(f in PRE_DECISION_FLAGS for f in self.flags)
 
 
 @dataclass
@@ -63,8 +75,12 @@ class GroupStats:
     ambiguous: int = 0
     n_episodes: int = 0
     counts: dict[str, int] = field(default_factory=dict)
+    flags: dict[str, int] = field(default_factory=dict)
     trades: RStats = field(default_factory=RStats)
     episodes: RStats = field(default_factory=RStats)
+    # без строк pre_ts/entry_stale (ревью 2026-10-16)
+    clean_trades: RStats = field(default_factory=RStats)
+    clean_episodes: RStats = field(default_factory=RStats)
 
     @property
     def resolved(self) -> int:
@@ -96,11 +112,12 @@ def _ts_ms(candidate_json: str, created_at: str | None) -> int:
         return 0
 
 
-def _is_ambiguous(detail: str | None) -> bool:
+def _flags(detail: str | None) -> tuple[str, ...]:
     try:
-        return bool(json.loads(detail or "").get("ambiguous"))
+        flags = json.loads(detail or "").get("ambiguous") or []
     except (TypeError, ValueError, AttributeError):
-        return False
+        return ()
+    return tuple(str(f) for f in flags) if isinstance(flags, list) else ()
 
 
 def load_rows(conn: sqlite3.Connection) -> list[CfRow]:
@@ -123,12 +140,13 @@ def load_rows(conn: sqlite3.Connection) -> list[CfRow]:
             start = episode_start_ms(episode) if episode else ts_ms
         except (ValueError, IndexError):
             start = ts_ms
+        flags = _flags(r["outcome_detail"])
         out.append(CfRow(
             id=int(r["id"]), cohort=str(r["cohort"]), version=int(r["resolver_version"] or 1),
             outcome=r["hypothetical_outcome"],
             r=None if r["realized_r"] is None else float(r["realized_r"]),
             episode=episode or f"row:{r['id']}", ts_ms=ts_ms, block=_day(start),
-            ambiguous=_is_ambiguous(r["outcome_detail"]),
+            ambiguous=bool(flags), flags=flags,
         ))
     return out
 
@@ -199,10 +217,14 @@ def summarize(rows: list[CfRow], n_boot: int = DEFAULT_BOOT, seed: int = DEFAULT
             else:
                 g.counts[x.outcome] = g.counts.get(x.outcome, 0) + 1
             g.ambiguous += int(x.ambiguous)
+            for f in x.flags:
+                g.flags[f] = g.flags.get(f, 0) + 1
         g.trades = r_stats(xs, n_boot, seed)
         firsts = first_of_episodes(xs)
         g.n_episodes = len(firsts)
         g.episodes = r_stats(firsts, n_boot, seed)
+        g.clean_trades = r_stats([x for x in xs if not x.pre_decision], n_boot, seed)
+        g.clean_episodes = r_stats([x for x in firsts if not x.pre_decision], n_boot, seed)
         out.append(g)
     return out
 
@@ -224,14 +246,17 @@ def render(groups: list[GroupStats], *, source: str, n_boot: int, seed: int) -> 
         "R after fees in sizing risk units (stop = -1R), unfilled = 0R; "
         f"CI95: bootstrap over UTC days of episode start ({n_boot} resamples, seed {seed})",
         "outcome shares: of resolved rows; per-episode R: first row of each episode",
+        "w/o pre_ts,entry_stale: rows whose outcome may use price before the decision ts dropped "
+        "(sensitivity check, the flag depends on exit timing)",
     ]
     if not groups:
         lines.append("no counterfactuals in the journal")
         return "\n".join(lines)
     for g in groups:
         lines.append("")
+        flags = ", ".join(f"{f} {n}" for f, n in sorted(g.flags.items()))
         lines.append(f"{g.cohort} v{g.version}: n={g.n} resolved={g.resolved} pending={g.pending} "
-                     f"episodes={g.n_episodes} ambiguous={g.ambiguous}")
+                     f"episodes={g.n_episodes} ambiguous={g.ambiguous}" + (f" ({flags})" if flags else ""))
         shown = [o for o in OUTCOME_ORDER if o in MAIN_OUTCOMES or g.counts.get(o)]
         shown += sorted(o for o in g.counts if o not in OUTCOME_ORDER)
         denom = g.resolved
@@ -242,6 +267,8 @@ def render(groups: list[GroupStats], *, source: str, n_boot: int, seed: int) -> 
             continue
         lines.append(_r_line("R per trade  ", g.trades))
         lines.append(_r_line("R per episode", g.episodes))
+        lines.append(_r_line("R per trade   w/o pre_ts,entry_stale", g.clean_trades))
+        lines.append(_r_line("R per episode w/o pre_ts,entry_stale", g.clean_episodes))
     return "\n".join(lines)
 
 

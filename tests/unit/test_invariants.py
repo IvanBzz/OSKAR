@@ -336,16 +336,20 @@ def _cf(j, did, outcome, *, version=2, resolved=NOW - timedelta(hours=1), detail
     j.commit()
 
 
+CF_START = 1_791_889_200_000  # 2026-10-13 11:00 UTC: начало окна синтетики INV-006
+CF_TF = 900_000
+
+
 def _resolved_detail(outcome):
-    """Деталь, которую пишет резолвер v2 — настоящим прогоном на синтетике."""
+    """Деталь, которую пишет резолвер v2 — настоящим прогоном на синтетике (победитель: цена
+    не хуже входа, без duration-stop)."""
     import pandas as pd
 
     from oskar.core.cf_resolver import resolve
 
-    start = 1_791_889_200_000
     cand = {"id": "x", "direction": "long", "timeframe": "15m", "ts": "2026-10-13T11:00:00Z"}
-    df = pd.DataFrame({"ts": [start + k * 900_000 for k in range(60)], "open": 100.0, "high": 100.5,
-                       "low": 99.5, "close": 100.2})
+    df = pd.DataFrame({"ts": [CF_START + k * CF_TF for k in range(60)], "open": 100.2, "high": 100.5,
+                       "low": 100.1, "close": 100.2})
     if outcome == "tp_hit":
         df.loc[3, "high"] = 105.0
     res = resolve(cand, 100.0, 98.0, 104.0, df)
@@ -362,6 +366,7 @@ def test_inv006_v2_outcomes_with_coverage_green(tmp_path):
     _cf(j, "old", "tp_hit", resolved=NOW - timedelta(hours=72))  # вне окна 48 ч
     v = one(j, inv("cf_v2_coverage_violations", {"hours": 48}))
     assert v.status == GREEN and v.value == 0 and v.n == 2
+    assert "no_data за окно: 1 (gap 1)" in v.detail  # для сведения, в значение не входит
 
 
 def test_inv006_outcome_without_proven_coverage_is_red(tmp_path):
@@ -370,12 +375,30 @@ def test_inv006_outcome_without_proven_coverage_is_red(tmp_path):
     j = connect(tmp_path / "j.db")
     _cf(j, "ok", "tp_hit", detail=_resolved_detail("tp_hit"))
     bad = json.loads(_resolved_detail("horizon_close"))
-    bad["bars"] = 40  # «горизонт закрыт» по 40 барам из 48 — выдумка
+    bad["bars"] = 40  # «горизонт закрыт», а в свечах нашлось 40 баров из 48 — выдумка
     _cf(j, "short", "horizon_close", detail=json.dumps(bad))
     _cf(j, "bare", "sl_hit", detail=None)
     v = one(j, inv("cf_v2_coverage_violations", {"hours": 48}))
     assert v.status == RED and v.value == 2
-    assert "horizon_close" in v.detail and "нет записи о покрытии" in v.detail
+    assert "найдено баров 40 при окне 48" in v.detail and "нет записи о покрытии" in v.detail
+
+
+def test_inv006_checks_resolution_time_by_db_clock(tmp_path):
+    """Ревью 2026-10-16 (P2-1): исход раньше закрытия бара исхода по часам БД — формирующаяся
+    свеча; horizon_close раньше конца горизонта — выдумка. Проверка не выводится из detail."""
+    now = datetime(2026, 10, 14, 12, 0, tzinfo=UTC)
+    tp_bar_closes = datetime.fromtimestamp((CF_START + 4 * CF_TF) / 1000, UTC)  # TP на баре 3
+    horizon_end = datetime.fromtimestamp((CF_START + 48 * CF_TF) / 1000, UTC)
+    j = connect(tmp_path / "j.db")
+    _cf(j, "ok", "tp_hit", detail=_resolved_detail("tp_hit"), resolved=tp_bar_closes)
+    _cf(j, "forming", "tp_hit", detail=_resolved_detail("tp_hit"),
+        resolved=tp_bar_closes - timedelta(minutes=5))
+    _cf(j, "hz_early", "horizon_close", detail=_resolved_detail("horizon_close"),
+        resolved=horizon_end - timedelta(minutes=10))
+    v = one(j, inv("cf_v2_coverage_violations", {"hours": 48}), now=now)
+    assert v.status == RED and v.value == 2 and v.n == 3
+    assert "#2 tp_hit: исход записан до закрытия бара исхода" in v.detail
+    assert "#3 horizon_close: исход записан до закрытия бара исхода" in v.detail
 
 
 def test_inv006_no_resolved_v2_is_insufficient(tmp_path):
