@@ -155,6 +155,32 @@ def test_trader_veto(journal, tmp_path):
     assert res.decision.entry_option_id is None
 
 
+def test_trader_prompt_lists_allowed_combos(journal, tmp_path):
+    """Блок F (2026-10-16): в промпте — только допустимые комбинации c1..cN с R:R и
+    стопом; Trader по-прежнему отвечает тремя id (схема TradeDecision та же)."""
+    from types import SimpleNamespace
+
+    from oskar.agents.trader import build_prompt
+
+    c = candidate()
+    opt = {o.id: o for o in c.entry_options + c.sl_options + c.tp_options}
+    combos = [
+        SimpleNamespace(entry=opt["e-fvg"], sl=opt["s-swing"], tp=opt["t-liq"], rr=3.312, sl_pct=1.669),
+        SimpleNamespace(entry=opt["e-market"], sl=opt["s-swing"], tp=opt["t-r0"], rr=1.94, sl_pct=3.5),
+    ]
+    p = build_prompt(c, scout_verdict(), combos)
+    assert "## Допустимые комбинации (только из них)" in p
+    assert "c1: e-fvg / s-swing / t-liq — R:R 3.31, стоп 1.67%" in p
+    assert "c2: e-market / s-swing / t-r0 — R:R 1.94, стоп 3.50%" in p
+    assert "{combos}" not in build_prompt(c, scout_verdict())  # без списка — заглушка, не плейсхолдер
+
+    res = decide(c, scout_verdict(), journal, "r1", limits=LIMITS, combos=combos,
+                 cli_cmd=stub_cmd(tmp_path, trader_json(), "combos"))
+    assert res.decision.entry_option_id == "e-fvg"
+    logged = journal.execute("SELECT prompt FROM analysis_log WHERE agent='trader'").fetchone()[0]
+    assert "c1: e-fvg / s-swing / t-liq" in logged
+
+
 def test_trader_hallucinated_option_rejected(journal, tmp_path):
     with pytest.raises(TraderError, match="nonexistent"):
         decide(

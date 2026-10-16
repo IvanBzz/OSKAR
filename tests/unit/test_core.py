@@ -260,8 +260,125 @@ def test_best_passing_combo_finds_viable_menu_option(state):
         confidence=68, equity_usd=1000.0,
     )
     assert verdict.passed
-    assert (entry, sl) == (101.8, 103.0)  # лучшая по R:R комбинация, не дефолтная
+    assert (entry, sl) == (101.8, 103.0)  # единственная проходная, не дефолтная
     assert verdict.computed.rr_fee_adjusted > 3.0
+
+
+# ---------------------------------------------- блок F (2026-10-16): правило выбора
+
+
+def _short_candidate(sl_options, tp_options, trend="bearish", entries=None):
+    from oskar.contracts.schemas import FvgInfo, ObInfo, PriceOption, SetupCandidate, SetupFeatures
+
+    tf = "15m"
+    return SetupCandidate(
+        id="T-2-short", ts=datetime.now(UTC), symbol="SOL/USDT:USDT",
+        direction="short", setup_type="confluence", timeframe=tf, score=70,
+        features=SetupFeatures(
+            rsi=55.0, trend_mtf=trend,
+            fvg=FvgInfo(top=102.0, bottom=101.0, mitigated=False, timeframe=tf),
+            ob=ObInfo(top=103.0, bottom=102.0, tested=False, timeframe=tf),
+        ),
+        entry_options=entries or [PriceOption(id="e-market", kind="market", price=100.0)],
+        sl_options=sl_options,
+        tp_options=tp_options,
+    )
+
+
+def test_best_passing_combo_takes_min_rr_not_max():
+    """Аудит F: максимум R:R брал дальний тейк (медиана прошедших 11.5R, максимум
+    107.6R) — counterfactual мерил нереалистичные цели. Берется МИНИМАЛЬНЫЙ R:R над капом."""
+    from oskar.contracts.schemas import PriceOption
+    from oskar.core.cycle import best_passing_combo
+
+    cand = _short_candidate(
+        [PriceOption(id="s-swing", kind="swing_high", price=101.5)],
+        [PriceOption(id="t-r1", kind="r_multiple", price=90.0),          # rr 6.53
+         PriceOption(id="t-fvg", kind="next_fvg", price=95.0),           # rr 3.20
+         PriceOption(id="t-liq", kind="liquidity_pool", price=96.0),     # rr 2.53
+         PriceOption(id="t-near", kind="liquidity_pool", price=98.0)],   # rr 1.20 — под капом
+    )
+    verdict, entry, sl, tp = best_passing_combo(cand, CAPS, PROFILE, confidence=68, equity_usd=1000.0)
+    assert verdict.passed and tp == 96.0
+    assert verdict.computed.rr_fee_adjusted == pytest.approx(2.533, abs=1e-3)
+
+
+def test_choice_rule_ties_structural_then_smaller_stop():
+    """При равном R:R структурный тейк раньше R-кратного, затем меньший стоп."""
+    from oskar.contracts.schemas import PriceOption
+    from oskar.risk.combos import evaluate_combos, rank_combos
+
+    tie_kind = _short_candidate(
+        [PriceOption(id="s-swing", kind="swing_high", price=101.5)],
+        [PriceOption(id="t-r0", kind="r_multiple", price=96.0),
+         PriceOption(id="t-liq", kind="liquidity_pool", price=96.0)],
+    )
+    ranked = rank_combos(evaluate_combos(tie_kind, CAPS, PROFILE, confidence=68, equity_usd=1000.0))
+    assert [c.tp.id for c in ranked] == ["t-liq", "t-r0"]
+
+    # SL 102 + TP 94.6 и SL 101 + TP 97.2: оба R:R 2.6 — берется меньший стоп
+    tie_rr = _short_candidate(
+        [PriceOption(id="s-ob", kind="ob_high", price=102.0),
+         PriceOption(id="s-swing", kind="swing_high", price=101.0)],
+        [PriceOption(id="t-fvg", kind="next_fvg", price=94.6),
+         PriceOption(id="t-liq", kind="liquidity_pool", price=97.2)],
+    )
+    ranked = rank_combos(evaluate_combos(tie_rr, CAPS, PROFILE, confidence=68, equity_usd=1000.0))
+    assert ranked[0].rr == ranked[1].rr == 2.6
+    assert (ranked[0].sl.id, ranked[0].tp.id) == ("s-swing", "t-liq")
+
+
+def test_no_passing_combo_reports_most_advanced_failure():
+    """F3: ни одна не прошла — вердикт комбинации, ушедшей по лестнице дальше всех.
+    Раньше — дефолтной (первой): журнал писал sl_distance/R:R, хотя резал confluence_gate."""
+    from oskar.contracts.schemas import PriceOption
+    from oskar.core.cycle import best_passing_combo
+
+    cand = _short_candidate(
+        [PriceOption(id="s-tight", kind="swing_high", price=100.1),    # 0.1% — sl_distance
+         PriceOption(id="s-swing", kind="swing_high", price=101.5)],
+        [PriceOption(id="t-liq", kind="liquidity_pool", price=96.0)],
+        trend="bullish",  # шорт против тренда — confluence_gate режет всё
+    )
+    verdict, entry, sl, tp = best_passing_combo(cand, CAPS, PROFILE, confidence=68, equity_usd=1000.0)
+    assert not verdict.passed
+    failed = next(s.name for s in verdict.steps if not s.passed)
+    assert failed == "confluence_gate"
+    assert (entry, sl, tp) == (100.0, 101.5, 96.0)
+
+
+def test_cycle_writes_escalated_cohorts_with_chosen_prices(state, monkeypatch):
+    """F4: pending/executed/error — свои когорты (журнал v4), цены — выбранной комбинации."""
+    import oskar.core.cycle as cyc
+    from oskar.contracts.schemas import PriceOption
+    from oskar.core.escalation import EscalationResult
+    from oskar.detect.score import Opportunity
+
+    cand = _short_candidate(
+        [PriceOption(id="s-swing", kind="swing_high", price=101.5)],
+        [PriceOption(id="t-liq", kind="liquidity_pool", price=96.0)],
+    )
+    monkeypatch.setattr(cyc, "analyze", lambda df, cfg: None)
+    monkeypatch.setattr(cyc, "compute", lambda df: None)
+    monkeypatch.setattr(cyc, "multi_tf_trend", lambda per_tf: "bearish")
+    monkeypatch.setattr(cyc, "score_opportunity", lambda s, i, m: Opportunity("short", 90, {}))
+    cfg = CycleConfig(context_timeframes=(), min_score=30)
+
+    for n, outcome in enumerate(["pending", "executed", "error"]):
+        c = cand.model_copy(update={"id": f"T-{n}-short"})
+        monkeypatch.setattr(cyc, "build_candidate", lambda *a, _c=c, **k: _c)
+        prices = (99.0, 101.0, 95.0) if outcome != "error" else None
+        cycle = ShadowCycle(FakeCache(market_df()), state, CAPS, PROFILE, cfg,
+                            escalator=lambda _c, o=outcome, p=prices: EscalationResult(outcome=o, prices=p))
+        cycle.run_once(["SOL/USDT:USDT"], 1000.0)
+        row = state.journal.execute(
+            "SELECT cohort, entry_price, sl_price, tp_price FROM counterfactuals WHERE decision_id=?",
+            (c.id,),
+        ).fetchone()
+        assert row["cohort"] == outcome
+        # error — цены гейта цикла; pending/executed — комбинации, ушедшей в план
+        expected = prices or (100.0, 101.5, 96.0)
+        assert (row["entry_price"], row["sl_price"], row["tp_price"]) == expected
 
 
 def test_shadow_cycle_symbol_error_isolated(state):

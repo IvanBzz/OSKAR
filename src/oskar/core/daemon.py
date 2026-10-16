@@ -180,10 +180,11 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache, auto
             knowledge=knowledge_for_candidate(candidate),
         ).verdict
 
-    def trader_fn(candidate, scout_verdict):
+    def trader_fn(candidate, scout_verdict, combos=None):
+        # 2026-10-16 (блок F): Trader выбирает из проходных комбинаций, а не из всего меню
         return decide(
             candidate, scout_verdict, state.journal, state.run_id,
-            limits=trader_limits,
+            limits=trader_limits, combos=combos,
         ).decision
 
     card_sink = None

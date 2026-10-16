@@ -52,6 +52,46 @@ def test_call_roundtrip_utf8(tmp_path):
     assert res.duration_ms >= 0
 
 
+STUB_MODEL_USAGE = """
+import sys, json
+sys.stdin.buffer.read()
+print(json.dumps({"result": "ok", "modelUsage": {
+    "claude-haiku-4-5": {"inputTokens": 900, "outputTokens": 12},
+    "claude-opus-4-1": {"inputTokens": 400, "outputTokens": 650},
+}}))
+"""
+
+
+def test_model_taken_from_model_usage(tmp_path):
+    """2026-10-16: `claude -p --output-format json` не отдает "model" — у всех 98 вызовов
+    в analysis_log стояло 'unknown'. Модель — ключ modelUsage с наибольшим outputTokens."""
+    from oskar.agents.budget import BudgetLimits, CallBudget
+
+    j = connect(tmp_path / "j.db")
+    res = call_claude(
+        "x", cli_cmd=stub_cmd(tmp_path, STUB_MODEL_USAGE, "usage"),
+        budget=CallBudget(j, "r1", "scout", "d1", BudgetLimits(daily=10)),
+    )
+    assert res.model == "claude-opus-4-1"
+    assert j.execute("SELECT model FROM analysis_log").fetchone()[0] == "claude-opus-4-1"
+    j.close()
+
+
+def test_model_from_usage_fallbacks():
+    from oskar.agents.claude_cli import model_from_usage
+
+    # без токенов — первый ключ; при равенстве — тоже первый
+    assert model_from_usage({"modelUsage": {"m-a": {}, "m-b": {"costUSD": 0.1}}}) == "m-a"
+    assert model_from_usage({"modelUsage": {"m-a": {"outputTokens": 5}, "m-b": {"outputTokens": 5}}}) == "m-a"
+    assert model_from_usage({"modelUsage": {}}) is None
+    assert model_from_usage({}) is None
+
+
+def test_model_unknown_without_usage(tmp_path):
+    stub = 'import sys, json\nsys.stdin.buffer.read()\nprint(json.dumps({"result": "ok"}))\n'
+    assert call_claude("x", cli_cmd=stub_cmd(tmp_path, stub, "bare")).model == "unknown"
+
+
 def test_call_fails_after_retries(tmp_path):
     cmd = stub_cmd(tmp_path, STUB_FAIL, "fail")
     with pytest.raises(AgentCallError, match="exit 3"):

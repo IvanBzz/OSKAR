@@ -3,6 +3,8 @@
 import json
 from datetime import UTC, datetime
 
+import pytest
+
 from oskar.agents.budget import BudgetExceeded
 from oskar.contracts.schemas import (
     FvgInfo,
@@ -138,7 +140,8 @@ def test_trader_veto(tmp_path):
 
 def test_final_ladder_rechecks_chosen_prices(tmp_path):
     """Ст. 2: даже после execute выбранные цены идут через полную лестницу.
-    SHORT с TP 99.0 дает fee-adjusted RR < 2.0 -> отказ на финальной проверке."""
+    SHORT с TP 99.0 дает fee-adjusted RR < 2.0 -> отказ (с 2026-10-16 — еще на переборе
+    меню до Trader'а: no_passing_combo; финал без перебора — test_final_ladder_still_rejects)."""
     bad = candidate().model_copy(update={
         "tp_options": [PriceOption(id="t-liq", kind="liquidity_pool", price=99.0)]
     })
@@ -171,3 +174,132 @@ def test_card_failure_keeps_pending(tmp_path):
     assert res.outcome == "pending"  # TTL fail-closed прикроет недоставку
     n = state.journal.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
     assert n == 1
+
+
+# ----------------------------------------------- блок F (2026-10-16): воронка сетапов
+
+
+def td_ids(entry="e-market", sl="s-swing", tp="t-liq") -> TradeDecision:
+    return td().model_copy(update={"entry_option_id": entry, "sl_option_id": sl, "tp_option_id": tp})
+
+
+def funnel_candidate() -> SetupCandidate:
+    """short @100: s-tight (0.1%) режет sl_distance; s-swing проходит с обоими тейками."""
+    return candidate().model_copy(update={
+        "sl_options": [PriceOption(id="s-swing", kind="swing_high", price=101.5),
+                       PriceOption(id="s-tight", kind="swing_high", price=100.1)],
+        "tp_options": [PriceOption(id="t-r1", kind="r_multiple", price=90.0),
+                       PriceOption(id="t-liq", kind="liquidity_pool", price=96.0)],
+    })
+
+
+def test_trader_sees_only_passing_combos_in_rule_order(tmp_path):
+    """F1: Trader получает только проходные комбинации — от минимального R:R."""
+    seen = {}
+
+    def trader(c, v, combos=None):
+        seen["combos"] = combos
+        return td_ids()
+
+    esc, state = make(tmp_path, lambda c: sv(), trader)
+    res = esc(funnel_candidate())
+    assert res.outcome == "pending" and res.prices == (100.0, 101.5, 96.0)
+    combos = seen["combos"]
+    assert [c.label for c in combos] == ["e-market/s-swing/t-liq", "e-market/s-swing/t-r1"]
+    assert all(c.passed for c in combos)
+    assert combos[0].rr < combos[1].rr and combos[0].sl_pct == pytest.approx(1.5)
+
+
+def test_trader_menu_capped_at_eight(tmp_path):
+    from oskar.core.escalation import MAX_TRADER_COMBOS
+
+    seen = {}
+
+    def trader(c, v, combos=None):
+        seen["combos"] = combos
+        return td_ids(tp="t-0")
+
+    many = candidate().model_copy(update={"tp_options": [
+        PriceOption(id=f"t-{i}", kind="liquidity_pool", price=96.0 - i * 0.5) for i in range(12)
+    ]})
+    esc, state = make(tmp_path, lambda c: sv(), trader)
+    assert esc(many).outcome == "pending"
+    rrs = [c.rr for c in seen["combos"]]
+    assert len(rrs) == MAX_TRADER_COMBOS == 8 and rrs == sorted(rrs)
+    assert seen["combos"][0].tp.id == "t-0"  # ближайшая цель первой
+
+
+def test_no_passing_combo_skips_trader(tmp_path):
+    """F1: проходных нет — Trader не вызывается (бюджет), причина — шаг лестницы."""
+    def no_trader(c, v, combos=None):
+        raise AssertionError("trader must not be called without passing combos")
+
+    bad = candidate().model_copy(update={
+        "tp_options": [PriceOption(id="t-liq", kind="liquidity_pool", price=99.0)]
+    })
+    esc, state = make(tmp_path, lambda c: sv(), no_trader)
+    res = esc(bad)
+    assert res.outcome == "risk_rejected"
+    assert res.detail == "no_passing_combo: rr_fee_adjusted"
+    assert res.trade_json is None and res.prices is None
+
+
+def test_no_passing_combo_uses_scout_confidence(tmp_path):
+    """Перебор идет с confidence Scout'а: 55 < 60 — ни одна комбинация не проходит."""
+    esc, state = make(tmp_path, lambda c: sv(conf=55), lambda c, v, combos=None: td_ids())
+    res = esc(candidate())
+    assert res.outcome == "risk_rejected" and res.detail == "no_passing_combo: confidence_bounds"
+
+
+def test_trader_choice_failing_ladder_falls_back_with_mark(tmp_path):
+    """F1: выбор Trader'а не прошел финальную лестницу — проходная по единому правилу,
+    пометка combo_fallback в detail, в плане и в карточке; цены — взятой комбинации."""
+    from oskar.contracts.schemas import ExecutionPlan
+
+    cards = []
+
+    def sink(c, v, s, p=None, note=None, buttons=True):
+        cards.append((p, note, buttons))
+        return 7
+
+    state = RuntimeState(journal=connect(tmp_path / "j.db"))
+    esc = Escalator(
+        state, CAPS, PROFILE, scout_fn=lambda c: sv(),
+        trader_fn=lambda c, v, combos=None: td_ids(sl="s-tight", tp="t-r1"),
+        resolve_fn=resolve_fn, approval_ttl_seconds=1200, card_sink=sink, equity_fn=lambda: 1000.0,
+    )
+    res = esc(funnel_candidate())
+    mark = "combo_fallback: e-market/s-tight/t-r1 -> e-market/s-swing/t-liq"
+    assert res.outcome == "pending" and res.detail == mark
+    assert res.prices == (100.0, 101.5, 96.0)
+    plan = ExecutionPlan.model_validate_json(state.journal.execute(
+        "SELECT card_json FROM pending_approvals").fetchone()[0])
+    assert (plan.sl, plan.tp) == (101.5, 96.0) and plan.tldr.startswith(mark)
+    assert cards[0][1] == mark and cards[0][2] is True
+    # выбор Trader'а в журнале остается как был — подмена видна, а не переписана
+    assert json.loads(res.trade_json)["sl_option_id"] == "s-tight"
+
+
+def test_final_ladder_still_rejects_when_world_changed(tmp_path):
+    """Ст. 2: финальная проверка остается. Портфель заполнился, пока думал Trader, —
+    отказ, fallback не помогает (лимит позиций у всех комбинаций общий)."""
+    from oskar.risk.ladder import OpenPosition
+
+    calls = []
+
+    def positions():
+        calls.append(1)
+        if len(calls) == 1:
+            return []
+        return [OpenPosition(symbol=f"X{i}/USDT:USDT", side="long", risk_usd=1.0) for i in range(3)]
+
+    state = RuntimeState(journal=connect(tmp_path / "j.db"))
+    esc = Escalator(
+        state, CAPS, PROFILE, scout_fn=lambda c: sv(),
+        trader_fn=lambda c, v, combos=None: td_ids(), resolve_fn=resolve_fn,
+        approval_ttl_seconds=1200, open_positions_fn=positions, equity_fn=lambda: 1000.0,
+    )
+    res = esc(candidate())
+    assert res.outcome == "risk_rejected" and res.detail == "final_ladder: max_open_positions"
+    n = state.journal.execute("SELECT COUNT(*) FROM pending_approvals").fetchone()[0]
+    assert n == 0

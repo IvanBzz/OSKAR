@@ -58,8 +58,25 @@ def fee_adjusted_rr(entry: float, sl: float, tp: float) -> float:
     tp_dist = abs(tp - entry)
     if sl_dist <= 0:
         raise ValueError("SL distance must be positive")
-    fee_buffer = RR_FEE_SAFETY_MULT * (ROUND_TRIP_FEE_PCT / 100.0) * entry
-    return (tp_dist - fee_buffer) / sl_dist
+    return (tp_dist - rr_fee_buffer(entry)) / sl_dist
+
+
+def rr_fee_buffer(entry: float) -> float:
+    """Ценовой буфер комиссий, который R:R вычитает из TP-дистанции (2 круга от entry)."""
+    return RR_FEE_SAFETY_MULT * (ROUND_TRIP_FEE_PCT / 100.0) * entry
+
+
+def tp_for_fee_adjusted_rr(entry: float, sl: float, rr: float) -> float:
+    """Обратная к fee_adjusted_rr: TP, при котором R:R после комиссий равен rr.
+
+    2026-10-16 (блок F): R-тейки меню считались валовыми — «2.0R» после вычета
+    буфера давал < 2.0 и не проходил min_rr_fee_adjusted никогда (мертвая опция).
+    Сторона — по стопу: SL ниже entry = long, тейк выше."""
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0:
+        raise ValueError("SL distance must be positive")
+    sign = 1.0 if sl < entry else -1.0
+    return entry + sign * (rr * sl_dist + rr_fee_buffer(entry))
 
 
 def confidence_factor(confidence: int) -> float:

@@ -1,5 +1,7 @@
 """Генератор меню опций: геометрия, якоря SL, полный контракт на выходе."""
 
+import pytest
+
 from oskar.contracts.schemas import SetupCandidate
 from oskar.detect.indicators import IndicatorSet
 from oskar.detect.options import build_candidate
@@ -122,3 +124,103 @@ def test_contract_validates():
     c = build_candidate("SOL/USDT:USDT", "15m", short_snapshot(), ind(), OPP, "bearish")
     restored = SetupCandidate.model_validate_json(c.model_dump_json())
     assert restored == c
+
+
+# ------------------------------------------------- блок F (2026-10-16): меню воронки
+
+
+def _menu(c: SetupCandidate) -> dict[str, float]:
+    return {o.id: o.price for o in c.entry_options + c.sl_options + c.tp_options}
+
+
+def test_existing_ids_kept_and_limit_entries_get_own_atr_stops():
+    """Прежние id на месте; у каждой лимитки свой ATR-стоп (s-atr от рынка при лимитке
+    оказывался в 0.02-0.04% от входа)."""
+    c = build_candidate("SOL/USDT:USDT", "15m", short_snapshot(), ind(), OPP, "bearish")
+    menu = _menu(c)
+    assert {"e-market", "e-fvg", "e-ob", "s-swing", "s-ob", "s-atr", "t-liq", "t-r0", "t-r1"} <= set(menu)
+    assert menu["s-atr"] == 100.0 + 1.5  # от рынка — как раньше
+    assert menu["s-atr-fvg"] == menu["e-fvg"] + 1.5  # 1.5 ATR от своей лимитки (short — выше)
+    assert menu["s-atr-ob"] == menu["e-ob"] + 1.5
+
+
+def test_sl_dedup_keeps_first_option():
+    """s-swing и s-ob с одной ценой (12/12 в журнале) — в меню остается s-swing."""
+    snap = short_snapshot()
+    same = SmcSnapshot(
+        bar_index=100, detector_version="test", swings=snap.swings, fvgs=snap.fvgs,
+        order_blocks=[OrderBlock(index=85, direction="bearish", top=103.5, bottom=102.5,
+                                 volume=1.0, strength_pct=60.0, mitigated=False)],
+        structure=snap.structure, liquidity=snap.liquidity,
+    )
+    c = build_candidate("SOL/USDT:USDT", "15m", same, ind(), OPP, "bearish")
+    ids = [o.id for o in c.sl_options]
+    assert "s-swing" in ids and "s-ob" not in ids
+    prices = [o.price for o in c.sl_options]
+    assert len(prices) == len(set(prices))
+
+
+def test_r_targets_are_net_r_of_their_own_pair():
+    """«2.0R» — ровно 2R ПОСЛЕ комиссий от своей пары вход/стоп (XAUT: подпись 2.0R,
+    а с чужой парой 26.5R); каждая R-цель сочетается ровно с одной парой."""
+    from oskar.detect.options import R_NET_MARGIN, combo_allowed
+    from oskar.risk.sizing import fee_adjusted_rr
+
+    c = build_candidate("SOL/USDT:USDT", "15m", short_snapshot(), ind(), OPP, "bearish")
+    for t in (o for o in c.tp_options if o.kind == "r_multiple"):
+        pairs = [(e, s) for e in c.entry_options for s in c.sl_options if combo_allowed(c, e, s, t)]
+        assert len(pairs) == 1, t.id
+        e, s = pairs[0]
+        r = 2.0 if t.id.startswith("t-r0") else 3.0
+        assert fee_adjusted_rr(e.price, s.price, t.price) == pytest.approx(r + R_NET_MARGIN, abs=1e-9)
+        assert t.note.startswith(f"{r}R net") and f"({e.id}/{s.id})" in t.note
+        assert t.price < 100.0  # цель за рынком: иначе на исполнении «цена уже за целью»
+    t_r0 = next(o for o in c.tp_options if o.id == "t-r0")
+    assert "(e-market/s-swing)" in t_r0.note  # прежний id = пара (рынок, первый стоп)
+
+
+def test_combo_allowed_rejects_foreign_pairs():
+    from oskar.detect.options import combo_allowed
+
+    c = build_candidate("SOL/USDT:USDT", "15m", short_snapshot(), ind(), OPP, "bearish")
+    o = {x.id: x for x in c.entry_options + c.sl_options + c.tp_options}
+    assert combo_allowed(c, o["e-fvg"], o["s-swing"], o["t-liq"])  # структурные — свободно
+    assert combo_allowed(c, o["e-fvg"], o["s-swing"], o["t-r0-fvg-swing"])
+    assert not combo_allowed(c, o["e-market"], o["s-swing"], o["t-r0-fvg-swing"])  # чужой вход
+    assert not combo_allowed(c, o["e-fvg"], o["s-atr"], o["t-liq"])  # ATR-стоп рынка при лимитке
+    assert not combo_allowed(c, o["e-market"], o["s-atr-fvg"], o["t-liq"])
+
+
+@pytest.mark.parametrize("direction", ["long", "short"])
+@pytest.mark.parametrize("price", [0.01234, 0.99, 1.9, 100.0, 3021.7, 65000.0])
+def test_t_r0_passes_rr_step_for_any_stop_in_profile_range(direction, price):
+    """t-r0 (2.0R net) проходит шаг R:R лестницы при любом стопе 0.5-3% — и после
+    округления тейка биржей до 5 значащих цифр (запас R_NET_MARGIN + допуск гейта)."""
+    import math
+
+    from oskar.risk.ladder import Caps, ProfileLimits, RiskInput, evaluate
+
+    caps = Caps(risk_per_trade_pct=1.0, max_total_risk_pct=5.0, max_leverage=10,
+                confidence_cap=75, min_rr_fee_adjusted=2.0, max_open_positions=3)
+    profile = ProfileLimits(sl_dist_pct_min=0.3, sl_dist_pct_max=6.0, max_leverage=8)
+    sign = 1.0 if direction == "long" else -1.0
+    atr = price * 0.004
+    for i in range(26):
+        d = 0.5 + i * 0.1  # % стопа от входа
+        level = price * (1 - sign * d / 100) + sign * 0.15 * atr  # s-swing = level -/+ 0.15 ATR
+        snap = SmcSnapshot(
+            bar_index=100, detector_version="test",
+            swings=[Swing(index=70, kind="low" if direction == "long" else "high", level=level)],
+        )
+        trend = "bullish" if direction == "long" else "bearish"
+        c = build_candidate("SOL/USDT:USDT", "15m", snap, ind(close=price, atr=atr),
+                            Opportunity(direction, 80, {}), trend)
+        sl = next(o for o in c.sl_options if o.id == "s-swing").price
+        tp = next(o for o in c.tp_options if o.id == "t-r0").price
+        assert abs(price - sl) / price * 100 == pytest.approx(d)
+        tick = 10 ** (math.floor(math.log10(tp)) - 4)
+        for tp_px in (tp, round(tp / tick) * tick):
+            v = evaluate(RiskInput(candidate=c, entry=price, sl=sl, tp=tp_px, confidence=68,
+                                   equity_usd=1000.0), caps, profile)
+            rr_step = next(s for s in v.steps if s.name == "rr_fee_adjusted")
+            assert rr_step.passed, (d, tp_px, rr_step.value)

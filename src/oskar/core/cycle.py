@@ -20,7 +20,8 @@ from oskar.detect.indicators import IndicatorSet, compute, multi_tf_trend
 from oskar.detect.options import build_candidate
 from oskar.detect.score import score_opportunity
 from oskar.detect.smc import DEFAULT_CONFIG, SmcConfig, analyze
-from oskar.risk.ladder import Caps, ProfileLimits, RiskInput, evaluate
+from oskar.risk.combos import choose_combo, evaluate_combos, most_advanced
+from oskar.risk.ladder import Caps, ProfileLimits
 
 SHADOW_CONFIDENCE = 68  # фиксированная confidence shadow-режима (в границах [60..75])
 EXPIRED_FLAT_BARS = 48  # counterfactual без исхода за 48 баров (12ч на 15м) -> expired_flat
@@ -32,40 +33,27 @@ def _iso_to_ms(iso: str) -> float:
 
 def best_passing_combo(candidate, caps, profile, *, confidence, equity_usd,
                        safe_mode=False, paused=False):
-    """Перебор всех комбинаций меню через лестницу; лучшая проходная по R:R.
+    """Перебор всех комбинаций меню через лестницу; проходная по правилу choose_combo.
 
     Гейт эскалации по ОДНОЙ дефолтной комбинации несправедливо строг (живой
     датасет: 12/17 кандидатов срезаны по R:R на market-входе с первым TP, при
     том что лимитка от FVG и тейк 2R прошли бы). Trader существует для выбора
     комбинации — гейт обязан проверять достижимость, а не один вариант.
 
-    Возвращает (verdict, entry, sl, tp): проходной вердикт лучшей комбинации,
-    либо вердикт дефолтной (первой) комбинации, если не проходит ни одна.
+    Возвращает (verdict, entry, sl, tp) комбинации, которую берет единое правило
+    (risk/combos.rank_combos: минимальный R:R над капом — ближайшая реалистичная
+    цель; 2026-10-16 вместо максимального R:R, мерившего counterfactual по дальним
+    тейкам). Если не проходит ни одна — вердикт комбинации, прошедшей больше всего
+    шагов лестницы (при равенстве первой). 2026-10-16: раньше бралась дефолтная
+    (первая), лестница на ней обрывалась на R:R, и журнал писал «R:R», хотя почти
+    всё резал confluence_gate шагом дальше — диагностика врала.
     """
-
-    def run(e, s, t):
-        return evaluate(
-            RiskInput(candidate=candidate, entry=e.price, sl=s.price, tp=t.price,
-                      confidence=confidence, equity_usd=equity_usd,
-                      safe_mode=safe_mode, paused=paused),
-            caps, profile,
-        )
-
-    best = None  # (rr, verdict, e, s, t)
-    default = None
-    for e in candidate.entry_options:
-        for s in candidate.sl_options:
-            for t in candidate.tp_options:
-                v = run(e, s, t)
-                if default is None:
-                    default = (v, e, s, t)
-                if v.passed and (best is None or v.computed.rr_fee_adjusted > best[0]):
-                    best = (v.computed.rr_fee_adjusted, v, e, s, t)
-    if best is not None:
-        _, v, e, s, t = best
-        return v, e.price, s.price, t.price
-    v, e, s, t = default
-    return v, e.price, s.price, t.price
+    evals = evaluate_combos(
+        candidate, caps, profile, confidence=confidence, equity_usd=equity_usd,
+        safe_mode=safe_mode, paused=paused,
+    )
+    pick = choose_combo(evals) or most_advanced(evals)
+    return (pick.verdict, *pick.prices)
 
 
 @dataclass
@@ -177,14 +165,20 @@ class ShadowCycle:
             outcome = esc.outcome if esc.outcome != "error" else "error"
             detail = esc.detail or "escalated"
             scout_json, trade_json = esc.scout_json, esc.trade_json
+            # 2026-10-16 (журнал v4): эскалированные — в свои когорты, а не в 'shadow'
+            # вперемешку с чистым shadow (CHECK раньше не пускал executed/pending/error)
             cohort = {
                 "scout_pass": "scout_pass",
                 "trader_decline": "trader_decline",
                 "risk_rejected": "risk_rejected",
-                "pending": "shadow",
-                "executed": "shadow",  # автомат: counterfactual рядом с реальной сделкой
-                "error": "shadow",
+                "pending": "pending",
+                "executed": "executed",  # автомат: counterfactual рядом с реальной сделкой
+                "error": "error",
             }[esc.outcome]
+            # 2026-10-16: цены ФАКТИЧЕСКИ выбранной комбинации (с учетом combo_fallback),
+            # а не лучшей по R:R из гейта — иначе исход считался не по той сделке
+            if esc.prices is not None:
+                entry, sl, tp = esc.prices
 
         j = self._state.journal
         j.execute(

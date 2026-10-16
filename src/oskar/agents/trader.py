@@ -36,7 +36,18 @@ def _options_line(options) -> str:
                      for o in options)
 
 
-def build_prompt(candidate: SetupCandidate, scout_verdict: SetupVerdict) -> str:
+def _combos_block(combos) -> str:
+    """Допустимые комбинации c1..cN (2026-10-16, блок F): только прошедшие лестницу,
+    в порядке единого правила выбора (risk/combos.rank_combos). Числа — из лестницы."""
+    if combos is None:
+        return "(перебор не передан: любая тройка из меню, финальная лестница проверит)"
+    return "\n".join(
+        f"c{i}: {c.entry.id} / {c.sl.id} / {c.tp.id} — R:R {c.rr:.2f}, стоп {c.sl_pct:.2f}%"
+        for i, c in enumerate(combos, 1)
+    )
+
+
+def build_prompt(candidate: SetupCandidate, scout_verdict: SetupVerdict, combos=None) -> str:
     return (
         _template()
         .replace("{candidate_json}", candidate.model_dump_json(indent=2))
@@ -44,6 +55,7 @@ def build_prompt(candidate: SetupCandidate, scout_verdict: SetupVerdict) -> str:
         .replace("{entry_options}", _options_line(candidate.entry_options))
         .replace("{sl_options}", _options_line(candidate.sl_options))
         .replace("{tp_options}", _options_line(candidate.tp_options))
+        .replace("{combos}", _combos_block(combos))
     )
 
 
@@ -56,9 +68,10 @@ def decide(
     limits: BudgetLimits,
     model: str | None = None,
     cli_cmd: list[str] | None = None,
+    combos=None,  # 2026-10-16: проходные комбинации (ComboEval) от эскалатора; None — без списка
 ) -> TraderResult:
     check_budget(journal, "trader", limits)
-    prompt = build_prompt(candidate, scout_verdict)
+    prompt = build_prompt(candidate, scout_verdict, combos)
     call = call_claude(
         prompt, model=model, cli_cmd=cli_cmd,
         budget=CallBudget(journal, run_id, "trader", candidate.id, limits),

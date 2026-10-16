@@ -6,6 +6,23 @@ date: 2026-08-25
 
 > Обновляется при каждом изменении кодовой базы или vault. Новые записи — сверху. Формат: `## YYYY-MM-DD — заголовок (commit)`.
 
+## 2026-10-16 — блок F: воронка
+
+По журналу: из 14 «execute» Trader'а 7 срезала финальная лестница (6 — sl_distance, 1 — R:R): меню — декартово произведение entry×sl×tp, проходят немногие, а Trader выбирал из всех. Плюс врала диагностика (причина отказа — с дефолтной комбинации), counterfactual эскалированных писался в 'shadow' по чужим ценам, модель в analysis_log — 'unknown' у всех 98 вызовов.
+- **F1 — Trader видит только проходные**: эскалатор до вызова Trader'а прогоняет все комбинации меню через лестницу (confidence Scout'а, тот же портфель/equity/safe_mode/paused, что у финальной проверки). Проходных нет — `risk_rejected`, `no_passing_combo: <шаг>`, Trader не зовется (бюджет). Есть — до 8 штук в промпт новым блоком «Допустимые комбинации (только из них)» (c1..cN: id входа/стопа/тейка, R:R после комиссий, стоп %); ответ Trader'а — те же три id, схема TradeDecision не менялась. `trader_fn(candidate, scout_verdict, combos=None)` — старые стабы с двумя аргументами работают. Выбор все равно не прошел финальную лестницу — берется проходная по единому правилу, пометка `combo_fallback: <выбор Trader'а> -> <взятая>` в detail, в tldr плана (-> trades.reasoning) и в карточке. Финальная лестница осталась.
+- **Единое правило выбора** (аудит: максимум R:R брал дальний тейк — медиана прошедших 11.5R, 54/93 выше 10R, максимум 107.6R): минимальный rr_fee_adjusted над капом (ближайшая реалистичная цель), при равенстве структурный тейк раньше R-кратного, затем меньший стоп. `risk/combos.py`: один перебор и одно правило на гейт цикла, fallback эскалатора и порядок списка в промпте.
+- **F2 — меню**: SL с одинаковой ценой (отн. < 1e-6) схлопываются, остается первая (s-swing; совпадал с s-ob в 12/12). ATR-стоп — и от каждой лимитки (`s-atr-fvg`, `s-atr-ob`; s-atr от рынка при лимитке был в 0.02-0.04% от входа). R-тейки — для каждой пары вход/стоп и в **fee-adjusted R** (`sizing.tp_for_fee_adjusted_rr`, обратная к формуле лестницы, + запас полдопуска гейта на округление цены): валовый «2.0R» после буфера комиссий не проходил кап 2.0 никогда, а с чужой парой выходил 26.5R (XAUT). Подпись «2.0R net (e-fvg/s-swing)», id `t-r0-fvg-swing` и т.п.; пара (рынок, первый стоп) сохраняет t-r0/t-r1. Тейк за рынком, иначе опции нет. Бессмысленные сочетания (R-тейк чужой пары, ATR-стоп чужого входа) отсекает `options.combo_allowed` до лестницы. Прежние id не тронуты.
+- **F3**: `best_passing_combo` без проходных возвращает вердикт комбинации, прошедшей больше всего шагов (при равенстве первой) — в журнале реальная причина, а не R:R дефолтной.
+- **F4 — журнал v4**: counterfactuals пересоздан с расширенным CHECK (+ executed, pending, error): перенос INSERT ... SELECT одной транзакцией (id, UNIQUE, индексы, счетчик AUTOINCREMENT сохраняются). `_migrate` теперь под явным BEGIN — раньше DDL коммитился по одному. Цикл пишет pending/executed/error в свои когорты и для эскалированных — цены фактически ушедшей в план комбинации (`EscalationResult.prices`, с учетом fallback).
+- **F5**: модель — из `payload["modelUsage"]` (ключ с наибольшими outputTokens, иначе первый), иначе 'unknown'.
+- **F6**: бюджеты scout 60/день, 10/час; trader 30/день (Иван: ускорение, больше реальных кейсов). settings, не caps.
+
+### Тесты
+- test_options +16 (прежние id, ATR-стопы лимиток, дедуп SL, R-тейки = net R своей пары, combo_allowed, t-r0 проходит шаг R:R при стопе 0.5-3% для 6 цен x 2 направлений, в т.ч. после округления тейка), test_core +4 (минимальный R:R, порядок при равенстве, самая продвинутая при отказе, когорты и цены в цикле), test_escalation +6 (только проходные и по правилу, кап 8, без проходных Trader не зовется, confidence Scout'а, combo_fallback с пометкой, финальная лестница при смене портфеля), test_scout_trader +1 (блок комбинаций в промпте), test_claude_cli +3 (modelUsage), test_journal +2 (миграция v3->v4 с данными, откат при сбое). Итого 491.
+
+### Затронутые файлы
+CREATE: src/oskar/risk/combos.py; MODIFY: src/oskar/core/{escalation,cycle,daemon}.py, src/oskar/detect/options.py, src/oskar/risk/sizing.py, src/oskar/agents/{trader,claude_cli}.py, src/oskar/agents/prompts/trader.md, src/oskar/journal/db.py, config/settings.yaml, tests/unit/{test_options,test_core,test_escalation,test_scout_trader,test_claude_cli,test_journal}.py
+
 ## 2026-10-16 — блок G: супервизор 24/7
 
 oskard и Hermes gateway запускались из сессии Claude и умирали вместе с ней: 15–16.10 — 19 ч простоя, ни одного сообщения в Telegram; 13–14.10 демон замораживал сон ПК (Kernel-Power 42). Теперь их держит отдельный супервизор с автозапуском при входе в Windows.
@@ -26,6 +43,7 @@ oskard и Hermes gateway запускались из сессии Claude и ум
 
 ### Затронутые файлы
 CREATE: scripts/{supervise.ps1,install_autostart.ps1,README_supervisor.md,trading_host.txt}, tests/unit/{test_runner_heartbeat,test_supervisor_scripts}.py; MODIFY: src/oskar/core/shadow_runner.py
+
 
 ## 2026-10-16 — блок H: защита капитала в автомате (R:R по фактической цене, стоп по просадке)
 

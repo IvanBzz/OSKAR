@@ -112,7 +112,7 @@ def call_claude(
                 raise AgentCallError("empty or invalid result in CLI output")
             result = AgentCallResult(
                 text=text,
-                model=str(payload.get("model") or model or "unknown"),
+                model=str(payload.get("model") or model_from_usage(payload) or model or "unknown"),
                 prompt_sha=sha,
                 duration_ms=duration_ms,
                 raw=payload,
@@ -136,6 +136,26 @@ def call_claude(
                 )
             return result
     raise AgentCallError(f"claude CLI failed after {1 + RETRIES} attempts: {last_err}")
+
+
+def model_from_usage(payload: dict) -> str | None:
+    """Модель ответа из payload["modelUsage"] (имя -> usage): с наибольшими outputTokens,
+    иначе первая. None — блока нет или он пуст.
+
+    2026-10-16: `claude -p --output-format json` не отдает поле "model" — у всех 98
+    вызовов в analysis_log стояло 'unknown'. Ключей бывает несколько (служебные вызовы
+    малой модели внутри CLI): отвечала та, что написала больше всего."""
+    usage = payload.get("modelUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    def output_tokens(name: str) -> float:
+        u = usage[name]
+        v = u.get("outputTokens") if isinstance(u, dict) else None
+        return float(v) if isinstance(v, int | float) else -1.0
+
+    names = list(usage)
+    return str(max(names, key=output_tokens))  # max берет первый из равных
 
 
 def extract_json_block(text: str) -> dict:
