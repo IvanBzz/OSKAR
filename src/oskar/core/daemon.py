@@ -244,7 +244,7 @@ def _sandbox(settings) -> bool:
     return True
 
 
-def _make_executor(state, settings, caps, client, profile_limits=None):
+def _make_executor(state, settings, caps, client, profile_limits=None, notify=None):
     """Исполнитель по кнопке. Среда (VST/реал) — из settings.exchange.sandbox,
     та же, что у equity и монитора. Цена для проверки «план не устарел» — с
     публичного тикера; лимит позиций — из капсов. Капсы и профиль — еще и для
@@ -270,7 +270,7 @@ def _make_executor(state, settings, caps, client, profile_limits=None):
     return ExecutionService(
         adapter, state.journal, state.run_id,
         price_fn=client.last_price, max_open_positions=caps.max_open_positions,
-        caps=caps, profile=profile_limits, state=state,
+        caps=caps, profile=profile_limits, state=state, notify=notify,  # алерт fill_out_of_caps
     )
 
 
@@ -398,7 +398,10 @@ def main() -> int:
     journal = _connect_journal(journal_path(settings))
     if journal is None:
         return 5
-    state = RuntimeState(journal=journal)
+    from oskar.core.emergency import SAFE_MODE_FLAG_NAME
+
+    # маркер-файл — второй носитель SAFE MODE (ревью Codex R1, 2026-10-16)
+    state = RuntimeState(journal=journal, safe_mode_flag=REPO_ROOT / "data" / SAFE_MODE_FLAG_NAME)
 
     import os
     import secrets
@@ -422,7 +425,8 @@ def main() -> int:
         state.panic()  # ст. 6 п. 3: после рестарта panic держится до явного сброса
         print(f"PANIC ENGAGED since {engaged}: trading blocked until `oskar panic-reset` "
               "(POST /panic/reset)", flush=True)
-    # SAFE MODE тоже переживает рестарт (блок H, 2026-10-16: супервизор снимал бы его молча)
+    # SAFE MODE тоже переживает рестарт (блок H, 2026-10-16: супервизор снимал бы его молча);
+    # по ЛЮБОМУ носителю — meta или маркер-файл (ревью Codex R1)
     from oskar.core.emergency import restore_safe_mode
 
     safe_reason = restore_safe_mode(state, notify=alert)
@@ -433,6 +437,12 @@ def main() -> int:
     client = MarketDataClient(make_bingx_public_exchange())
     cache = CandleCache(client)
     cycle = ShadowCycle(cache, state, caps, profile.limits, cycle_cfg)
+    # Equity с биржи с моментом ответа (ревью Codex R1, 2026-10-16): тот же snapshot_balance для
+    # runner'а (час), монитора (защелка на каждом полном тике) и исполнителя (не старше 120 с)
+    from oskar.risk.drawdown import DEFAULT_DRAWDOWN_PCT, DrawdownGuard, LiveEquity
+
+    equity_fetch = _make_equity_fn(settings)
+    live_equity = LiveEquity(equity_fetch) if equity_fetch is not None else None
     runner = ShadowRunner(
         cycle, cache, client, state,
         top_n=scanner.full_analysis_top,
@@ -440,16 +450,15 @@ def main() -> int:
         tick_seconds=float(profile.scan_interval_seconds),
         # ключ не читался — runner жил на зашитом дефолте того же значения (ревью 2026-10-13)
         consecutive_errors_to_safe_mode=int((settings.get("safe_mode") or {}).get("consecutive_errors", 3)),
-        equity_fn=_make_equity_fn(settings),
+        equity_fn=live_equity.refresh if live_equity is not None else None,
         notify=alert,
     )
-    # Стоп по просадке (блок H, 2026-10-16): тот же equity, что у equity_guarded исполнителя
-    from oskar.risk.drawdown import DEFAULT_DRAWDOWN_PCT, DrawdownGuard
-
+    # Стоп по просадке (блок H, 2026-10-16): по свежему equity с биржи, не по кешу runner'а
     try:
         drawdown = DrawdownGuard(
             journal, float((settings.get("safe_mode") or {}).get("drawdown_pct", DEFAULT_DRAWDOWN_PCT)),
             equity_fn=lambda: runner.equity_usd, equity_source_fn=lambda: runner.equity_source,
+            live=live_equity,
         )
     except (TypeError, ValueError) as e:
         print(f"REFUSING TO START: safe_mode.drawdown_pct: {e}", flush=True)
@@ -457,7 +466,7 @@ def main() -> int:
     # Исполнитель и режим — ДО эскалатора: в режиме «автомат» сделку ставит сам цикл.
     from oskar.core.trading_mode import AutoExecutor, TradingMode
 
-    executor = _make_executor(state, settings, caps, client, profile.limits)
+    executor = _make_executor(state, settings, caps, client, profile.limits, notify=alert)
     guarded_execute = None
     if executor is not None:
         from oskar.core.executor import equity_guarded
@@ -466,6 +475,7 @@ def main() -> int:
             executor.execute, lambda: runner.equity_source,
             equity_fn=lambda: runner.equity_usd, plan_fn=executor.plan_for,
             risk_cap_pct=caps.risk_per_trade_pct,
+            live=live_equity, drawdown=drawdown,  # свежий equity и защелка — до входа (ревью Codex R1)
         )
     # автомат — только paper/VST (реал закрыт гейтом Фазы 5); по умолчанию — из настроек
     trading_mode = TradingMode(

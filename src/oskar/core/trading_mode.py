@@ -28,6 +28,7 @@ from oskar.core.executor import (
     KIND_ENTRY_UNKNOWN,
     KIND_ERROR,
     KIND_EXCHANGE_REJECTED,
+    KIND_FILL_OUT_OF_CAPS,
     KIND_PROTECTION_FAILED,
 )
 from oskar.journal.db import transaction
@@ -41,8 +42,10 @@ MODES = (CONFIRM, AUTO)
 MODE_LABELS = {AUTO: "автомат", CONFIRM: "с подтверждением"}
 BREAKER_FAILURES = 3
 # Исходы, которые считает предохранитель; refused_precheck (цена ушла, лимит, R:R по факту,
-# флаги защиты) — нормальная работа, не сбой биржи. Таймаут входа — тоже сбой биржи.
-BREAKER_KINDS = {KIND_EXCHANGE_REJECTED, KIND_PROTECTION_FAILED, KIND_ENTRY_UNKNOWN, KIND_ERROR}
+# флаги защиты) — нормальная работа, не сбой биржи. Таймаут входа — тоже сбой биржи. Филл
+# вне капа R:R/стопа (ревью Codex R1, 2026-10-16) — биржевая аномалия, в серию.
+BREAKER_KINDS = {KIND_EXCHANGE_REJECTED, KIND_PROTECTION_FAILED, KIND_ENTRY_UNKNOWN,
+                 KIND_FILL_OUT_OF_CAPS, KIND_ERROR}
 BREAKER_TRIP_AT_ONCE = {KIND_PROTECTION_FAILED}  # позиция без стопа — с первого раза
 
 

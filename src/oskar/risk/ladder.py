@@ -85,6 +85,13 @@ FORBIDDEN_INPUT_FIELDS = {
 
 MIN_CONFIDENCE = 60
 
+# Люфт на проскальзывание ФИЛЛА маркета. Исполнитель проверяет R:R и стоп по цене перед
+# отправкой; филл может уйти на тик-другой хуже — люфт ловит обход капа (BERA: R:R 0.23 у
+# кнопки «Маркет»), а не проскальзывание. 2026-10-16, ревью Codex R1: перенесено из
+# ops/invariants.py — одни числа у INV-004 и у проверки филла исполнителем.
+FILL_RR_ALLOWANCE = 0.1
+FILL_SL_PCT_ALLOWANCE = 0.05
+
 
 @dataclass(frozen=True)
 class PriceCheck:

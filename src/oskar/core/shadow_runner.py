@@ -27,7 +27,7 @@ import threading
 import time
 
 from oskar.core.cycle import ShadowCycle
-from oskar.core.emergency import engage_safe_mode
+from oskar.core.emergency import engage_safe_mode, retry_safe_mode_persist
 from oskar.core.state import RuntimeState
 from oskar.data.client import classify_error
 from oskar.data.scanner import scan
@@ -212,6 +212,7 @@ class ShadowRunner:
 
     def tick(self) -> None:
         """Один такт. Все падения инфраструктуры ловятся здесь."""
+        retry_safe_mode_persist(self._state)  # SAFE MODE не записан в meta — повтор (ревью Codex R1)
         now = self._clock()
         if now - self._equity_at >= self._equity_interval and self._equity_fn is not None:
             try:

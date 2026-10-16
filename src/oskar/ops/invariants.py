@@ -31,6 +31,8 @@ from typing import Any
 
 import yaml
 
+# INV-004: люфт на проскальзывание филла — общие с проверкой филла исполнителем (ревью Codex R1)
+from oskar.risk.ladder import FILL_RR_ALLOWANCE, FILL_SL_PCT_ALLOWANCE
 from oskar.sync.reconcile import STATUS_OK
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -46,11 +48,6 @@ KNOWN_CLOSE_REASONS = frozenset(
 # Duration-stop монитора срабатывает на первом тике после max_loss_hold (тик 60 с) и закрывает
 # по рынку с подтверждением по позициям: 5 минут — люфт исполнения, а не нарушение инварианта.
 OVERHOLD_GRACE_SEC = 300
-# INV-004 (блок H, 2026-10-16): исполнитель проверяет R:R и стоп по цене, которую видит перед
-# отправкой; филл маркета может уйти на проскальзывание. Люфт — чтобы инвариант ловил обход
-# капа (BERA: R:R 0.23 у кнопки «Маркет»), а не тик проскальзывания.
-FILL_RR_ALLOWANCE = 0.1
-FILL_SL_PCT_ALLOWANCE = 0.05
 MIN_TRADES_IN_HOURS_WINDOW = 1  # окно по времени без единой закрытой сделки — не доказательство
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _EXPECT_RE = re.compile(r"^\s*(==|!=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")

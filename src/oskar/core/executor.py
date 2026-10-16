@@ -28,6 +28,17 @@ closePosition-ордера SL/TP, пока позиции нет — 109420 «po
   отправкой входа на биржу: вход «в процессе» panic_flatten не видит (журнала еще нет);
 - исход несет машинный код kind — по нему считает предохранитель автомата.
 
+Ревью Codex R1, 2026-10-16:
+- перед КАЖДОЙ отправкой входа (и перед голым повтором) — флаги защиты, свежая цена, R:R и
+  стоп по ней, qty только вниз (_send_gate): голый повтор шел после panic без проверки, а
+  цена бралась до долгой подготовки (плечо с сетевыми повторами);
+- после филла маркета R:R и стоп считаются по цене филла: вне капа с люфтом INV-004 — авария
+  fill_out_of_caps (позиция с SL/TP не закрывается, алерт, предохранитель считает);
+- реестр in-flight знает символ и сторону входа: panic ждет его опустения, а не дождавшись —
+  снимает по бирже (core/emergency.py);
+- equity для входа — не старше EQUITY_MAX_AGE_SEC, иначе свежий запрос к бирже
+  (equity_guarded); по нему же защелка просадки — до исполнения.
+
 Инварианты (ревью 2026-10-13, класс бага v1 с двойной позицией):
 - вход ушел на биржу (или мог уйти — таймаут) => запись в trades есть ВСЕГДА
   (журнал не врет, ст. 1); исход несет entry_sent=True — откатывать approve по
@@ -38,6 +49,7 @@ closePosition-ордера SL/TP, пока позиции нет — 109420 «po
 """
 
 import hashlib
+import html
 import logging
 import sqlite3
 import threading
@@ -50,9 +62,15 @@ from oskar.core.emergency import panic_engaged, safe_mode_engaged
 from oskar.data.client import classify_error, exchange_error_code
 from oskar.execution.base import ExchangeAdapter, PlacedOrder, cid_base, pick_protection
 from oskar.journal.db import transaction
-from oskar.risk.drawdown import read_halt
-from oskar.risk.ladder import Caps, ProfileLimits, check_entry_price
-from oskar.risk.sizing import qty_for_risk
+from oskar.risk.drawdown import EQUITY_MAX_AGE_SEC, read_halt
+from oskar.risk.ladder import (
+    FILL_RR_ALLOWANCE,
+    FILL_SL_PCT_ALLOWANCE,
+    Caps,
+    ProfileLimits,
+    check_entry_price,
+)
+from oskar.risk.sizing import fee_adjusted_rr, qty_for_risk
 
 logger = logging.getLogger("oskar.executor")
 
@@ -68,6 +86,9 @@ KIND_REFUSED = "refused_precheck"  # до биржи не дошло: цена �
 KIND_EXCHANGE_REJECTED = "exchange_rejected"  # биржа ответила отказом (плечо/вход)
 KIND_PROTECTION_FAILED = "protection_failed"  # вход исполнен, стоп не встал
 KIND_ENTRY_UNKNOWN = "entry_unknown"  # таймаут на входе: принят ли ордер — неизвестно
+# Вход исполнен и защищен SL/TP, но R:R/стоп по цене ФИЛЛА вне капа с люфтом (ревью Codex
+# R1, 2026-10-16): биржевая аномалия — позицию не закрываем, алерт, предохранитель считает.
+KIND_FILL_OUT_OF_CAPS = "fill_out_of_caps"
 KIND_ERROR = "error"  # исключение/неожиданное
 
 
@@ -76,11 +97,20 @@ KIND_ERROR = "error"  # исключение/неожиданное
 # ордера за сирот и снять (ревью Codex раунд 2, high #2), ни ставить защиту параллельно.
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()  # база clientOrderId (OSKAR-<run>-<hash>), нижний регистр
+# Символ и сторона входа «в процессе» (после чтения плана): panic, не дождавшийся записи,
+# закрывает позицию по ним (ревью Codex R1, 2026-10-16).
+_INFLIGHT_TARGETS: dict[str, tuple[str, str]] = {}
 
 
 def inflight_client_ids() -> set[str]:
     with _INFLIGHT_LOCK:
         return set(_INFLIGHT)
+
+
+def inflight_entries() -> dict[str, tuple[str, str] | None]:
+    """{база cid: (symbol, side) | None — план еще не прочитан} входов «в процессе»."""
+    with _INFLIGHT_LOCK:
+        return {key: _INFLIGHT_TARGETS.get(key) for key in _INFLIGHT}
 
 
 def _is_ambiguous(e: Exception) -> bool:
@@ -116,6 +146,8 @@ class _EntryResult:
     attached: bool  # SL/TP прикреплены к входу (биржа создаст их при исполнении)
     unknown: bool = False  # таймаут: принят ли вход — неизвестно
     error: Exception | None = None
+    qty: float = 0.0  # qty последней отправки (после пересчета перед ней — только вниз)
+    refused: str | None = None  # проверка перед отправкой не пройдена: ордер НЕ ушел
 
 
 def make_client_order_id(run_id: str, decision_id: str) -> str:
@@ -150,6 +182,7 @@ class ExecutionService:
         profile: ProfileLimits | None = None,
         state=None,  # RuntimeState: panic/SAFE MODE в памяти (meta журнала читается всегда)
         sleep=time.sleep,
+        notify=None,  # (text) -> None: алерт fill_out_of_caps (parse_mode=HTML — экранируем)
     ):
         if (caps is None) != (profile is None):
             raise ValueError("caps и profile передаются вместе: без одного проверка R:R неполна")
@@ -163,6 +196,7 @@ class ExecutionService:
         self._profile = profile
         self._state = state
         self._sleep = sleep
+        self._notify = notify
 
     def plan_for(self, decision_id: str) -> ExecutionPlan:
         row = self._j.execute(
@@ -235,6 +269,11 @@ class ExecutionService:
             return f"лимит открытых позиций: {len(live)}/{self._max_open}", None
         if any(r["symbol"] == plan.symbol and r["side"] == plan.side for r in live):
             return f"уже есть позиция {plan.symbol} {plan.side}", None
+        return self._price_checks(plan, mode)
+
+    def _price_checks(self, plan: ExecutionPlan, mode: str) -> tuple[str | None, float | None]:
+        """Текущая цена: не за стопом/целью, маркет — не дальше max_drift_pct от плана, R:R и
+        стоп по цене входа. Зовется при нажатии и перед каждой отправкой (_send_gate)."""
         px = None
         if self._price_fn is not None:
             try:
@@ -252,6 +291,54 @@ class ExecutionService:
                     return (f"цена ушла на {drift:.2f}% от плана "
                             f"({plan.entry_market:.6g} -> {px:.6g}) — план устарел"), px
         return self._rr_reason(plan, mode, self._entry_price(plan, mode, px)), px
+
+    def _send_gate(self, plan: ExecutionPlan, mode: str, qty: float) -> tuple[str | None, float]:
+        """Последний рубеж перед КАЖДОЙ отправкой входа, включая голый повтор (ревью Codex R1,
+        2026-10-16): panic/SAFE MODE/просадка, свежая цена и R:R/стоп по ней, qty под эту цену —
+        только вниз. Между нажатием и отправкой — плечо с сетевыми повторами, а между первой
+        попыткой и повтором другой поток мог взвести panic и закончить flatten.
+        Возвращает (причина отказа | None, qty к отправке)."""
+        halt = self._halt_reason()
+        if halt is not None:
+            return halt, qty
+        reason, px = self._price_checks(plan, mode)
+        if reason is not None:
+            return reason, qty
+        entry_px = self._entry_price(plan, mode, px)
+        target = self.risk_sized_qty(plan, entry_px)
+        if target < qty:
+            try:
+                qty = min(qty, self._ex.normalize_qty(plan.symbol, target))
+            except Exception as e:  # noqa: BLE001 - без точности биржи qty не уменьшить — не входим
+                return f"qty не пересчитана: {short_error(e)}", qty
+            if qty <= 0:
+                return f"qty после пересчета по цене {entry_px:.6g} = {qty}", qty
+        return None, qty
+
+    def _fill_breach(self, plan: ExecutionPlan, fill_px: float | None) -> str | None:
+        """R:R и стоп по ФАКТИЧЕСКОЙ цене филла маркета с люфтом INV-004 (ревью Codex R1,
+        2026-10-16): проверка перед отправкой видит цену до филла. None — в рамках капа."""
+        if self._caps is None or self._profile is None or fill_px is None or not fill_px > 0:
+            return None
+        is_long = plan.side == "long"
+        if not (plan.sl < fill_px < plan.tp if is_long else plan.tp < fill_px < plan.sl):
+            return f"цена филла не между стопом {plan.sl:.6g} и целью {plan.tp:.6g}"
+        rr = fee_adjusted_rr(fill_px, plan.sl, plan.tp)
+        if rr < self._caps.min_rr_fee_adjusted - FILL_RR_ALLOWANCE:
+            return f"R:R по филлу {rr:.2f} < капа {self._caps.min_rr_fee_adjusted}"
+        sl_pct = abs(fill_px - plan.sl) / fill_px * 100.0
+        lo, hi = self._profile.sl_dist_pct_min, self._profile.sl_dist_pct_max
+        if not lo - FILL_SL_PCT_ALLOWANCE <= sl_pct <= hi + FILL_SL_PCT_ALLOWANCE:
+            return f"стоп по филлу {sl_pct:.2f}% вне [{lo}..{hi}]%"
+        return None
+
+    def _alert(self, text: str) -> None:
+        if self._notify is None:
+            return
+        try:  # send_text шлет parse_mode=HTML, а в тексте бывает ошибка биржи
+            self._notify(html.escape(text, quote=False))
+        except Exception as e:  # noqa: BLE001 - канал не влияет на учет
+            logger.warning("notify failed: %s", e)
 
     @staticmethod
     def risk_sized_qty(plan: ExecutionPlan, entry_price: float) -> float:
@@ -277,6 +364,7 @@ class ExecutionService:
         finally:
             with _INFLIGHT_LOCK:
                 _INFLIGHT.discard(key)
+                _INFLIGHT_TARGETS.pop(key, None)
 
     def _execute(self, decision_id: str, mode: str) -> ExecutionOutcome:
         if mode not in ("market", "limit"):
@@ -288,6 +376,10 @@ class ExecutionService:
             plan = self.plan_for(decision_id)
         except Exception as e:  # noqa: BLE001
             return ExecutionOutcome(False, f"план не прочитан: {e}", kind=KIND_ERROR)
+        key = cid_base(make_client_order_id(self._run_id, decision_id))
+        with _INFLIGHT_LOCK:  # panic, не дождавшийся записи, закроет позицию по символу/стороне
+            if key in _INFLIGHT:
+                _INFLIGHT_TARGETS[key] = (plan.symbol, plan.side)
 
         if mode == "limit" and plan.entry_limit is None:
             return ExecutionOutcome(False, "лимитного уровня нет в плане — только маркет",
@@ -316,15 +408,13 @@ class ExecutionService:
             return ExecutionOutcome(False, f"биржа отказала: {short_error(e)}",
                                     kind=KIND_EXCHANGE_REJECTED)
 
-        # Последний рубеж перед биржей (блок H, 2026-10-16): panic/SAFE MODE/просадка могли
-        # взвестись после предпроверок, а вход «в процессе» panic_flatten не видит.
-        halt = self._halt_reason()
-        if halt is not None:
-            logger.warning("execution refused right before entry for %s: %s", decision_id, halt)
-            return ExecutionOutcome(False, halt, kind=KIND_REFUSED)
-
-        # 1. вход — с прикрепленной защитой, если биржа примет
+        # 1. вход — с прикрепленной защитой, если биржа примет. Последний рубеж (флаги, цена,
+        # R:R, qty) — внутри, перед каждой отправкой (блок H; ревью Codex R1, 2026-10-16)
         entry = self._place_entry(plan, qty, cid, mode, price)
+        qty = entry.qty
+        if entry.refused is not None:
+            logger.warning("execution refused right before entry for %s: %s", decision_id, entry.refused)
+            return ExecutionOutcome(False, entry.refused, kind=KIND_REFUSED)
         if entry.order is None and not entry.unknown:
             logger.error("entry failed for %s: %s", decision_id, entry.error)
             return ExecutionOutcome(False, f"биржа отказала: {short_error(entry.error)}",
@@ -346,7 +436,7 @@ class ExecutionService:
             sl_id, tp_id, protection_error = self._standalone_protection(plan, cid)
             if protection_error is not None:
                 flattened = self._flatten(plan, sl_id)
-        status, entry_price, entry_fee = self._entry_state(plan, entry.order, mode, price)
+        status, entry_price, entry_fee, fill_px = self._entry_state(plan, entry.order, mode, price)
         if entry.attached and status == "open":
             sl_id, tp_id = self._adopt_attached(plan, qty)  # None — подберет монитор
 
@@ -358,6 +448,12 @@ class ExecutionService:
         detail = f"{mode}@{price:.8g}; protection={how}"
         if protection_error is not None:
             detail += f"; protection_failed: {short_error(protection_error)}; flattened={flattened}"
+        # R:R и стоп по цене ФИЛЛА маркета (ревью Codex R1, 2026-10-16): позиция уже открыта с
+        # SL/TP — не закрываем (закрытие по рынку — еще один филл и комиссия), а фиксируем аварию
+        breach = (self._fill_breach(plan, fill_px)
+                  if mode == "market" and status == "open" and protection_error is None else None)
+        if breach is not None:
+            detail += f"; fill_out_of_caps: {breach}"
         self._record(plan, decision_id, cid, mode, qty, status, entry_price, entry_fee,
                      entry.order.exchange_id, sl_id, tp_id, close_reason, detail, closed_at=closed_at)
 
@@ -367,6 +463,12 @@ class ExecutionService:
             msg = f"⚠️ вход исполнен, но стоп не встал ({short_error(protection_error)}); {tail}"
             logger.critical("%s %s", decision_id, msg)
             return ExecutionOutcome(False, msg, cid, mode, entry_sent=True, kind=KIND_PROTECTION_FAILED)
+        if breach is not None:
+            msg = (f"⚠️ {plan.symbol} {plan.side}: вход исполнен по {fill_px:.6g}, {breach} — "
+                   "позиция защищена SL/TP, проверь")
+            logger.critical("%s fill_out_of_caps: %s", decision_id, msg)
+            self._alert(msg)
+            return ExecutionOutcome(False, msg, cid, mode, entry_sent=True, kind=KIND_FILL_OUT_OF_CAPS)
 
         label = "маркет" if mode == "market" else f"лимит {price:.6g}"
         guard = {
@@ -398,37 +500,46 @@ class ExecutionService:
     def _place_entry(self, plan: ExecutionPlan, qty: float, cid: str, mode: str,
                      price: float) -> _EntryResult:
         kw = {"entry_type": mode, "price": None if mode == "market" else price}
+        reason, qty = self._send_gate(plan, mode, qty)
+        if reason is not None:
+            return _EntryResult(None, attached=True, qty=qty, refused=reason)
         try:
             order = self._ex.place_entry(plan.symbol, plan.side, qty, cid,
                                          stop_loss=plan.sl, take_profit=plan.tp, **kw)
-            return _EntryResult(order, attached=True)
+            return _EntryResult(order, attached=True, qty=qty)
         except Exception as e:  # noqa: BLE001
             if _is_ambiguous(e):
-                return self._resolve_unknown_entry(plan, cid, mode, e, attached=True)
+                return self._resolve_unknown_entry(plan, cid, mode, e, attached=True, qty=qty)
             # Голый повтор — ТОЛЬКО после явного отказа биржи с кодом (ордера точно нет;
             # возможно, не принято прикрепление). Rate limit/бан — не повторяем, без кода
             # (локальная ошибка) — тоже.
             if exchange_error_code(e) is None or classify_error(e) == "cooldown":
-                return _EntryResult(None, attached=True, error=e)
+                return _EntryResult(None, attached=True, error=e, qty=qty)
             logger.warning("entry with attached SL/TP rejected for %s (%s) - retrying bare entry",
                            cid, short_error(e))
+        # Повтор — та же проверка заново (ревью Codex R1, 2026-10-16): пока биржа отвечала
+        # отказом, другой поток мог взвести panic и закончить flatten, не видя этого входа.
+        reason, qty = self._send_gate(plan, mode, qty)
+        if reason is not None:
+            return _EntryResult(None, attached=False, qty=qty, refused=reason)
         try:
             return _EntryResult(self._ex.place_entry(plan.symbol, plan.side, qty, cid, **kw),
-                                attached=False)
+                                attached=False, qty=qty)
         except Exception as e:  # noqa: BLE001
             if _is_ambiguous(e):
-                return self._resolve_unknown_entry(plan, cid, mode, e, attached=False)
-            return _EntryResult(None, attached=False, error=e)
+                return self._resolve_unknown_entry(plan, cid, mode, e, attached=False, qty=qty)
+            return _EntryResult(None, attached=False, error=e, qty=qty)
 
     def _resolve_unknown_entry(self, plan: ExecutionPlan, cid: str, mode: str, err: Exception,
-                               attached: bool) -> _EntryResult:
+                               attached: bool, qty: float) -> _EntryResult:
         """Таймаут на входе: ордер мог быть принят. Повторять вслепую нельзя (двойной
         вход) — спрашиваем биржу по clientOrderId."""
         try:
             st = self._ex.order_status(plan.symbol, client_order_id=cid)
         except Exception:  # noqa: BLE001 - не нашли/не дозвонились: исход неизвестен
-            return _EntryResult(None, attached=attached, unknown=True, error=err)
-        return _EntryResult(PlacedOrder(st.exchange_id, cid, mode.upper(), st.status), attached=attached)
+            return _EntryResult(None, attached=attached, unknown=True, error=err, qty=qty)
+        return _EntryResult(PlacedOrder(st.exchange_id, cid, mode.upper(), st.status),
+                            attached=attached, qty=qty)
 
     def _wait_position(self, plan: ExecutionPlan) -> bool:
         waited = 0.0
@@ -459,7 +570,9 @@ class ExecutionService:
     def _standalone_protection(self, plan: ExecutionPlan, cid: str):
         """Маркет без прикрепленной защиты: дождаться позиции и поставить SL/TP.
         Не встал SL — ошибка (позицию закроем). Не встал TP — позиция защищена
-        стопом, TP поставит монитор: не повод закрываться."""
+        стопом, TP поставит монитор: не повод закрываться. Флаги защиты здесь НЕ
+        проверяются (ревью Codex R1): SL/TP — closePosition-ордера, позицию они не
+        открывают, а при panic голую позицию тем более нельзя оставлять без стопа."""
         if not self._wait_position(plan):
             logger.warning("position %s %s not visible after %.0fs", plan.symbol, plan.side,
                            POSITION_WAIT_SEC)
@@ -493,19 +606,20 @@ class ExecutionService:
 
     def _entry_state(
         self, plan: ExecutionPlan, entry_order: PlacedOrder, mode: str, price: float
-    ) -> tuple[str, float, float | None]:
+    ) -> tuple[str, float, float | None, float | None]:
         """Статус/цена/комиссия входа ПО БИРЖЕ: маркет мог не исполниться, а
-        цена исполнения отличается от плановой (слиппедж) — журнал не выдумывает."""
+        цена исполнения отличается от плановой (слиппедж) — журнал не выдумывает.
+        Последнее — цена филла, если ее отдала биржа (None — не знаем)."""
         if mode == "limit":
-            return "pending", price, None
+            return "pending", price, None, None
         try:
             st = self._ex.order_status(plan.symbol, exchange_id=entry_order.exchange_id)
         except Exception as e:  # noqa: BLE001 - уточнит монитор/реконсиляция
             logger.warning("entry fill lookup failed for %s: %s", entry_order.exchange_id, e)
-            return "open", price, None
+            return "open", price, None, None
         if st.is_filled:
-            return "open", st.avg_price or price, st.fee
-        return "pending", price, None
+            return "open", st.avg_price or price, st.fee, st.avg_price
+        return "pending", price, None, None
 
     def _flatten(self, plan: ExecutionPlan, sl_id: str | None) -> bool:
         """Стоп не встал на маркет-входе — позицию без стопа не держим."""
@@ -550,6 +664,9 @@ def equity_guarded(
     plan_fn=None,  # (decision_id) -> ExecutionPlan
     risk_cap_pct: float | None = None,  # caps.risk_per_trade_pct
     tolerance: float = 0.10,
+    live=None,  # LiveEquity: equity с биржи с моментом ответа (risk/drawdown.py)
+    max_age_sec: float = EQUITY_MAX_AGE_SEC,
+    drawdown=None,  # DrawdownGuard: защелка просадки по тому же свежему equity — до входа
 ):
     """Обертка исполнения: без свежего equity с биржи ордера не ставим (ст. 1).
 
@@ -557,23 +674,48 @@ def equity_guarded(
     выдуманным; план посчитан на equity, которого может не быть. Кнопка
     честно отвечает причиной, карточка остается живой.
 
+    С live (ревью Codex R1, 2026-10-16): equity не старше max_age_sec, иначе свежий запрос
+    к бирже; не ответила — отказ. Часовой кеш runner'а с источником exchange пропускал вход
+    после падения баланса. По этому же значению — пик и защелка просадки до исполнения.
+
     Вторая проверка: план мог быть посчитан на ДРУГОМ equity (дефолтные $1000
     до первого ответа биржи) — риск плана сверяется с живым equity и капсом.
     """
 
     def guarded(decision_id: str, mode: str) -> ExecutionOutcome:
-        source = equity_source_fn()
-        if source != "exchange":
-            return ExecutionOutcome(
-                False,
-                f"equity с биржи недоступен (источник: {source}) — исполнение "
-                "заблокировано. Проверь API-ключ BingX.",
-                kind=KIND_REFUSED,
-            )
-        if equity_fn is not None and plan_fn is not None and risk_cap_pct is not None:
+        fresh = None
+        if live is not None:
+            fresh = live.fresh(max_age_sec)
+            if fresh is None:
+                return ExecutionOutcome(
+                    False, "нет свежего equity с биржи — исполнение заблокировано. "
+                    "Проверь API-ключ BingX.", kind=KIND_REFUSED,
+                )
+            if drawdown is not None:
+                try:  # уже взведенную защелку отклонит _halt_reason исполнителя (meta)
+                    halt = drawdown.observe(fresh)
+                except Exception as e:  # noqa: BLE001 - журнал недоступен: не входим
+                    return ExecutionOutcome(False, f"стоп по просадке не проверен: {e}",
+                                            kind=KIND_ERROR)
+                if halt is not None:  # взведена этим входом: монитор алерт уже не пошлет
+                    return ExecutionOutcome(
+                        False, f"🛑 {halt.message()}. Снять — oskar drawdown-reset",
+                        kind=KIND_REFUSED,
+                    )
+        else:
+            source = equity_source_fn()
+            if source != "exchange":
+                return ExecutionOutcome(
+                    False,
+                    f"equity с биржи недоступен (источник: {source}) — исполнение "
+                    "заблокировано. Проверь API-ключ BingX.",
+                    kind=KIND_REFUSED,
+                )
+        if (fresh is not None or equity_fn is not None) and plan_fn is not None \
+                and risk_cap_pct is not None:
             try:
                 plan = plan_fn(decision_id)
-                equity = float(equity_fn())
+                equity = fresh if fresh is not None else float(equity_fn())
             except Exception as e:  # noqa: BLE001
                 return ExecutionOutcome(False, f"план/equity не прочитаны: {e}", kind=KIND_ERROR)
             allowed = risk_cap_pct / 100.0 * equity * (1.0 + tolerance)

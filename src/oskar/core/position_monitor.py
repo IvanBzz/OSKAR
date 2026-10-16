@@ -148,6 +148,9 @@ class PositionMonitor:
     # ------------------------------------------------------------------ tick
 
     def tick(self) -> MonitorReport:
+        from oskar.core.emergency import retry_safe_mode_persist
+
+        retry_safe_mode_persist(self._state)  # SAFE MODE не записан в meta — повтор (ревью Codex R1)
         rep = MonitorReport()
         self._guard(rep, "sweeper", lambda: self._sweep_expired(rep))
         self._pending_pass(rep)
@@ -695,6 +698,36 @@ class PositionMonitor:
                 out["errors"].append(f"{t['decision_id']}: {e}")
         self._say(f"🚨 PANIC: снято входов {out['cancelled']}, закрыто позиций {out['closed']}, "
                   f"ошибок {len(out['errors'])}")
+        return out
+
+    def panic_flatten_inflight(self, entries: dict) -> dict:
+        """Panic, а вход «в процессе» не записан в журнал за окно ожидания (ревью Codex R1,
+        2026-10-16): снять по бирже. entries — {база cid OSKAR-<run>-<hash>: (symbol, side) | None}.
+        Ордера с этой базой cid (вход, -sl/-tp) — отмена; позиция символа/стороны входа —
+        рыночное закрытие и снятие ее SL/TP (прикрепленные — без cid)."""
+        out = {"cancelled": 0, "closed": 0, "errors": []}
+        keys = {cid_base(k) for k in entries}
+        self._say(f"🚨 PANIC: вход в процессе не записан за окно ожидания ({len(keys)}) — "
+                  "снимаю по бирже по clientOrderId, проверь биржу")
+        try:
+            for o in self._ex.open_orders_all():
+                if o.client_order_id and cid_base(o.client_order_id) in keys:
+                    self._ex.cancel_order(o.symbol, o.exchange_id)
+                    out["cancelled"] += 1
+        except Exception as e:  # noqa: BLE001 - позиции закрываем все равно
+            out["errors"].append(f"open orders: {e}")
+        for key, target in entries.items():
+            if target is None:
+                continue  # план еще не прочитан — до биржи вход не дошел
+            symbol, side = target
+            try:
+                if self._ex.close_position(symbol, side) is not None:
+                    out["closed"] += 1
+                for o in self._ex.protection_orders(symbol, side):
+                    if o.status == "open":
+                        self._ex.cancel_order(symbol, o.exchange_id)
+            except Exception as e:  # noqa: BLE001
+                out["errors"].append(f"{key}: {e}")
         return out
 
     # ---------------------------------------------------------------- thread

@@ -4,6 +4,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -14,6 +15,11 @@ class RuntimeState:
     paused: bool = False
     safe_mode: bool = False
     panic_at: float | None = None
+    # SAFE MODE на двух носителях (2026-10-16, ревью Codex R1): запись в meta упала (SQLite
+    # занят) — флаг стоял только в памяти, и рестарт супервизором молча снимал защиту.
+    safe_mode_unsaved: bool = False  # meta не записана: монитор и runner повторяют каждый тик
+    safe_mode_record: str | None = None  # JSON {"reason","at"} для повтора записи
+    safe_mode_flag: Path | None = None  # маркер-файл (демон: data/safe_mode.flag); None — без файла
 
     @property
     def uptime_sec(self) -> int:

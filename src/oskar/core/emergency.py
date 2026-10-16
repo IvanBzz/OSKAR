@@ -9,19 +9,33 @@
    не смеет задержать panic (ст. 6 п. 2);
 2. флаг в `meta` — panic переживает рестарт (ст. 6 п. 3: снятие только явной
    командой оператора);
-3. биржа: `monitor.panic_flatten()` — снять входы, закрыть позиции.
+3. биржа: `monitor.panic_flatten()` — снять входы, закрыть позиции;
+4. входы «в процессе» (2026-10-16, ревью Codex R1): исполнитель мог пройти последнюю
+   проверку флагов до panic и уже слать вход — записи в журнале еще нет, flatten ее не
+   видит. Ждем до PANIC_INFLIGHT_WAIT_SEC, пока реестр in-flight опустеет, и делаем
+   финальный проход по только что записанным сделкам; не опустел — алерт и снятие по
+   бирже по clientOrderId этих входов.
 
 SAFE MODE (блок H, 2026-10-16) тоже переживает рестарт: супервизор блока G перезапускает
 демон, и флаг только в памяти («позиция без SL», расхождение с биржей) снимался бы молча.
 Взвод — флаг в памяти и запись в `meta` (с причиной), старт — восстановление с алертом,
 снятие — только явное (`reset_panic`: CLI `oskar panic-reset` / POST /panic/reset).
+
+Два носителя SAFE MODE (2026-10-16, ревью Codex R1): запись в meta падала (SQLite занят) —
+флаг стоял только в памяти, повтора не было, и рестарт снимал защиту. Теперь второй
+носитель — маркер-файл data/safe_mode.flag (атомарно: tmp + rename); несохраненная meta
+повторяется на каждом тике монитора и runner'а; старт восстанавливает SAFE MODE по ЛЮБОМУ
+носителю; panic-reset снимает оба.
 """
 
 import html
 import json
 import logging
+import os
 import threading
+import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 from oskar.core.state import RuntimeState
 from oskar.journal.db import transaction
@@ -30,18 +44,63 @@ logger = logging.getLogger("oskar.emergency")
 
 PANIC_META_KEY = "panic_engaged"
 SAFE_MODE_META_KEY = "safe_mode_engaged"
+SAFE_MODE_FLAG_NAME = "safe_mode.flag"  # в data/ демона: второй носитель SAFE MODE
+PANIC_INFLIGHT_WAIT_SEC = 15.0  # panic ждет входы «в процессе» до финального прохода
+PANIC_INFLIGHT_POLL_SEC = 0.25
 
 # Два канала сразу (Telegram + API/CLI) не должны закрывать одни и те же позиции
 # параллельно: второй ждет первого и проходит по уже пустым спискам. Флаги
 # второго вызова ставятся ДО замка — ожидание касается только биржевой части.
 _FLATTEN_LOCK = threading.Lock()
+# Запись носителей SAFE MODE: взвод, повтор с тиков и panic-reset не перемешиваются
+# (повтор после reset воскресил бы SAFE MODE в meta).
+_SAFE_MODE_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
-def engage_panic(state: RuntimeState, monitor=None) -> dict:
+# ------------------------------------------------------------------- panic
+
+
+def _flatten_pass(fn) -> dict:
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 - биржа недоступна: оператор видит это в ответе
+        return {"error": str(e)}
+
+
+def _merge_passes(*parts: dict) -> dict:
+    out = {"cancelled": 0, "closed": 0, "errors": []}
+    for part in parts:
+        if "error" in part:
+            out["errors"].append(str(part["error"]))
+            continue
+        out["cancelled"] += int(part.get("cancelled", 0))
+        out["closed"] += int(part.get("closed", 0))
+        out["errors"].extend(part.get("errors") or [])
+    return out
+
+
+def _await_inflight(wait_sec: float, sleep, clock) -> tuple[bool, dict]:
+    """(были ли входы «в процессе», оставшиеся по истечении окна {ключ cid: (symbol, side)})."""
+    from oskar.core.executor import inflight_entries  # executor импортирует этот модуль
+
+    deadline = clock() + wait_sec
+    seen = False
+    while True:
+        left = inflight_entries()
+        if not left:
+            return seen, {}
+        seen = True
+        if clock() >= deadline:
+            return seen, left
+        sleep(PANIC_INFLIGHT_POLL_SEC)
+
+
+def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float = PANIC_INFLIGHT_WAIT_SEC,
+                 sleep=time.sleep, clock=time.monotonic) -> dict:
     """Ст. 6 п. 1: немедленно и безусловно. Ответ — тот же JSON, что отдавал `/panic`:
     exchange=None — монитора нет (нет ключей биржи), биржа не тронута."""
     state.panic()  # флаги ПЕРВЫМИ, ничто не смеет задержать
@@ -53,12 +112,28 @@ def engage_panic(state: RuntimeState, monitor=None) -> dict:
             )
     except Exception as e:  # noqa: BLE001 - флаги уже стоят, биржу снимаем все равно
         result["persist_error"] = str(e)
+        # panic не записан: защиту держит SAFE MODE на двух носителях (маркер-файл сразу,
+        # meta — повтором с тиков), иначе рестарт снял бы все (ревью Codex R1, 2026-10-16)
+        with _SAFE_MODE_LOCK:
+            state.safe_mode_record = _safe_mode_record(f"panic не записан в журнал: {e}")
+            _persist_safe_mode(state)
     if monitor is not None:
         with _FLATTEN_LOCK:
-            try:
-                result["exchange"] = monitor.panic_flatten()  # отмена ордеров + закрытие позиций
-            except Exception as e:  # noqa: BLE001 - биржа недоступна: оператор видит это в ответе
-                result["exchange"] = {"error": str(e)}
+            first = _flatten_pass(monitor.panic_flatten)  # отмена ордеров + закрытие позиций
+            # Вход «в процессе» мог пройти последнюю проверку флагов до panic: ждем его
+            # записи и закрываем финальным проходом (ревью Codex R1, 2026-10-16).
+            waited, left = _await_inflight(inflight_wait_sec, sleep, clock)
+            if not waited:
+                result["exchange"] = first
+                return result
+            parts = [first, _flatten_pass(monitor.panic_flatten)]
+            if left:
+                logger.critical("panic: %d entr(ies) still in flight after %.0fs: %s",
+                                len(left), inflight_wait_sec, sorted(left))
+                parts.append(_flatten_pass(lambda: monitor.panic_flatten_inflight(left)))
+            result["exchange"] = _merge_passes(*parts)
+            if left:
+                result["exchange"]["inflight_unfinished"] = sorted(left)
     return result
 
 
@@ -68,13 +143,19 @@ def reset_panic(state: RuntimeState) -> dict:
 
     Сначала журнал, потом память: не записалось — panic остается взведенным
     целиком (раньше флаги снимались до записи, и сбой БД давал «panic снят до
-    рестарта, а после рестарта снова взведен»)."""
-    with transaction(state.journal):
-        state.journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_META_KEY,))
-        # SAFE MODE снимается здесь же и тоже сначала в журнале (блок H, 2026-10-16)
-        state.journal.execute("DELETE FROM meta WHERE key = ?", (SAFE_MODE_META_KEY,))
-    state.panic_at = None
-    state.safe_mode = False
+    рестарта, а после рестарта снова взведен»). Маркер-файл SAFE MODE удаляется до
+    снятия флагов в памяти: не удалился — исключение, флаги стоят."""
+    with _SAFE_MODE_LOCK:
+        with transaction(state.journal):
+            state.journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_META_KEY,))
+            # SAFE MODE снимается здесь же и тоже сначала в журнале (блок H, 2026-10-16)
+            state.journal.execute("DELETE FROM meta WHERE key = ?", (SAFE_MODE_META_KEY,))
+        if state.safe_mode_flag is not None:
+            state.safe_mode_flag.unlink(missing_ok=True)  # второй носитель (ревью Codex R1)
+        state.panic_at = None
+        state.safe_mode = False
+        state.safe_mode_unsaved = False
+        state.safe_mode_record = None
     return {"panic": False, "safe_mode": False, "paused": state.paused}
 
 
@@ -84,22 +165,92 @@ def panic_engaged(journal) -> str | None:
     return row[0] if row else None
 
 
-def engage_safe_mode(state: RuntimeState, reason: str) -> bool:
-    """Взвести SAFE MODE: флаг в памяти ПЕРВЫМ, затем запись в meta с причиной (переживает
-    рестарт). Запись не удалась — флаг стоит до рестарта, ошибка в лог. True — взведен
-    этим вызовом (алерт шлет вызывающий, один раз)."""
-    if state.safe_mode:
-        return False
-    state.safe_mode = True
+# --------------------------------------------------------------- SAFE MODE
+
+
+def _safe_mode_record(reason: str) -> str:
+    return json.dumps({"reason": reason, "at": _now_iso()}, ensure_ascii=False)
+
+
+def _parse_record(raw: str) -> dict:
+    try:
+        info = json.loads(raw)
+        return {"reason": str(info.get("reason", "")), "at": info.get("at")}
+    except (ValueError, AttributeError):
+        return {"reason": str(raw), "at": None}  # битая запись — все равно SAFE MODE
+
+
+def _write_flag_file(path: Path, record: str) -> None:
+    """Атомарно: tmp + rename — недописанный файл не выглядит как «SAFE MODE снят»."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(record, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def read_safe_mode_flag(path: Path | None) -> dict | None:
+    """{"reason", "at"} из маркер-файла; None — файла нет. Нечитаемый файл — все равно SAFE MODE."""
+    if path is None or not path.exists():
+        return None
+    try:
+        return _parse_record(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        return {"reason": f"маркер-файл SAFE MODE не прочитан ({e})", "at": None}
+
+
+def _persist_safe_mode(state: RuntimeState) -> bool:
+    """Оба носителя из state.safe_mode_record: маркер-файл и meta. True — meta записана.
+    Вызывается под _SAFE_MODE_LOCK; исключений не бросает."""
+    record = state.safe_mode_record or _safe_mode_record("причина не записана")
+    if state.safe_mode_flag is not None:
+        try:
+            _write_flag_file(state.safe_mode_flag, record)
+        except OSError as e:
+            logger.error("SAFE MODE flag file %s not written: %s", state.safe_mode_flag, e)
     try:
         with transaction(state.journal):
             state.journal.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-                (SAFE_MODE_META_KEY, json.dumps({"reason": reason, "at": _now_iso()}, ensure_ascii=False)),
+                "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (SAFE_MODE_META_KEY, record)
             )
-    except Exception as e:  # noqa: BLE001 - флаг уже стоит; рестарт его не удержит — громко в лог
-        logger.error("SAFE MODE not persisted (a restart would lift it): %s", e)
+    except Exception as e:  # noqa: BLE001 - флаг уже стоит; повтор — с тиков монитора и runner'а
+        state.safe_mode_unsaved = True
+        logger.error("SAFE MODE not persisted to journal (retry every tick; flag file %s): %s",
+                     "written" if state.safe_mode_flag is not None else "off", e)
+        return False
+    state.safe_mode_unsaved = False
     return True
+
+
+def engage_safe_mode(state: RuntimeState, reason: str) -> bool:
+    """Взвести SAFE MODE: флаг в памяти ПЕРВЫМ, затем маркер-файл и запись в meta с причиной
+    (переживают рестарт). meta не записалась — признак state.safe_mode_unsaved, повтор с тиков
+    (retry_safe_mode_persist). True — взведен этим вызовом (алерт шлет вызывающий, один раз)."""
+    if state.safe_mode:
+        return False
+    state.safe_mode = True
+    with _SAFE_MODE_LOCK:
+        state.safe_mode_record = _safe_mode_record(reason)
+        _persist_safe_mode(state)
+    return True
+
+
+def retry_safe_mode_persist(state: RuntimeState | None) -> bool | None:
+    """Тик монитора и runner'а (ревью Codex R1, 2026-10-16): SAFE MODE, не записанный в meta,
+    пишется снова, пока не удастся. None — повторять нечего, True — записан этим вызовом.
+    Исключений не бросает: тик не роняет."""
+    if state is None or not getattr(state, "safe_mode_unsaved", False):
+        return None
+    try:
+        with _SAFE_MODE_LOCK:
+            if not state.safe_mode_unsaved or not state.safe_mode:
+                return None  # снят оператором между проверкой и замком
+            ok = _persist_safe_mode(state)
+    except Exception as e:  # noqa: BLE001
+        logger.error("SAFE MODE persist retry failed: %s", e)
+        return False
+    if ok:
+        logger.warning("SAFE MODE persisted to journal on retry")
+    return ok
 
 
 def safe_mode_engaged(journal) -> dict | None:
@@ -107,20 +258,27 @@ def safe_mode_engaged(journal) -> dict | None:
     row = journal.execute("SELECT value FROM meta WHERE key = ?", (SAFE_MODE_META_KEY,)).fetchone()
     if row is None:
         return None
-    try:
-        info = json.loads(row[0])
-        return {"reason": str(info.get("reason", "")), "at": info.get("at")}
-    except (ValueError, AttributeError):
-        return {"reason": str(row[0]), "at": None}  # битая запись — все равно SAFE MODE
+    return _parse_record(row[0])
 
 
 def restore_safe_mode(state: RuntimeState, notify=None) -> str | None:
-    """Старт демона: SAFE MODE из meta -> флаг + алерт. Возвращает причину или None."""
+    """Старт демона: SAFE MODE по ЛЮБОМУ носителю (meta или маркер-файл) -> флаг + алерт.
+    Носители разошлись (сбой записи до рестарта) — недостающий дописывается; meta не
+    записалась — повтор с тиков. Возвращает причину или None."""
     info = safe_mode_engaged(state.journal)
-    if info is None:
+    flag = read_safe_mode_flag(state.safe_mode_flag)
+    if info is None and flag is None:
         return None
     state.safe_mode = True
-    reason = info["reason"] or "причина не записана"
+    src = info or flag
+    reason = src["reason"] or "причина не записана"
+    if info is None or (flag is None and state.safe_mode_flag is not None):
+        with _SAFE_MODE_LOCK:
+            state.safe_mode_record = json.dumps(
+                {"reason": src["reason"], "at": src["at"]}, ensure_ascii=False)
+            _persist_safe_mode(state)
+    if info is None:
+        logger.error("SAFE MODE restored from flag file only (journal had no record): %s", reason)
     if notify is not None:
         try:  # send_text шлет parse_mode=HTML, а в причине бывает текст ошибки биржи
             notify("🛑 " + html.escape(f"SAFE MODE восстановлен после рестарта: {reason}", quote=False))
