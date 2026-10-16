@@ -1,0 +1,415 @@
+<title>Пульт OSKAR</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --bg:#f5f3ee; --panel:#fffdf8; --ink:#1c2229; --muted:#5d6670; --faint:#8a929b; --rule:#dcd8cf; --track:#e7e3da;
+  --accent:#b9770e; --accent-soft:#f6e7c8;
+  --ok:#2e8a57; --ok-soft:#d9efe2; --warn:#b98309; --warn-soft:#f6ebcc; --wip:#2c66c9; --wip-soft:#dce7fb;
+  --risk:#c0432f; --risk-soft:#f8dcd5; --none:#9aa1a9; --none-soft:#eceae5;
+  --mono:"IBM Plex Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0e1216; --panel:#151a20; --ink:#e4e8ec; --muted:#a0a9b3; --faint:#717b86; --rule:#27303a; --track:#222a33;
+  --accent:#f0b43c; --accent-soft:#3a2f17;
+  --ok:#4cc38a; --ok-soft:#16322a; --warn:#e9b949; --warn-soft:#3a3016; --wip:#6ea2ff; --wip-soft:#18284a;
+  --risk:#ff7a66; --risk-soft:#43201b; --none:#6b7580; --none-soft:#1e252d; color-scheme:dark;}}
+:root[data-theme="dark"]{
+  --bg:#0e1216; --panel:#151a20; --ink:#e4e8ec; --muted:#a0a9b3; --faint:#717b86; --rule:#27303a; --track:#222a33;
+  --accent:#f0b43c; --accent-soft:#3a2f17;
+  --ok:#4cc38a; --ok-soft:#16322a; --warn:#e9b949; --warn-soft:#3a3016; --wip:#6ea2ff; --wip-soft:#18284a;
+  --risk:#ff7a66; --risk-soft:#43201b; --none:#6b7580; --none-soft:#1e252d; color-scheme:dark;}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.5;margin:0}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:20px;padding-block:28px 64px;display:flex;flex-direction:column;gap:40px}
+@media (max-width:520px){.wrap{padding-inline:16px}}
+h1,h2,h3{text-wrap:balance;margin:0;line-height:1.2}
+h1{font-size:30px;font-weight:700;letter-spacing:-.01em}
+h2{font-size:20px;font-weight:600}
+h3{font-size:15px;font-weight:600}
+p{margin:0}
+.mono{font-family:var(--mono)}
+.label{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.num{font-variant-numeric:tabular-nums}
+section{display:flex;flex-direction:column;gap:16px}
+.sec-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid var(--rule);padding-bottom:8px}
+.sec-head .label{white-space:nowrap}
+
+/* header */
+header{display:flex;flex-direction:column;gap:14px}
+.topline{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+.pill{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:999px;font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.04em}
+.pill.auto{background:var(--ok-soft);color:var(--ok)}
+.pill.snap{background:var(--none-soft);color:var(--muted)}
+.led{width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px color-mix(in srgb,currentColor 20%,transparent)}
+.lede{color:var(--muted);max-width:72ch}
+
+/* KPI */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:10px;overflow:hidden}
+.kpi{background:var(--panel);padding:14px 16px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.kpi .v{font-family:var(--mono);font-size:26px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.1}
+.kpi .v small{font-size:14px;color:var(--faint);font-weight:500}
+.kpi .s{font-size:12.5px;color:var(--muted)}
+.kpi.bad .v{color:var(--risk)} .kpi.good .v{color:var(--ok)} .kpi.mid .v{color:var(--warn)}
+
+/* bars */
+.bar{position:relative;height:8px;background:var(--track);border-radius:4px;overflow:hidden}
+.bar>i{position:absolute;inset:0 auto 0 0;border-radius:4px;background:var(--accent)}
+.bar.ok>i{background:var(--ok)} .bar.warn>i{background:var(--warn)} .bar.wip>i{background:var(--wip)} .bar.risk>i{background:var(--risk)} .bar.none>i{background:var(--none)}
+.bar.live>i{background:repeating-linear-gradient(135deg,var(--ok) 0 5px,color-mix(in srgb,var(--ok) 70%,var(--panel)) 5px 8px)}
+
+/* phases */
+.phases{display:flex;flex-direction:column;gap:2px;background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:6px 0}
+.phase{display:grid;grid-template-columns:58px minmax(0,1.3fr) minmax(0,2fr) 48px;gap:14px;align-items:center;padding:10px 18px}
+.phase+.phase{border-top:1px dashed var(--rule)}
+.phase .pn{font-family:var(--mono);font-weight:600;color:var(--faint)}
+.phase .pt{display:flex;flex-direction:column;gap:2px;min-width:0}
+.phase .pt span{font-size:12.5px;color:var(--muted)}
+.phase .pct{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;font-weight:600}
+@media (max-width:640px){.phase{grid-template-columns:44px minmax(0,1fr) 44px}.phase .bar{grid-column:2/4;grid-row:2}}
+.gate{display:flex;gap:16px;align-items:center;flex-wrap:wrap;background:var(--accent-soft);border-radius:10px;padding:12px 16px}
+.gate .g-track{flex:1 1 260px;display:flex;gap:3px;min-width:0}
+.gate .g-track i{flex:1;height:14px;border-radius:2px;background:color-mix(in srgb,var(--accent) 22%,var(--panel))}
+.gate b{font-family:var(--mono)}
+
+/* architecture */
+.arch{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:16px;overflow-x:auto}
+.arch pre.mermaid{margin:0;min-width:760px;background:transparent}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:12.5px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block;border:1px solid var(--rule)}
+
+/* blocks */
+.layer{display:flex;flex-direction:column;gap:10px}
+.layer>.label{color:var(--accent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card .ch{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.card .path{font-family:var(--mono);font-size:11.5px;color:var(--faint);word-break:break-all}
+.card .note{font-size:13px;color:var(--muted)}
+.chip{flex:none;font-family:var(--mono);font-size:11px;font-weight:600;letter-spacing:.03em;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.chip.ok{background:var(--ok-soft);color:var(--ok)} .chip.warn{background:var(--warn-soft);color:var(--warn)}
+.chip.wip{background:var(--wip-soft);color:var(--wip)} .chip.risk{background:var(--risk-soft);color:var(--risk)} .chip.none{background:var(--none-soft);color:var(--muted)}
+.meters{display:grid;grid-template-columns:auto minmax(0,1fr) 36px;gap:6px 10px;align-items:center;font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+.meters .p{text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
+
+/* funnel */
+.funnel{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:16px 18px;display:flex;flex-direction:column;gap:9px}
+.frow{display:grid;grid-template-columns:minmax(0,220px) minmax(0,1fr) 46px;gap:12px;align-items:center}
+.frow .fl{font-size:13.5px;min-width:0}
+.frow .fl span{display:block;font-size:12px;color:var(--faint)}
+.frow .fb{height:18px;background:var(--track);border-radius:3px;position:relative;overflow:hidden}
+.frow .fb i{position:absolute;inset:0 auto 0 0;background:var(--accent);border-radius:3px;min-width:2px}
+.frow .fb i.loss{background:var(--risk)}
+.frow .fn{font-family:var(--mono);font-variant-numeric:tabular-nums;text-align:right;font-weight:600}
+@media (max-width:560px){.frow{grid-template-columns:minmax(0,1fr) 46px}.frow .fb{grid-column:1/3;grid-row:2}}
+.axis{display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--faint);margin-left:calc(min(220px,30%) + 12px);margin-right:58px}
+@media (max-width:560px){.axis{margin-left:0;margin-right:58px}}
+
+/* uptime */
+.uptime{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.ut-track{position:relative;height:34px;background:var(--risk-soft);border-radius:4px;overflow:hidden}
+.ut-track i{position:absolute;top:0;bottom:0;background:var(--ok)}
+.ut-days{position:relative;height:16px;font-family:var(--mono);font-size:11px;color:var(--faint)}
+.ut-days span{position:absolute;transform:translateX(-50%)}
+.ut-grid{position:absolute;inset:0;pointer-events:none}
+.ut-grid b{position:absolute;top:0;bottom:0;width:1px;background:color-mix(in srgb,var(--panel) 60%,transparent)}
+
+/* tables & lists */
+.tbl-wrap{overflow-x:auto;background:var(--panel);border:1px solid var(--rule);border-radius:10px}
+table{border-collapse:collapse;width:100%;min-width:640px;font-size:13.5px}
+th,td{text-align:left;padding:10px 14px;vertical-align:top;border-bottom:1px solid var(--rule)}
+th{font-family:var(--mono);font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:500}
+tr:last-child td{border-bottom:0}
+td.k{font-family:var(--mono);font-weight:600;white-space:nowrap}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.box{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:16px 18px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.box ul,.box ol{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:7px;font-size:13.5px}
+.box li b{font-weight:600}
+.who{display:inline-flex;align-items:center;gap:8px}
+.who i{width:10px;height:10px;border-radius:50%;display:inline-block}
+.timeline{display:flex;flex-direction:column;gap:0;background:var(--panel);border:1px solid var(--rule);border-radius:10px}
+.tl{display:grid;grid-template-columns:110px minmax(0,1fr);gap:16px;padding:14px 18px}
+.tl+.tl{border-top:1px solid var(--rule)}
+.tl .d{font-family:var(--mono);font-size:12.5px;color:var(--accent);font-weight:600}
+.tl .t{display:flex;flex-direction:column;gap:4px;min-width:0}
+.tl .t p{font-size:13.5px;color:var(--muted)}
+.tl .t em{font-style:normal;font-family:var(--mono);font-size:12px;color:var(--ok)}
+@media (max-width:560px){.tl{grid-template-columns:1fr;gap:4px}}
+.asks{counter-reset:a}
+.ask{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;padding:10px 0;border-top:1px dashed var(--rule)}
+.ask:first-child{border-top:0}
+.ask::before{counter-increment:a;content:counter(a);font-family:var(--mono);font-weight:600;color:var(--accent)}
+.ask p{font-size:13.5px}
+.ask code{font-family:var(--mono);font-size:12.5px;background:var(--none-soft);padding:1px 6px;border-radius:4px}
+.corr{border-left:3px solid var(--warn);background:var(--warn-soft);border-radius:6px;padding:12px 16px;font-size:13.5px}
+footer{font-size:12px;color:var(--faint);font-family:var(--mono)}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="topline">
+    <span class="label">OSKAR · BingX USDT-перпы · интрадей 15м</span>
+    <span class="pill auto"><span class="led"></span>АВТОМАТ · VST</span>
+    <span class="pill snap mono" id="snap">срез 16.10.2026 · 04:20 МСК · релиз R1</span>
+  </div>
+  <h1>Пульт OSKAR</h1>
+  <p class="lede">Что готово, что проверено на бирже и что дальше. Источники: 4 аудитора Claude (сверка с эталоном целей), Codex gpt-6-astra (ревью стратегии, планировщик, думающий центр), журнал <span class="mono">data/oskar.db</span> и логи демона.</p>
+</header>
+
+<section aria-label="Ключевые показатели">
+  <div class="kpis">
+    <div class="kpi bad"><span class="label">Закрытых сделок</span><span class="v num">0<small> / 60</small></span><span class="s">гейт реала: PF ≥ 1.3 на 60</span></div>
+    <div class="kpi mid"><span class="label">Аптайм за 7 дней</span><span class="v num">16.7<small>%</small></span><span class="s">28 ч из 168; супервизора не было</span></div>
+    <div class="kpi"><span class="label">Кандидатов в журнале</span><span class="v num">266</span><span class="s">до биржи дошел 1</span></div>
+    <div class="kpi good"><span class="label">Тестов</span><span class="v num" id="kpi-tests">519</span><span class="s">в main; с веткой F — 551</span></div>
+    <div class="kpi"><span class="label">Вызовов LLM</span><span class="v num">98</span><span class="s">Scout 84 · Trader 14</span></div>
+    <div class="kpi"><span class="label">Коммитов</span><span class="v num" id="kpi-commits">58</span><span class="s">+1 в ветке F; только от Ивана</span></div>
+  </div>
+</section>
+
+<section aria-labelledby="h-phases">
+  <div class="sec-head"><h2 id="h-phases">Путь к реальным деньгам</h2><span class="label">фазы плана v2 · 25.08</span></div>
+  <div class="phases">
+    <div class="phase"><span class="pn">Ф0</span><div class="pt"><b>Фундамент</b><span>конституция, контракты, капсы с хеш-пином, vault, хуки</span></div><div class="bar ok"><i style="width:85%"></i></div><span class="pct num">85%</span></div>
+    <div class="phase"><span class="pn">Ф1</span><div class="pt"><b>Ядро + paper</b><span>данные, SMC, лестница, журнал, исполнение — код есть, биржей не подтвержден</span></div><div class="bar warn"><i style="width:65%"></i></div><span class="pct num">65%</span></div>
+    <div class="phase"><span class="pn">Ф2</span><div class="pt"><b>Telegram + Scout/Trader</b><span>карточки, кнопки, автомат, /mode — 0 автоисполнений</span></div><div class="bar warn"><i style="width:60%"></i></div><span class="pct num">60%</span></div>
+    <div class="phase"><span class="pn">Ф3</span><div class="pt"><b>Sentinel</b><span>тренды, новости, соцсети — только контракт</span></div><div class="bar none"><i style="width:3%"></i></div><span class="pct num">3%</span></div>
+    <div class="phase"><span class="pn">Ф4</span><div class="pt"><b>Learning loop</b><span>Analyst, уроки, калибровка — схемы и counterfactuals</span></div><div class="bar none"><i style="width:5%"></i></div><span class="pct num">5%</span></div>
+    <div class="phase"><span class="pn">Ф5</span><div class="pt"><b>Самоэволюция + малый реал</b><span>гейт PF ≥ 1.3 на 60 сделках; Ouroboros</span></div><div class="bar none"><i style="width:3%"></i></div><span class="pct num">3%</span></div>
+  </div>
+  <div class="gate">
+    <span class="label" style="color:var(--accent)">Гейт реала</span>
+    <div class="g-track" id="gate-track" aria-label="0 из 60 сделок"></div>
+    <span><b>0 / 60</b> сверенных сделок одной версии политики</span>
+  </div>
+</section>
+
+<section aria-labelledby="h-arch">
+  <div class="sec-head"><h2 id="h-arch">Архитектура</h2><span class="label">один процесс oskard + шлюзы</span></div>
+  <div class="arch">
+<pre class="mermaid">
+flowchart LR
+  subgraph EXCH["BingX VST"]
+    BX[("REST · ccxt")]
+  end
+  subgraph OSK["oskard · 127.0.0.1:8321"]
+    direction LR
+    SCAN["Сканер<br/>555 пар → топ-20"] --> SMC["SMC-детекторы<br/>FVG · OB · BOS · свипы"]
+    SMC --> MENU["Меню опций<br/>тройки вход/SL/TP"]
+    MENU --> L1["Риск-лестница<br/>15 шагов"]
+    L1 --> SCOUT["Scout<br/>claude -p"]
+    SCOUT --> TRADER["Trader<br/>вето + выбор"]
+    TRADER --> L2["Финальная лестница"]
+    L2 --> MODE{"Режим<br/>авто / подтвержд."}
+    MODE -- авто --> EXE["Исполнитель<br/>вход + SL/TP"]
+    MODE -- подтвержд. --> CARD["Карточка<br/>с кнопками"]
+    CARD -- кнопка --> EXE
+    EXE --> MON["Монитор позиций<br/>5 с / 60 с"]
+    MON --> REC["Сверка<br/>по филлам"]
+    GUARD["Защита капитала<br/>просадка · гейт реала"] -.-> EXE
+    JR[("Журнал SQLite<br/>решения · сделки · CF")]
+  end
+  BX --> SCAN
+  EXE --> BX
+  MON <--> BX
+  REC <--> BX
+  SIG["Signals-бот<br/>/mode /status /panic"] <--> CARD
+  HER["Hermes gateway<br/>основной бот"] --> OSK
+  SUP["Супервизор 24/7"] -.-> OSK
+  SUP -.-> HER
+  SENT["Sentinel"] -.-> SCOUT
+  AN["Analyst"] -.-> JR
+  VAULT["Obsidian vault"]
+  classDef ok fill:#d9efe2,stroke:#2e8a57,color:#14261c
+  classDef warn fill:#f6ebcc,stroke:#b98309,color:#2b2108
+  classDef wip fill:#dce7fb,stroke:#2c66c9,color:#0f1d38
+  classDef none fill:#eceae5,stroke:#9aa1a9,color:#3a4048,stroke-dasharray:4 3
+  classDef risk fill:#f8dcd5,stroke:#c0432f,color:#3a130d
+  class BX,SCAN,JR,L1 ok
+  class SMC,SCOUT,MODE,CARD,MON,REC,SIG,VAULT warn
+  class MENU,TRADER wip
+  class L2,EXE,GUARD,SUP warn
+  class HER risk
+  class SENT,AN none
+</pre>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:var(--ok-soft);border-color:var(--ok)"></i>работает, подтверждено вживую</span>
+    <span><i class="sw" style="background:var(--warn-soft);border-color:var(--warn)"></i>код есть, вживую не проверено</span>
+    <span><i class="sw" style="background:var(--wip-soft);border-color:var(--wip)"></i>готово в ветке F, ждет зеленого R1</span>
+    <span><i class="sw" style="background:var(--risk-soft);border-color:var(--risk)"></i>сломано / требует Ивана</span>
+    <span><i class="sw" style="background:var(--none-soft);border-color:var(--none)"></i>не начато</span>
+  </div>
+</section>
+
+<section aria-labelledby="h-blocks">
+  <div class="sec-head"><h2 id="h-blocks">Блоки системы</h2><span class="label">две шкалы: код · проверено на бирже</span></div>
+  <div id="blocks" style="display:flex;flex-direction:column;gap:22px"></div>
+</section>
+
+<section aria-labelledby="h-funnel">
+  <div class="sec-head"><h2 id="h-funnel">Воронка сетапов</h2><span class="label">весь журнал · 30.08–16.10</span></div>
+  <div class="funnel" id="funnel"></div>
+  <p class="note" style="font-size:13px;color:var(--muted)">Где теряется поток: лестница режет confluence-гейтом (дневной тренд фактически обязателен, свечной паттерн никогда не заполняется); Scout отказывает в 84% потому что не видит событий структуры; Trader выбирал из меню комбинации, которые лестница заведомо отклоняла (7 из 12) — блок F это закрывает.</p>
+</section>
+
+<section aria-labelledby="h-up">
+  <div class="sec-head"><h2 id="h-up">Аптайм демона</h2><span class="label">09.10 03:40 → 16.10 03:40 МСК</span></div>
+  <div class="uptime">
+    <div class="ut-track" id="ut"><div class="ut-grid" id="ut-grid"></div></div>
+    <div class="ut-days" id="ut-days"></div>
+    <p style="font-size:13px;color:var(--muted)">Зеленое — демон работал. Простои: сон ПК (13.10, 17.7 ч и 12.6 ч), смерть вместе с сессией Claude (15→16.10, 18.5 ч), ни одного алерта в Telegram. Блок G: супервизор с перезапуском, запретом сна на время работы и сторожем по heartbeat.</p>
+  </div>
+</section>
+
+<section aria-labelledby="h-today">
+  <div class="sec-head"><h2 id="h-today">Работа по блокам</h2><span class="label">15–16.10</span></div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Блок</th><th>Что</th><th>Статус</th></tr></thead>
+    <tbody id="work"></tbody>
+  </table></div>
+</section>
+
+<section aria-labelledby="h-plan">
+  <div class="sec-head"><h2 id="h-plan">План на две недели</h2><span class="label">сведено: планировщик Codex + думающий центр</span></div>
+  <div class="timeline">
+    <div class="tl"><span class="d">16–17.10 · R1</span><div class="t"><b>Живой контур и защита капитала</b> <span class="chip ok">в бою с 04:19</span><p>Супервизор 24/7 (G), R:R по фактической цене, стоп по просадке, белый список гейта реала, SAFE MODE переживает рестарт (H). Первые автосделки на VST: вход → SL/TP на бирже → закрытие → сверка по филлам.</p><em>приемка: 0 входов с R:R &lt; 2 по факту · рестарт ≤ 2 мин · reconciled=1</em></div></div>
+    <div class="tl"><span class="d">18–20.10 · R2</span><div class="t"><b>Воронка без мертвых комбинаций</b> <span class="chip wip">ветка block-f-funnel</span><p>Trader видит только проходящие тройки, R-тейки в net-R от своей пары вход/стоп, когорты executed/pending/error, модель в журнале (F).</p><em>приемка: 0 отказов финальной лестницы из-за меню за 48 ч</em></div></div>
+    <div class="tl"><span class="d">18–23.10 · R3</span><div class="t"><b>Честные данные</b><p>Резолвер counterfactuals v2: полное покрытие свечами или no_data, жизненный цикл ордера как вживую, версии. Пакет воспроизводимости решения. Ledger ст. 5.</p><em>приемка: реплей 20 свежих решений совпадает на 100%</em></div></div>
+    <div class="tl"><span class="d">21–25.10 · R4</span><div class="t"><b>SMC-адаптер по курсу</b><p>OB: тело/фитиль, первый тест; FVG: процент заполнения и ближняя граница входа; связь свип → BOS → origin с временами событий. Сначала shadow.</p><em>приемка: 0 нарушений порядка/стороны/свежести</em></div></div>
+    <div class="tl"><span class="d">25–29.10 · R5</span><div class="t"><b>Одна модель SH–BOS–RTO и роль LLM</b><p>HTF POI и структура (H4/H1), 15м подтверждение. Scout как наблюдатель в заранее назначенной группе (решение Ивана), Trader против фиксированного правила.</p><em>цель к 29.10: ~20 закрытых сверенных сделок</em></div></div>
+  </div>
+</section>
+
+<section aria-labelledby="h-voices">
+  <div class="sec-head"><h2 id="h-voices">Что нашли Claude и Codex</h2><span class="label">аудит · ревью · думающий центр</span></div>
+  <div class="two">
+    <div class="box">
+      <h3 class="who"><i style="background:var(--accent)"></i>Claude — 4 аудитора + думающий центр</h3>
+      <ul>
+        <li><b>Аптайм 16.7%</b> — главный тормоз «реальных кейсов»; ПК засыпал, демон умирал с сессией.</li>
+        <li><b>SAFE MODE не переживает рестарт</b> — с авто-перезапуском защелка «позиция без SL» снялась бы молча.</li>
+        <li><b>Кнопка «Маркет» обходила кап R:R</b>: у BERA вышло бы 0.23 при капе 2.0.</li>
+        <li><b>Гейт реала — черный список строк</b>: опечатка в mode + sandbox:false = реальный BingX.</li>
+        <li><b>Hermes без LLM с 11.10</b> (авторизация Nous), approve через Hermes ничего не исполняет.</li>
+        <li><b>Obsidian-дашборд застыл на 26.08</b>, доска задач отстает от changelog.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3 class="who"><i style="background:var(--wip)"></i>Codex gpt-6-astra — стратегия, план, гипотезы</h3>
+      <ul>
+        <li><b>SMC — набор примитивов, не модель курса</b>: нет связки свип → BOS → возврат к origin, нет HTF-SMC и displacement.</li>
+        <li><b>FVG «умирает» на первом касании</b>, вход от дальней границы вместо ближней; OB от всего диапазона свечи, а не тела.</li>
+        <li><b>Дневной тренд фактически обязателен</b>: веса 1/2/3.5/5 — без D1 направление не набрать.</li>
+        <li><b>Валовый 2R-тейк никогда не проходит</b> fee-adjusted гейт 2.0 — опция меню мертвая.</li>
+        <li><b>Дрейф входа до 0.5% ломал R:R</b> (100 → 100.4: 2.00 → 1.14).</li>
+        <li><b>Counterfactuals годятся для поиска дефектов, не для настройки</b> доходности.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="corr"><b>Поправка к моим прошлым выводам.</b> «+40R отсечено гейтом R:R» и «+23R у Scout-pass» — артефакты. Режет не R:R, а confluence-гейт (92 из 94); без поздно дорешенных исходов у Scout-pass +3.4R на 44 сетапа (+0.08R до комиссий). Снижать капсы оснований нет.</div>
+</section>
+
+<section aria-labelledby="h-asks">
+  <div class="sec-head"><h2 id="h-asks">Нужно от Ивана</h2><span class="label">решения и действия руками</span></div>
+  <div class="box asks" id="asks"></div>
+</section>
+
+<footer id="foot">Собрано Claude Code · срез 16.10.2026 · OSKAR/vault/progress/dashboard</footer>
+</div>
+
+<script>
+const S = {ok:["ok","работает"],warn:["warn","не проверено"],wip:["wip","в работе"],risk:["risk","проблема"],none:["none","не начато"]};
+const layers = [
+  ["Рынок и сигнал",[
+    ["Данные BingX","src/oskar/data","ok",90,85,"555 пар, топ-20 по ликвидности; ни одного бана 109429 с 11.10"],
+    ["SMC-детекторы","src/oskar/detect/smc.py · score.py","warn",65,60,"FVG/OB/BOS/свипы без look-ahead; нет последовательности и HTF-SMC (R4)"],
+    ["Меню опций","src/oskar/detect/options.py","wip",80,30,"ветка F: тройки, net-R тейки от своей пары, дедуп стопов — выкатка после R1"],
+    ["Риск-лестница","src/oskar/risk","ok",90,80,"15 шагов, комиссии в риске; свечной паттерн не заполняется → confluence = OB+FVG"]
+  ]],
+  ["Решение",[
+    ["Scout","src/oskar/agents/scout.py","warn",75,55,"84% отказов: не видит событий структуры; модель не журналировалась"],
+    ["Trader","src/oskar/agents/trader.py","wip",85,35,"ветка F: видит только проходящие тройки; fallback на детерминированный выбор"],
+    ["Эскалация и автомат","src/oskar/core/escalation.py · trading_mode.py","warn",85,15,"ползунок авто/подтверждение в боте; 0 автоисполнений пока"]
+  ]],
+  ["Исполнение",[
+    ["Исполнитель","src/oskar/core/executor.py · execution/bingx.py","warn",92,10,"SL/TP прикреплены ко входу; R:R и стоп по фактической цене, panic/SAFE MODE прямо перед ордером (H)"],
+    ["Монитор позиций","src/oskar/core/position_monitor.py","warn",85,15,"5 с pending / 60 с полный тик, усыновление защиты, duration-stop"],
+    ["Сверка с биржей","src/oskar/sync","warn",80,5,"по филлам; 0 закрытых сделок — путь не пройден ни разу"],
+    ["Журнал","src/oskar/journal","ok",92,90,"SQLite, миграции; v4 добавляет когорты executed/pending/error"]
+  ]],
+  ["Контроль и эксплуатация",[
+    ["Конституция и капсы","CONSTITUTION.md · config/caps.yaml","warn",70,60,"хеш-пин работает; процедура ст. 4 и ledger ст. 5 — нет"],
+    ["Защита капитала","risk/drawdown.py · core/env_gate.py","warn",85,20,"стоп по просадке 10% (пик 121.71 VST выставлен вживую), гейт реала — белый список, SAFE MODE переживает рестарт"],
+    ["Emergency stop","src/oskar/core/emergency.py","warn",80,0,"/panic из TG, CLI, API; позиции вне журнала не трогает; вживую не взводился"],
+    ["Инварианты ст. 5","src/oskar/ops/invariants.py","risk",45,0,"INV-004/005 объявлены до деплоя R1; демон их пока не гоняет (блок I), ledger нет"],
+    ["Супервизор 24/7","scripts/supervise.ps1","warn",85,0,"готов: рестарт, запрет сна, heartbeat-сторож, алерты; ждет установки Иваном"]
+  ]],
+  ["Интерфейсы и интеграции",[
+    ["Signals-бот","src/oskar/core/telegram_*.py","warn",85,40,"карточки и кнопки доходят; /mode /status /panic вживую не нажимались"],
+    ["Hermes gateway","C:/Users/Ivan/hermes","risk",60,30,"нет авторизации Nous с 11.10; approve-путь фиктивный; конфликт 409"],
+    ["Obsidian vault","vault/","warn",75,50,"хук changelog работает; дашборд index застыл на 26.08"],
+    ["База знаний","vault/library","ok",70,70,"35 заметок book_claim; 7 из ~22 книг INVEST ZONE"],
+    ["Claudexor · Codex","~/.claudexor · codex exec","ok",85,80,"починен: песочница Windows + патч остановки; ревью R1 идет через Claudexor"]
+  ]],
+  ["Следующие фазы",[
+    ["Sentinel","—","none",3,0,"Scout получает заглушку нейтрального контекста"],
+    ["Analyst и уроки","—","none",5,0,"trade_lessons = 0; нужны сначала закрытые сделки"],
+    ["Критик-наблюдатель","—","none",0,0,"решение есть: без права вето, судят когорты"],
+    ["Самоэволюция","Ouroboros","none",5,0,"после гейта реала"]
+  ]]
+];
+const blocks = document.getElementById("blocks");
+for (const [name, items] of layers){
+  const l = document.createElement("div"); l.className="layer";
+  l.innerHTML = `<span class="label">${name}</span><div class="grid"></div>`;
+  const g = l.querySelector(".grid");
+  for (const [t,path,st,code,live,note] of items){
+    const [cls,lab] = S[st];
+    const c = document.createElement("article"); c.className="card";
+    c.innerHTML = `<div class="ch"><div style="min-width:0"><h3>${t}</h3><div class="path">${path}</div></div><span class="chip ${cls}">${lab}</span></div>
+      <div class="meters"><span>код</span><div class="bar ${cls==='none'?'none':cls==='risk'?'risk':cls==='wip'?'wip':'ok'}"><i style="width:${code}%"></i></div><span class="p">${code}%</span>
+      <span>вживую</span><div class="bar live"><i style="width:${live}%"></i></div><span class="p">${live}%</span></div>
+      <p class="note">${note}</p>`;
+    g.appendChild(c);
+  }
+  blocks.appendChild(l);
+}
+// gate
+const gt=document.getElementById("gate-track"); for(let i=0;i<60;i++){gt.appendChild(document.createElement("i"))}
+// funnel (линейная шкала: 266 = 100%)
+const fun=[["Кандидатов","скан + SMC + score",266],["Прошли лестницу","лучшая комбинация меню",93],["Дошли до Scout","19 потеряны на бюджете",74],["Scout: take","",12],["Trader: execute","вето не применил ни разу",12],["Прошли финальную лестницу","7 отбиты: стоп 6, R:R 1",5],["Попытка исполнения","BERA 14.10 → 109420, вход снят",1],["Закрыто","",0]];
+const f=document.getElementById("funnel");
+for(const [a,b,n] of fun){const r=document.createElement("div");r.className="frow";
+  r.innerHTML=`<div class="fl">${a}${b?`<span>${b}</span>`:""}</div><div class="fb"><i class="${n===0?'loss':''}" style="width:${n/266*100}%"></i></div><span class="fn">${n}</span>`;f.appendChild(r)}
+const ax=document.createElement("div");ax.className="axis";ax.innerHTML="<span>0</span><span>133</span><span>266</span>";f.appendChild(ax);
+// uptime: окно 168 ч от 09.10 03:40
+const t0=Date.UTC(2026,9,9,0,40); const H=3600e3; const W=168*H;
+const seg=[["2026-10-11T13:08","2026-10-11T14:46"],["2026-10-12T02:19","2026-10-12T04:53"],["2026-10-13T02:57","2026-10-13T04:36"],["2026-10-13T22:21","2026-10-13T22:25"],["2026-10-14T11:02","2026-10-15T08:46"],["2026-10-16T03:16","2026-10-16T03:40"]];
+const msk=s=>Date.parse(s+":00+03:00");
+const ut=document.getElementById("ut");
+for(const [a,b] of seg){const i=document.createElement("i");const x=(msk(a)-t0)/W*100,w=Math.max((msk(b)-msk(a))/W*100,.25);i.style.left=x+"%";i.style.width=w+"%";i.title=a.replace("T"," ")+" – "+b.slice(11);ut.appendChild(i)}
+const days=document.getElementById("ut-days"),grid=document.getElementById("ut-grid");
+for(let d=10;d<=16;d++){const x=(msk(`2026-10-${d}T00:00`)-t0)/W*100;const s=document.createElement("span");s.style.left=x+"%";s.textContent=d+".10";days.appendChild(s);const b=document.createElement("b");b.style.left=x+"%";grid.appendChild(b)}
+// work
+const work=[["A","Прикрепленные SL/TP ко входу, монитор усыновляет защиту (фикс 109420)","ok","сделано 15.10"],["B","Сайзинг с комиссиями, целое плечо","ok","сделано 15.10"],["C","Сверка закрытых по филлам, вердикты инвариантов","ok","сделано 15.10"],["D","/panic и /status из Telegram, ротация логов без секретов","ok","сделано 15.10"],["E","Бюджет LLM по попыткам, изоляция claude -p, rate limit","ok","сделано 15.10"],["—","Режим авто / с подтверждением, ползунок /mode","ok","сделано 16.10"],["H","Защита капитала: R:R по факту, стоп по просадке, гейт реала, SAFE MODE в журнале, предохранитель по кодам · INV-004/005","ok","в бою (R1)"],["G","Супервизор 24/7: рестарт, запрет сна, heartbeat, алерты","warn","готов, ждет установки"],["—","Бюджет LLM: Scout 60/день 10/ч, Trader 30","ok","в бою (R1)"],["F","Воронка: тройки, net-R тейки, когорты v4, модель в журнале","wip","ветка, ждет зеленого R1"],["—","Claudexor: Codex снова видит файлы (песочница + патч)","ok","починен"],["I","Вторая машина, approve через Hermes, инварианты в демоне, дневная сводка","wip","в работе"]];
+const wb=document.getElementById("work");
+for(const [k,t,st,s] of work){const tr=document.createElement("tr");tr.innerHTML=`<td class="k">${k}</td><td>${t}</td><td><span class="chip ${S[st][0]}">${s}</span></td>`;wb.appendChild(tr)}
+// asks
+const asks=[
+ "<b>Hermes: войти заново</b> — у него нет LLM с 11.10. В терминале: <code>hermes auth add nous</code>, потом «статус» в боте.",
+ "<b>Установить супервизор</b> (PowerShell, из папки OSKAR): <code>powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install_autostart.ps1</code>, затем <code>Start-ScheduledTask -TaskName 'OSKAR Supervisor'</code>. Он подхватит работающий демон.",
+ "<b>Блок F (воронка)</b>: ждать зеленого вердикта R1 по ст. 5 п. 3 (первая автосделка закрыта и сверена) или выкатить сразу — твое решение.",
+ "<b>Claudexor</b>: задать постоянную переменную пользователя <code>CLAUDEXOR_CODEX_BIN</code> = путь к codex.exe — иначе после перезагрузки его Codex снова пропадет.",
+ "<b>Выключить Hermes gateway на ноутбуке</b> — конфликт 409 роняет шлюз здесь; демон и шлюз — только на одной машине.",
+ "<b>Перевыпустить токен signals-бота</b> через BotFather /revoke — первый побывал в логе.",
+ "<b>Порог стопа по просадке</b>: по умолчанию 10% от пика equity; добавить ли дневной лимит −3%? Пауза входов или только алерт на VST?",
+ "<b>Эксперимент с Scout</b>: в половине возможностей (заранее по хешу) Scout только наблюдает, сделка идет по детерминированному правилу. Это стратегическое решение.",
+ "<b>Дневной тренд</b>: должен ли он быть обязателен для интрадея? Сейчас он фактически вето — можно проверить вариант без него в shadow.",
+ "<b>Для реала позже</b>: отдельный ключ BingX с IP-whitelist и без права вывода."];
+const ak=document.getElementById("asks");for(const a of asks){const d=document.createElement("div");d.className="ask";d.innerHTML=`<p>${a}</p>`;ak.appendChild(d)}
+</script>
