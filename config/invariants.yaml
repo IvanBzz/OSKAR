@@ -37,3 +37,20 @@ invariants:
     window: { hours: 48 }
     expect: "== 0"
     status: pending
+
+  # --- R1 (2026-10-16): автомат + блок H. Объявлено до деплоя (ст. 5 п. 1).
+  - id: INV-004
+    commit: pending
+    description: "Ни один вход не нарушает кап R:R и диапазон стопа профиля по цене филла (блок H: BERA 0.23 у кнопки «Маркет»)"
+    metric: entry_price_violations
+    window: { closed_trades: 10 }
+    expect: "== 0"
+    status: pending
+
+  - id: INV-005
+    commit: pending
+    description: "Автомат: закрытые сделки сверены с биржей без расхождений (вход -> SL/TP -> закрытие -> филлы)"
+    metric: reconcile_diff_rows
+    window: { closed_trades: 5 }
+    expect: "== 0"
+    status: pending

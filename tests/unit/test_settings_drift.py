@@ -32,7 +32,6 @@ UNIMPLEMENTED = {
     "agents.trader.model_cmd": "то же: команда модели зашита в agents/claude_cli.py",
     "agents.analyst": "агента Analyst еще нет",
     "safe_mode.error_cooldown_minutes": "safe_mode — защелка: автовыхода по кулдауну нет",
-    "safe_mode.drawdown_pct": "триггер safe_mode по просадке НЕ реализован (открытая задача)",
     "safe_mode.token_budget_floor_pct": "бюджеты LLM — жесткие daily/hourly лимиты (agents/budget.py)",
     "journal.archive_before_run": "архив журнала только при смене схемы (daemon._connect_journal)",
     "knowledge": "источники индекса зашиты в knowledge/index.py; знания Scout режет max_chars, не токены",

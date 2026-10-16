@@ -117,6 +117,8 @@ DAEMON_API_COMMANDS = {
     "panic": ("POST", "/panic", 60.0),  # снятие ордеров/закрытие позиций на бирже — до минуты
     "panic-reset": ("POST", "/panic/reset", 10.0),
     "status": ("GET", "/status", 10.0),
+    # блок H, 2026-10-16: стоп по просадке снимается только явной командой оператора
+    "drawdown-reset": ("POST", "/drawdown/reset", 15.0),
 }
 
 
@@ -124,6 +126,10 @@ def _add_daemon_api_parsers(sub) -> None:
     sub.add_parser("panic", help="EMERGENCY STOP (Art. 6): cancel entries, close positions, safe_mode")
     sub.add_parser("panic-reset", help="lift panic: explicit operator command only (Art. 6.3); pause stays")
     sub.add_parser("status", help="oskard state via the local API")
+    sub.add_parser(
+        "drawdown-reset",
+        help="lift the drawdown stop (explicit operator command only): peak := current exchange equity",
+    )
 
 
 def _ascii(value) -> str:
@@ -222,6 +228,8 @@ def _cmd_daemon_api(command: str) -> int:
         print(f"panic reset: safe_mode={body.get('safe_mode')} paused={body.get('paused')} "
               "(pause stays - resume is a separate explicit decision)")
         return 0
+    if command == "drawdown-reset":
+        return _print_drawdown_reset(body)
     print(json.dumps(body, ensure_ascii=True, indent=2))
     return 0
 
@@ -248,6 +256,17 @@ def _print_panic(result: dict) -> int:
         print(f"WARNING: panic flag not persisted ({_ascii(result['persist_error'])}) "
               "- a restart would lift it")
     return 0 if ok else 1
+
+
+def _print_drawdown_reset(result: dict) -> int:
+    """Текущий equity, пик до и после; стоп снят (или его и не было)."""
+    def money(value) -> str:
+        return f"{float(value):.2f}" if value is not None else "none"
+
+    state = "was ENGAGED - lifted" if result.get("was_halted") else "was not engaged"
+    print(f"drawdown stop {state}: equity={money(result.get('equity'))} "
+          f"peak {money(result.get('peak_before'))} -> {money(result.get('peak'))}; new entries allowed")
+    return 0
 
 
 def _journal_db():
@@ -287,10 +306,14 @@ def _cmd_sync(args) -> int:
         print("ERROR: BINGX_API_KEY / BINGX_API_SECRET not set (see .env.example)")
         return 1
     from oskar.core.bootstrap import load_settings
+    from oskar.core.env_gate import paper_gate
 
-    # та же среда, что у демона (settings.exchange.sandbox), а не зашитый VST
-    sandbox = bool(load_settings().get("exchange", {}).get("sandbox", True))
-    view = make_bingx_view(key, secret, sandbox=sandbox)
+    # та же среда, что у демона, тем же белым списком (блок H, 2026-10-16): только paper/VST
+    if paper_gate(load_settings()) is not None:
+        print("ERROR: environment not allowed - only mode=paper with exchange.sandbox=true "
+              "(real trading is closed by the Phase 5 gate)")
+        return 1
+    view = make_bingx_view(key, secret, sandbox=True)
 
     if args.sync_command == "balance":
         b = snapshot_balance(view)

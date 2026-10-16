@@ -27,6 +27,7 @@ from oskar.core.approvals import resolve_approval
 from oskar.core.emergency import engage_panic
 from oskar.core.state import RuntimeState
 from oskar.journal.db import transaction
+from oskar.risk.drawdown import read_halt
 
 logger = logging.getLogger("oskar.buttons")
 
@@ -134,6 +135,10 @@ def status_line(state: RuntimeState, runner=None) -> str:
             "SELECT COUNT(*) FROM pending_approvals WHERE resolution IS NULL"
         ).fetchone()[0]
         parts.append(f"позиций {live.get('open', 0)}, лимиток {live.get('pending', 0)}, карточек {cards}")
+        halt = read_halt(state.journal)  # блок H, 2026-10-16: защелка просадки видна в /status
+        if halt is not None:
+            parts.append(f"СТОП ПО ПРОСАДКЕ −{halt.pct:.1f}% от пика ${halt.peak:.2f}: "
+                         "новые входы закрыты (oskar drawdown-reset)")
     except Exception as e:  # noqa: BLE001 - статус не падает из-за журнала
         parts.append(f"журнал недоступен ({type(e).__name__})")
     if runner is not None:

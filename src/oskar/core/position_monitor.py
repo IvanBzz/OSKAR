@@ -21,13 +21,21 @@
    (exit/pnl NULL); лосер старше max_loss_hold -> рыночное закрытие с
    ПОДТВЕРЖДЕНИЕМ по позициям -> duration_timeout (урок v1: лосеры жили в 3.4x дольше);
 4. reconcile: позиции биржи vs open-сделки журнала (сумма qty по ключу, допуск 1%) —
-   расхождение два тика подряд -> SAFE MODE + Telegram, один раз на ключ.
+   расхождение два тика подряд -> SAFE MODE + Telegram, один раз на ключ;
+5. стоп по просадке (блок H, 2026-10-16): пик equity и защелка drawdown_halt в meta
+   (risk/drawdown.py). Защелка закрывает только НОВЫЕ входы — сопровождение и защита
+   открытых позиций выше идут как обычно.
+
+SAFE MODE пишется в meta (переживает рестарт, core/emergency.py). Алерты — с
+экранированием под parse_mode=HTML и ошибками биржи через short_error (без подписанных
+URL): «&» или «<» в тексте не должны молча глушить алерт «БЕЗ SL».
 
 Все решения — по состоянию ордеров НА БИРЖЕ, не по ценам свечей. Исключение по
 одной сделке не валит проход по остальным. realized_pnl — брутто по ценам
 исполнения минус комиссии, если биржа их отдала (иначе брутто).
 """
 
+import html
 import logging
 import sqlite3
 import threading
@@ -36,6 +44,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from oskar.core.approvals import mark_decision
+from oskar.core.emergency import engage_safe_mode
+from oskar.core.executor import short_error
 from oskar.data.client import exchange_error_code
 from oskar.execution.base import (
     ExchangeAdapter,
@@ -111,6 +121,7 @@ class PositionMonitor:
         interval_seconds: float = DEFAULT_INTERVAL_SEC,
         fast_interval_seconds: float = DEFAULT_FAST_INTERVAL_SEC,
         reconciler=None,  # ClosedTradeReconciler: tick(now) — сверка закрытых по филлам биржи
+        drawdown=None,  # DrawdownGuard: пик equity и защелка просадки на полном тике
     ):
         self._ex = adapter
         self._j = journal
@@ -123,6 +134,7 @@ class PositionMonitor:
         self._interval = interval_seconds
         self._fast_interval = fast_interval_seconds
         self._reconciler = reconciler
+        self._drawdown = drawdown
         self._reported_mismatches: set[str] = set()
         self._mismatch_streak: dict[str, int] = {}
         self._missing: dict[str, int] = {}  # decision_id -> тиков подряд без позиции
@@ -145,6 +157,8 @@ class PositionMonitor:
         self._guard(rep, "orphans", lambda: self._scan_orphans(rep))
         if self._reconciler is not None:
             self._guard(rep, "closed_reconcile", lambda: self._reconciler.tick(self._now()))
+        if self._drawdown is not None:
+            self._guard(rep, "drawdown", self._check_drawdown)
         self.ticks += 1
         self.last_report = rep.as_dict()
         return rep
@@ -189,16 +203,22 @@ class PositionMonitor:
     def _say(self, text: str) -> None:
         logger.info(text)
         if self._notify is not None:
-            try:
-                self._notify(text)
+            try:  # notify = send_text с parse_mode=HTML: «P&L», «<» из ошибки биржи — экранируем
+                self._notify(html.escape(text, quote=False))
             except Exception as e:  # noqa: BLE001 - канал не влияет на учет
                 logger.warning("notify failed: %s", e)
 
     def _set_safe_mode(self, reason: str) -> None:
         if self._state is None or self._state.safe_mode:
             return
-        self._state.safe_mode = True
+        engage_safe_mode(self._state, reason)  # флаг + meta: переживает рестарт (блок H)
         self._say(f"🛑 SAFE MODE: {reason} — новые входы заблокированы до ручного сброса")
+
+    def _check_drawdown(self) -> None:
+        halt = self._drawdown.check()
+        if halt is not None:
+            self._say(f"🛑 {halt.message()}. Открытые позиции сопровождаются; снять — "
+                      "oskar drawdown-reset")
 
     # --------------------------------------------------------------- sweeper
 
@@ -383,9 +403,10 @@ class PositionMonitor:
                 return
             if kind == "tp":
                 if fails == PROTECT_RETRIES or exchange_error_code(e) != POSITION_MISSING_CODE:
-                    self._say(f"⚠️ {t['symbol']} {t['side']}: TP не встал ({e}); стоп на месте")
+                    self._say(f"⚠️ {t['symbol']} {t['side']}: TP не встал ({short_error(e)}); "
+                              "стоп на месте")
                 return  # без TP позиция защищена стопом — safe mode не нужен
-            self._say(f"🛑 {t['symbol']} {t['side']} БЕЗ SL: поставить не удалось ({e})")
+            self._say(f"🛑 {t['symbol']} {t['side']} БЕЗ SL: поставить не удалось ({short_error(e)})")
             self._set_safe_mode(f"позиция {t['symbol']} без защиты")
             return
         self._replaced[key] = n

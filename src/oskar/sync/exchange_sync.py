@@ -156,16 +156,20 @@ def render_diff(d: PositionDiff) -> str:
 
 
 def make_bingx_view(api_key: str, secret: str, sandbox: bool = True) -> ExchangeView:
-    """Реальный read-only view поверх ccxt BingX (VST при sandbox=True)."""
+    """Read-only view поверх ccxt BingX — только VST до гейта Фазы 5 (блок H, 2026-10-16:
+    sandbox — именно True, иначе исключение, а не реальный аккаунт)."""
     import ccxt
 
+    from oskar.core.env_gate import require_vst
+
+    require_vst(sandbox)
     ex = ccxt.bingx({
         "apiKey": api_key,
         "secret": secret,
         # defaultType=swap: иначе balance уходит в SPOT реального аккаунта
         "options": {"adjustForTimeDifference": True, "defaultType": "swap"},
     })
-    ex.set_sandbox_mode(sandbox)
+    ex.set_sandbox_mode(True)
 
     class _CcxtView:
         def balance(self) -> dict[str, Any]:

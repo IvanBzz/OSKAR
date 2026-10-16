@@ -46,6 +46,11 @@ KNOWN_CLOSE_REASONS = frozenset(
 # Duration-stop монитора срабатывает на первом тике после max_loss_hold (тик 60 с) и закрывает
 # по рынку с подтверждением по позициям: 5 минут — люфт исполнения, а не нарушение инварианта.
 OVERHOLD_GRACE_SEC = 300
+# INV-004 (блок H, 2026-10-16): исполнитель проверяет R:R и стоп по цене, которую видит перед
+# отправкой; филл маркета может уйти на проскальзывание. Люфт — чтобы инвариант ловил обход
+# капа (BERA: R:R 0.23 у кнопки «Маркет»), а не тик проскальзывания.
+FILL_RR_ALLOWANCE = 0.1
+FILL_SL_PCT_ALLOWANCE = 0.05
 MIN_TRADES_IN_HOURS_WINDOW = 1  # окно по времени без единой закрытой сделки — не доказательство
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _EXPECT_RE = re.compile(r"^\s*(==|!=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)\s*$")
@@ -97,6 +102,16 @@ class Context:
     """Параметры метрик, которые читаются из конфигов лениво (тесты подставляют свои)."""
 
     max_loss_hold_seconds: int | None = None
+    caps: Any = None  # risk.ladder.Caps
+    profile_limits: Any = None  # risk.ladder.ProfileLimits
+
+    def entry_limits(self) -> tuple[Any, Any]:
+        if self.caps is None or self.profile_limits is None:
+            from oskar.core.bootstrap import load_active_profile, load_caps
+
+            self.caps = self.caps or load_caps()
+            self.profile_limits = self.profile_limits or load_active_profile().limits
+        return self.caps, self.profile_limits
 
     def loss_hold_limit(self) -> int:
         if self.max_loss_hold_seconds is None:
@@ -258,7 +273,42 @@ def reconcile_diff_rows(
     return Measurement(len(diffs), checked, full and not unchecked, detail + _shortfall(window, trades))
 
 
+def entry_price_violations(
+    journal: sqlite3.Connection, window: Window, now: datetime, ctx: Context
+) -> Measurement:
+    """INV-004: закрытые сделки, чей вход по цене ФИЛЛА нарушал кап R:R или диапазон стопа профиля.
+
+    Блок H (2026-10-16): лестница проверяла цену плана, а кнопка «Маркет» и дрейф до 0.5%
+    входили по другой (BERA: R:R 0.23 при капе 2.0). Пересчет — той же check_entry_price,
+    что у лестницы и исполнителя, с люфтом на проскальзывание филла."""
+    from oskar.risk.sizing import fee_adjusted_rr
+
+    caps, limits = ctx.entry_limits()
+    trades, full = closed_trades_in(journal, window, now)
+    bad, unknown = [], []
+    for t in trades:
+        e, sl, tp = t["entry_price"], t["sl_price"], t["tp_price"]
+        if not e or not sl or not tp:
+            unknown.append(t)
+            continue
+        sl_pct = abs(e - sl) / e * 100.0
+        rr = fee_adjusted_rr(e, sl, tp)
+        if (rr < caps.min_rr_fee_adjusted - FILL_RR_ALLOWANCE
+                or sl_pct < limits.sl_dist_pct_min - FILL_SL_PCT_ALLOWANCE
+                or sl_pct > limits.sl_dist_pct_max + FILL_SL_PCT_ALLOWANCE):
+            bad.append(t)
+    detail = (f"{len(bad)} входов вне капа R:R >= {caps.min_rr_fee_adjusted} "
+              f"или стопа [{limits.sl_dist_pct_min}..{limits.sl_dist_pct_max}]% "
+              f"по цене филла из {len(trades)} закрытых")
+    if bad:
+        detail += f" ({_ids(bad)})"
+    if unknown:
+        detail += f"; без entry/SL/TP, не классифицировать: {_ids(unknown)}"
+    return Measurement(len(bad), len(trades), full and not unknown, detail + _shortfall(window, trades))
+
+
 METRICS: dict[str, MetricFn] = {
+    "entry_price_violations": entry_price_violations,
     "close_reason_unknown_count": close_reason_unknown_count,
     "loser_overhold_count": loser_overhold_count,
     "reconcile_diff_rows": reconcile_diff_rows,

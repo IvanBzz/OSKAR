@@ -86,6 +86,57 @@ FORBIDDEN_INPUT_FIELDS = {
 MIN_CONFIDENCE = 60
 
 
+@dataclass(frozen=True)
+class PriceCheck:
+    """Шаги 5-6 лестницы для одной цены входа: след + числа для следующих шагов."""
+
+    steps: list[RiskStep]
+    sl_dist_pct: float
+    rr: float | None  # None — до шага R:R не дошли
+
+    @property
+    def failed(self) -> RiskStep | None:
+        return next((s for s in self.steps if not s.passed), None)
+
+
+def check_entry_price(
+    direction: str, entry: float, sl: float, tp: float, caps: Caps, profile: ProfileLimits
+) -> PriceCheck:
+    """Шаги 5, 5b, 6: дистанция стопа в рамках профиля, SL/TP по нужные стороны от входа,
+    fee-aware R:R. Первый непройденный шаг останавливает проверку.
+
+    Общие для лестницы (цена плана) и исполнителя (цена, по которой реально войдем).
+    Блок H, 2026-10-16: «Маркет» по ушедшей цене (и по плану, где Trader выбрал лимитку)
+    проходил с R:R ниже капа — лестница видела другую цену входа."""
+    steps: list[RiskStep] = []
+
+    # 5. SL присутствует и дистанция в рамках профиля
+    sl_dist = abs(entry - sl)
+    sl_ok = sl > 0 and sl_dist > 0
+    sl_dist_pct = (sl_dist / entry * 100.0) if sl_ok else 0.0
+    in_range = sl_ok and profile.sl_dist_pct_min <= sl_dist_pct <= profile.sl_dist_pct_max
+    steps.append(RiskStep(
+        name="sl_distance", passed=in_range, value=f"{sl_dist_pct:.2f}%",
+        limit=f"[{profile.sl_dist_pct_min}..{profile.sl_dist_pct_max}]%",
+    ))
+    if not in_range:
+        return PriceCheck(steps, sl_dist_pct, None)
+
+    # 5b. направление согласовано с ценами (SL и TP по правильные стороны от entry)
+    px_ok = sl < entry < tp if direction == "long" else tp < entry < sl
+    steps.append(RiskStep(name="price_geometry", passed=px_ok, value=f"e={entry} sl={sl} tp={tp}"))
+    if not px_ok:
+        return PriceCheck(steps, sl_dist_pct, None)
+
+    # 6. fee-aware R:R (v1 fix 1.3: до фикса фактический R:R был 0.42 при floor 1.5)
+    rr = fee_adjusted_rr(entry, sl, tp)
+    steps.append(RiskStep(
+        name="rr_fee_adjusted", passed=rr + RR_TOLERANCE >= caps.min_rr_fee_adjusted,
+        value=f"{rr:.3f}", limit=f">={caps.min_rr_fee_adjusted}",
+    ))
+    return PriceCheck(steps, sl_dist_pct, rr)
+
+
 def evaluate(inp: RiskInput, caps: Caps, profile: ProfileLimits) -> RiskVerdict:
     steps: list[RiskStep] = []
     computed: RiskComputed | None = None
@@ -129,36 +180,14 @@ def evaluate(inp: RiskInput, caps: Caps, profile: ProfileLimits) -> RiskVerdict:
     ):
         return verdict(False)
 
-    # 5. SL присутствует и дистанция в рамках профиля
+    # 5-6. дистанция стопа, геометрия цен, fee-aware R:R — общая функция с исполнителем
+    # (он перепроверяет их по фактической цене входа, блок H 2026-10-16)
+    price = check_entry_price(inp.candidate.direction, inp.entry, inp.sl, inp.tp, caps, profile)
+    steps.extend(price.steps)
+    if price.failed is not None:
+        return verdict(False)
     sl_dist = abs(inp.entry - inp.sl)
-    sl_ok = inp.sl > 0 and sl_dist > 0
-    sl_dist_pct = (sl_dist / inp.entry * 100.0) if sl_ok else 0.0
-    in_range = sl_ok and profile.sl_dist_pct_min <= sl_dist_pct <= profile.sl_dist_pct_max
-    if not step(
-        "sl_distance",
-        in_range,
-        value=f"{sl_dist_pct:.2f}%",
-        limit=f"[{profile.sl_dist_pct_min}..{profile.sl_dist_pct_max}]%",
-    ):
-        return verdict(False)
-
-    # 5b. направление согласовано с ценами (SL и TP по правильные стороны от entry)
-    if inp.candidate.direction == "long":
-        px_ok = inp.sl < inp.entry < inp.tp
-    else:
-        px_ok = inp.tp < inp.entry < inp.sl
-    if not step("price_geometry", px_ok, value=f"e={inp.entry} sl={inp.sl} tp={inp.tp}"):
-        return verdict(False)
-
-    # 6. fee-aware R:R (v1 fix 1.3: до фикса фактический R:R был 0.42 при floor 1.5)
-    rr = fee_adjusted_rr(inp.entry, inp.sl, inp.tp)
-    if not step(
-        "rr_fee_adjusted",
-        rr + RR_TOLERANCE >= caps.min_rr_fee_adjusted,
-        value=f"{rr:.3f}",
-        limit=f">={caps.min_rr_fee_adjusted}",
-    ):
-        return verdict(False)
+    sl_dist_pct, rr = price.sl_dist_pct, price.rr
 
     # 7. леверидж (только Python, ст. 2): ЦЕЛЫЙ — ровно то, что уйдет на биржу. Раньше
     # маржа проверялась на 4.4x, а отправлялось 4x (ревью 2026-10-13, Codex #20); и

@@ -336,9 +336,14 @@ class MarketDataClient:
 
 
 def make_bingx_exchange(api_key: str = "", secret: str = "", sandbox: bool = True):
-    """Фабрика для ПРИВАТНЫХ вызовов (баланс/ордера): sandbox=True -> VST."""
+    """Фабрика для ПРИВАТНЫХ вызовов (баланс/ордера): только VST до гейта Фазы 5.
+    Блок H, 2026-10-16: sandbox — именно True, иначе исключение (было `if sandbox:` —
+    False/None молча давали реальный хост)."""
     import ccxt
 
+    from oskar.core.env_gate import require_vst
+
+    require_vst(sandbox)
     ex = ccxt.bingx({
         "apiKey": api_key,
         "secret": secret,
@@ -347,8 +352,7 @@ def make_bingx_exchange(api_key: str = "", secret: str = "", sandbox: bool = Tru
         # реального аккаунта даже в sandbox (VST — это swap-хост)
         "options": {"adjustForTimeDifference": True, "defaultType": "swap"},
     })
-    if sandbox:
-        ex.set_sandbox_mode(True)
+    ex.set_sandbox_mode(True)
     return ex
 
 

@@ -19,11 +19,13 @@ Cooldown kline-эндпоинта (бан 109429 / бюджет ошибок к�
 частичный топ перекошен к началу алфавита.
 """
 
+import html
 import logging
 import threading
 import time
 
 from oskar.core.cycle import ShadowCycle
+from oskar.core.emergency import engage_safe_mode
 from oskar.core.state import RuntimeState
 from oskar.data.client import classify_error
 from oskar.data.scanner import scan
@@ -191,12 +193,12 @@ class ShadowRunner:
     def _enter_safe_mode(self, why: str) -> None:
         if self._state.safe_mode:
             return
-        self._state.safe_mode = True
+        engage_safe_mode(self._state, why)  # флаг + meta: переживает рестарт (блок H, 2026-10-16)
         msg = f"SAFE MODE: {why}"
         logger.error(msg)
         if self._notify is not None:
-            try:
-                self._notify("🛑 " + msg)
+            try:  # send_text шлет parse_mode=HTML, а в why — текст исключения
+                self._notify("🛑 " + html.escape(msg, quote=False))
             except Exception as ne:  # noqa: BLE001
                 logger.warning("notify failed: %s", ne)
 

@@ -54,8 +54,8 @@ agents:                            # model_cmd не подключен (claude_c
 safe_mode:
   consecutive_errors: 3            # серия неудачных тиков shadow-потока -> safe_mode
   error_cooldown_minutes: 60       # НЕ РЕАЛИЗОВАН: safe_mode — защелка, автовыхода нет
-  drawdown_pct: 10                 # НЕ РЕАЛИЗОВАН: триггера по просадке нет (план: не снимается
-                                   # автоматически, урок v1)
+  drawdown_pct: 10                 # просадка от пика equity, % -> стоп новых входов (risk/drawdown.py);
+                                   # автоматически не снимается (урок v1): oskar drawdown-reset
   token_budget_floor_pct: 20       # НЕ РЕАЛИЗОВАН: бюджеты LLM — жесткие daily/hourly лимиты
 
 journal:

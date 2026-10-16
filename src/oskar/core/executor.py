@@ -20,6 +20,14 @@ closePosition-ордера SL/TP, пока позиции нет — 109420 «po
 изменился»: лимит позиций и дубль по журналу, цена не ушла за стоп/цель и не
 уплыла от плана дальше max_drift_pct.
 
+Блок H, 2026-10-16:
+- R:R с комиссиями и дистанция стопа перепроверяются по цене, по которой реально войдем
+  (маркет — текущая, лимит — уровень плана), той же функцией, что у лестницы: кнопка
+  «Маркет» есть и у плана, где Trader выбрал лимитку, а цена за час уходит;
+- panic, SAFE MODE и стоп по просадке проверяются в начале И непосредственно перед
+  отправкой входа на биржу: вход «в процессе» panic_flatten не видит (журнала еще нет);
+- исход несет машинный код kind — по нему считает предохранитель автомата.
+
 Инварианты (ревью 2026-10-13, класс бага v1 с двойной позицией):
 - вход ушел на биржу (или мог уйти — таймаут) => запись в trades есть ВСЕГДА
   (журнал не врет, ст. 1); исход несет entry_sent=True — откатывать approve по
@@ -38,9 +46,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from oskar.contracts.schemas import ExecutionPlan
+from oskar.core.emergency import panic_engaged, safe_mode_engaged
 from oskar.data.client import classify_error, exchange_error_code
 from oskar.execution.base import ExchangeAdapter, PlacedOrder, cid_base, pick_protection
 from oskar.journal.db import transaction
+from oskar.risk.drawdown import read_halt
+from oskar.risk.ladder import Caps, ProfileLimits, check_entry_price
 from oskar.risk.sizing import qty_for_risk
 
 logger = logging.getLogger("oskar.executor")
@@ -49,6 +60,15 @@ DEFAULT_MAX_DRIFT_PCT = 0.5  # цена ушла дальше — план ус�
 POSITION_MISSING_CODE = "109420"  # BingX: «position not exist» — позиции (еще) нет
 POSITION_WAIT_SEC = 6.0  # маркет без прикрепленной защиты: ждать появления позиции
 NETWORK_RETRIES = 2  # идемпотентные вызовы (плечо): таймаут VST — повтор, не отказ
+
+# Машинный код исхода (блок H, 2026-10-16): предохранитель автомата считал отказы по
+# подстроке сообщения, а «вход есть, защита не встала» — успехом.
+KIND_OK = "ok"
+KIND_REFUSED = "refused_precheck"  # до биржи не дошло: цена ушла, лимит, R:R, флаги защиты
+KIND_EXCHANGE_REJECTED = "exchange_rejected"  # биржа ответила отказом (плечо/вход)
+KIND_PROTECTION_FAILED = "protection_failed"  # вход исполнен, стоп не встал
+KIND_ENTRY_UNKNOWN = "entry_unknown"  # таймаут на входе: принят ли ордер — неизвестно
+KIND_ERROR = "error"  # исключение/неожиданное
 
 
 # Входы «в процессе»: исполнитель (поток кнопок) уже шлет ордера, а запись в журнале
@@ -83,6 +103,11 @@ class ExecutionOutcome:
     client_order_id: str = ""
     entry_type: str = ""
     entry_sent: bool = False  # вход ушел на биржу: откат approve ЗАПРЕЩЕН
+    kind: str = ""  # KIND_*; пусто -> ok | error (неизвестный отказ — сбой, консервативно)
+
+    def __post_init__(self):
+        if not self.kind:
+            object.__setattr__(self, "kind", KIND_OK if self.ok else KIND_ERROR)
 
 
 @dataclass(frozen=True)
@@ -121,14 +146,22 @@ class ExecutionService:
         price_fn=None,  # (symbol) -> float: последняя цена; None = проверка цены выключена
         max_drift_pct: float = DEFAULT_MAX_DRIFT_PCT,
         max_open_positions: int | None = None,
+        caps: Caps | None = None,  # R:R/стоп по фактической цене входа; None = выключено (тесты)
+        profile: ProfileLimits | None = None,
+        state=None,  # RuntimeState: panic/SAFE MODE в памяти (meta журнала читается всегда)
         sleep=time.sleep,
     ):
+        if (caps is None) != (profile is None):
+            raise ValueError("caps и profile передаются вместе: без одного проверка R:R неполна")
         self._ex = adapter
         self._j = journal
         self._run_id = run_id
         self._price_fn = price_fn
         self._max_drift_pct = max_drift_pct
         self._max_open = max_open_positions
+        self._caps = caps
+        self._profile = profile
+        self._state = state
         self._sleep = sleep
 
     def plan_for(self, decision_id: str) -> ExecutionPlan:
@@ -154,31 +187,71 @@ class ExecutionService:
             (exclude_decision,),
         ).fetchall()
 
+    def _halt_reason(self) -> str | None:
+        """panic, SAFE MODE, стоп по просадке — в памяти демона и в meta журнала (переживают
+        рестарт). Журнал не читается — входа нет (fail-closed)."""
+        st = self._state
+        try:
+            if (st is not None and st.panic_at is not None) or panic_engaged(self._j):
+                return "panic взведен — вход отменен"
+            if (st is not None and st.safe_mode) or safe_mode_engaged(self._j):
+                return "SAFE MODE взведен — вход отменен"
+            halt = read_halt(self._j)
+        except Exception as e:  # noqa: BLE001
+            return f"флаги защиты не прочитаны ({type(e).__name__}: {e}) — вход отменен"
+        return halt.message() if halt is not None else None
+
+    @staticmethod
+    def _entry_price(plan: ExecutionPlan, mode: str, px: float | None) -> float:
+        """Цена, по которой реально войдем: маркет — текущая (без цены — плановая), лимит — уровень."""
+        if mode == "limit":
+            return float(plan.entry_limit)
+        return px if px is not None else plan.entry_market
+
+    def _rr_reason(self, plan: ExecutionPlan, mode: str, entry_px: float) -> str | None:
+        """Шаги лестницы 5-6 (стоп, геометрия, R:R с комиссиями) по фактической цене входа."""
+        if self._caps is None or self._profile is None:
+            return None
+        check = check_entry_price(plan.side, entry_px, plan.sl, plan.tp, self._caps, self._profile)
+        failed = check.failed
+        if failed is None:
+            return None
+        where = "по текущей цене" if mode == "market" else "по лимитному уровню"
+        if failed.name == "rr_fee_adjusted":
+            return f"R:R {where} {check.rr:.2f} < {self._caps.min_rr_fee_adjusted} — вход отменен"
+        if failed.name == "sl_distance":
+            return f"стоп {where} {check.sl_dist_pct:.2f}% вне {failed.limit} — вход отменен"
+        return (f"цена входа {entry_px:.6g} не между стопом {plan.sl:.6g} и целью "
+                f"{plan.tp:.6g} — вход отменен")
+
     def _pre_checks(self, plan: ExecutionPlan, mode: str) -> tuple[str | None, float | None]:
         """Мир на момент нажатия. Лестница видела его при создании карточки.
         Возвращает (причина отказа | None, текущая цена | None)."""
+        halt = self._halt_reason()
+        if halt is not None:
+            return halt, None
         live = self._live_trades(plan.candidate_id)
         if self._max_open is not None and len(live) >= self._max_open:
             return f"лимит открытых позиций: {len(live)}/{self._max_open}", None
         if any(r["symbol"] == plan.symbol and r["side"] == plan.side for r in live):
             return f"уже есть позиция {plan.symbol} {plan.side}", None
-        if self._price_fn is None:
-            return None, None
-        try:
-            px = float(self._price_fn(plan.symbol))
-        except Exception as e:  # noqa: BLE001 - без цены вслепую не входим
-            return f"нет текущей цены: {short_error(e)}", None
-        is_long = plan.side == "long"
-        if (is_long and px <= plan.sl) or (not is_long and px >= plan.sl):
-            return f"цена {px:.6g} уже за стопом {plan.sl:.6g}", px
-        if (is_long and px >= plan.tp) or (not is_long and px <= plan.tp):
-            return f"цена {px:.6g} уже за целью {plan.tp:.6g}", px
-        if mode == "market":
-            drift = abs(px - plan.entry_market) / plan.entry_market * 100.0
-            if drift > self._max_drift_pct:
-                return (f"цена ушла на {drift:.2f}% от плана "
-                        f"({plan.entry_market:.6g} -> {px:.6g}) — план устарел"), px
-        return None, px
+        px = None
+        if self._price_fn is not None:
+            try:
+                px = float(self._price_fn(plan.symbol))
+            except Exception as e:  # noqa: BLE001 - без цены вслепую не входим
+                return f"нет текущей цены: {short_error(e)}", None
+            is_long = plan.side == "long"
+            if (is_long and px <= plan.sl) or (not is_long and px >= plan.sl):
+                return f"цена {px:.6g} уже за стопом {plan.sl:.6g}", px
+            if (is_long and px >= plan.tp) or (not is_long and px <= plan.tp):
+                return f"цена {px:.6g} уже за целью {plan.tp:.6g}", px
+            if mode == "market":
+                drift = abs(px - plan.entry_market) / plan.entry_market * 100.0
+                if drift > self._max_drift_pct:
+                    return (f"цена ушла на {drift:.2f}% от плана "
+                            f"({plan.entry_market:.6g} -> {px:.6g}) — план устарел"), px
+        return self._rr_reason(plan, mode, self._entry_price(plan, mode, px)), px
 
     @staticmethod
     def risk_sized_qty(plan: ExecutionPlan, entry_price: float) -> float:
@@ -207,44 +280,55 @@ class ExecutionService:
 
     def _execute(self, decision_id: str, mode: str) -> ExecutionOutcome:
         if mode not in ("market", "limit"):
-            return ExecutionOutcome(False, f"неизвестный режим {mode}")
+            return ExecutionOutcome(False, f"неизвестный режим {mode}", kind=KIND_ERROR)
         if self.already_executed(decision_id):
-            return ExecutionOutcome(False, "уже исполнено")
+            return ExecutionOutcome(False, "уже исполнено", kind=KIND_REFUSED)
 
         try:
             plan = self.plan_for(decision_id)
         except Exception as e:  # noqa: BLE001
-            return ExecutionOutcome(False, f"план не прочитан: {e}")
+            return ExecutionOutcome(False, f"план не прочитан: {e}", kind=KIND_ERROR)
 
         if mode == "limit" and plan.entry_limit is None:
-            return ExecutionOutcome(False, "лимитного уровня нет в плане — только маркет")
+            return ExecutionOutcome(False, "лимитного уровня нет в плане — только маркет",
+                                    kind=KIND_REFUSED)
         reason, px = self._pre_checks(plan, mode)
         if reason is not None:
             logger.info("execution refused for %s: %s", decision_id, reason)
-            return ExecutionOutcome(False, reason)
+            return ExecutionOutcome(False, reason, kind=KIND_REFUSED)
 
         cid = make_client_order_id(self._run_id, decision_id)
         price = plan.entry_market if mode == "market" else float(plan.entry_limit)
         # риск считается от цены, по которой реально войдем: маркет — текущая, лимит — уровень
-        sizing_price = px if (mode == "market" and px is not None) else price
+        # (та же цена, по которой _pre_checks перепроверил R:R и стоп)
+        sizing_price = self._entry_price(plan, mode, px)
         target_qty = self.risk_sized_qty(plan, sizing_price)
 
         # 0. подготовка: до этой точки на бирже ничего нет — любой отказ честно без следов
         try:
             qty = self._ex.normalize_qty(plan.symbol, target_qty)
             if qty <= 0:
-                return ExecutionOutcome(False, f"qty после нормализации = {qty}")
+                return ExecutionOutcome(False, f"qty после нормализации = {qty}", kind=KIND_REFUSED)
             # плечо идемпотентно: таймаут VST (живой случай 2026-10-14) — повтор, не отказ
             self._retry_network(lambda: self._ex.set_leverage(plan.symbol, plan.leverage, plan.side))
         except Exception as e:  # noqa: BLE001
             logger.error("pre-entry failed for %s: %s", decision_id, e)
-            return ExecutionOutcome(False, f"биржа отказала: {short_error(e)}")
+            return ExecutionOutcome(False, f"биржа отказала: {short_error(e)}",
+                                    kind=KIND_EXCHANGE_REJECTED)
+
+        # Последний рубеж перед биржей (блок H, 2026-10-16): panic/SAFE MODE/просадка могли
+        # взвестись после предпроверок, а вход «в процессе» panic_flatten не видит.
+        halt = self._halt_reason()
+        if halt is not None:
+            logger.warning("execution refused right before entry for %s: %s", decision_id, halt)
+            return ExecutionOutcome(False, halt, kind=KIND_REFUSED)
 
         # 1. вход — с прикрепленной защитой, если биржа примет
         entry = self._place_entry(plan, qty, cid, mode, price)
         if entry.order is None and not entry.unknown:
             logger.error("entry failed for %s: %s", decision_id, entry.error)
-            return ExecutionOutcome(False, f"биржа отказала: {short_error(entry.error)}")
+            return ExecutionOutcome(False, f"биржа отказала: {short_error(entry.error)}",
+                                    kind=KIND_EXCHANGE_REJECTED)
         if entry.unknown:
             # таймаут на входе: принят ли ордер — неизвестно. Пишем намерение (pending
             # без id), монитор найдет ордер по clientOrderId или снимет запись по TTL.
@@ -252,7 +336,7 @@ class ExecutionService:
                          None, None, f"{mode}@{price:.8g}; entry_unknown: {short_error(entry.error)}")
             msg = "биржа не ответила на вход — проверяю по clientOrderId; повторно НЕ нажимай"
             logger.critical("%s %s", decision_id, msg)
-            return ExecutionOutcome(False, msg, cid, mode, entry_sent=True)
+            return ExecutionOutcome(False, msg, cid, mode, entry_sent=True, kind=KIND_ENTRY_UNKNOWN)
 
         # 2. защита
         sl_id = tp_id = None
@@ -282,7 +366,7 @@ class ExecutionService:
                     else "ЗАКРЫТЬ НЕ УДАЛОСЬ — проверь биржу СРОЧНО")
             msg = f"⚠️ вход исполнен, но стоп не встал ({short_error(protection_error)}); {tail}"
             logger.critical("%s %s", decision_id, msg)
-            return ExecutionOutcome(False, msg, cid, mode, entry_sent=True)
+            return ExecutionOutcome(False, msg, cid, mode, entry_sent=True, kind=KIND_PROTECTION_FAILED)
 
         label = "маркет" if mode == "market" else f"лимит {price:.6g}"
         guard = {
@@ -294,7 +378,7 @@ class ExecutionService:
                     decision_id, label, qty, plan.leverage, entry.order.exchange_id, status, how)
         return ExecutionOutcome(
             True, f"{label}: {plan.symbol} {plan.side} qty {qty:g}, плечо {plan.leverage:g}x; {guard}",
-            client_order_id=cid, entry_type=mode, entry_sent=True,
+            client_order_id=cid, entry_type=mode, entry_sent=True, kind=KIND_OK,
         )
 
     # -------------------------------------------------------------- helpers
@@ -484,19 +568,21 @@ def equity_guarded(
                 False,
                 f"equity с биржи недоступен (источник: {source}) — исполнение "
                 "заблокировано. Проверь API-ключ BingX.",
+                kind=KIND_REFUSED,
             )
         if equity_fn is not None and plan_fn is not None and risk_cap_pct is not None:
             try:
                 plan = plan_fn(decision_id)
                 equity = float(equity_fn())
             except Exception as e:  # noqa: BLE001
-                return ExecutionOutcome(False, f"план/equity не прочитаны: {e}")
+                return ExecutionOutcome(False, f"план/equity не прочитаны: {e}", kind=KIND_ERROR)
             allowed = risk_cap_pct / 100.0 * equity * (1.0 + tolerance)
             if plan.risk_usd > allowed:
                 return ExecutionOutcome(
                     False,
                     f"план посчитан на другой equity: риск ${plan.risk_usd:.2f} > "
                     f"${allowed:.2f} допустимых при equity ${equity:.2f} — пропусти карточку",
+                    kind=KIND_REFUSED,
                 )
         return execute_fn(decision_id, mode)
 

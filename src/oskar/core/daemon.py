@@ -233,13 +233,23 @@ def _make_escalator(state, caps, profile_settings, settings, runner, cache, auto
 
 
 def _sandbox(settings) -> bool:
-    return bool(settings.get("exchange", {}).get("sandbox", True))
+    """Среда приватного доступа к бирже: до гейта Фазы 5 — только VST. Белый список
+    (блок H, 2026-10-16): вне paper + sandbox=true — исключение, а не реальный хост
+    (было bool(...) от любого значения ключа)."""
+    from oskar.core.env_gate import paper_gate
+
+    reason = paper_gate(settings)
+    if reason is not None:
+        raise RuntimeError(reason)
+    return True
 
 
-def _make_executor(state, settings, caps, client):
+def _make_executor(state, settings, caps, client, profile_limits=None):
     """Исполнитель по кнопке. Среда (VST/реал) — из settings.exchange.sandbox,
     та же, что у equity и монитора. Цена для проверки «план не устарел» — с
-    публичного тикера; лимит позиций — из капсов."""
+    публичного тикера; лимит позиций — из капсов. Капсы и профиль — еще и для
+    перепроверки R:R/стопа по фактической цене входа (блок H, 2026-10-16), state —
+    panic/SAFE MODE непосредственно перед отправкой входа."""
     import os
 
     from dotenv import load_dotenv
@@ -260,10 +270,11 @@ def _make_executor(state, settings, caps, client):
     return ExecutionService(
         adapter, state.journal, state.run_id,
         price_fn=client.last_price, max_open_positions=caps.max_open_positions,
+        caps=caps, profile=profile_limits, state=state,
     )
 
 
-def _make_monitor(state, settings, profile, token: str, chat_id: str):
+def _make_monitor(state, settings, profile, token: str, chat_id: str, drawdown=None):
     """Монитор позиций: свой ccxt-экземпляр (не делим сессию с кнопками),
     уведомления через сигнального бота. None без ключей биржи."""
     import os
@@ -299,6 +310,7 @@ def _make_monitor(state, settings, profile, token: str, chat_id: str):
         max_loss_hold_seconds=profile.max_loss_hold_seconds,
         limit_entry_ttl_seconds=profile.limit_entry_ttl_seconds,
         notify=notify, on_card_expired=on_expired, state=state, reconciler=reconciler,
+        drawdown=drawdown,
     )
 
 
@@ -373,15 +385,15 @@ def main() -> int:
     scanner = load_scanner_settings(settings)
     cycle_cfg = build_cycle_config(profile, scanner, settings)
 
-    # одна среда для исполнения, equity и монитора; реал закрыт гейтом Фазы 5
-    mode = str(settings.get("mode", "paper"))
-    if mode == "live":
-        print("REFUSING TO START: mode=live is gated until Phase 5 (PF>=1.3 over 60 trades)", flush=True)
+    # одна среда для исполнения, equity и монитора; реал закрыт гейтом Фазы 5. Белый список
+    # (блок H, 2026-10-16): был черный — «real»/«Live»/опечатка + sandbox:false шли на реал.
+    from oskar.core.env_gate import paper_gate
+
+    gate = paper_gate(settings)
+    if gate is not None:
+        print(f"REFUSING TO START: {gate}", flush=True)
         return 6
-    if mode == "paper" and not _sandbox(settings):
-        print("REFUSING TO START: mode=paper but exchange.sandbox=false (real orders from a paper run)",
-              flush=True)
-        return 6
+    mode = "paper"
 
     journal = _connect_journal(journal_path(settings))
     if journal is None:
@@ -410,6 +422,13 @@ def main() -> int:
         state.panic()  # ст. 6 п. 3: после рестарта panic держится до явного сброса
         print(f"PANIC ENGAGED since {engaged}: trading blocked until `oskar panic-reset` "
               "(POST /panic/reset)", flush=True)
+    # SAFE MODE тоже переживает рестарт (блок H, 2026-10-16: супервизор снимал бы его молча)
+    from oskar.core.emergency import restore_safe_mode
+
+    safe_reason = restore_safe_mode(state, notify=alert)
+    if safe_reason is not None:
+        print(f"SAFE MODE restored after restart ({safe_reason!r}): new entries blocked until "
+              "`oskar panic-reset`", flush=True)
 
     client = MarketDataClient(make_bingx_public_exchange())
     cache = CandleCache(client)
@@ -424,10 +443,21 @@ def main() -> int:
         equity_fn=_make_equity_fn(settings),
         notify=alert,
     )
+    # Стоп по просадке (блок H, 2026-10-16): тот же equity, что у equity_guarded исполнителя
+    from oskar.risk.drawdown import DEFAULT_DRAWDOWN_PCT, DrawdownGuard
+
+    try:
+        drawdown = DrawdownGuard(
+            journal, float((settings.get("safe_mode") or {}).get("drawdown_pct", DEFAULT_DRAWDOWN_PCT)),
+            equity_fn=lambda: runner.equity_usd, equity_source_fn=lambda: runner.equity_source,
+        )
+    except (TypeError, ValueError) as e:
+        print(f"REFUSING TO START: safe_mode.drawdown_pct: {e}", flush=True)
+        return 6
     # Исполнитель и режим — ДО эскалатора: в режиме «автомат» сделку ставит сам цикл.
     from oskar.core.trading_mode import AutoExecutor, TradingMode
 
-    executor = _make_executor(state, settings, caps, client)
+    executor = _make_executor(state, settings, caps, client, profile.limits)
     guarded_execute = None
     if executor is not None:
         from oskar.core.executor import equity_guarded
@@ -439,7 +469,7 @@ def main() -> int:
         )
     # автомат — только paper/VST (реал закрыт гейтом Фазы 5); по умолчанию — из настроек
     trading_mode = TradingMode(
-        journal, allowed=(mode == "paper" and _sandbox(settings) and guarded_execute is not None),
+        journal, allowed=(paper_gate(settings) is None and guarded_execute is not None),
         default=str((settings.get("execution") or {}).get("default_mode", "confirm")),
     )
     auto_executor = (AutoExecutor(trading_mode, state, guarded_execute, notify=alert)
@@ -451,7 +481,7 @@ def main() -> int:
 
     # Монитор — ДО поллера: Telegram /panic зовет monitor.panic_flatten(), а /panic,
     # пролежавший в очереди Telegram, поллер исполнит на первом же опросе.
-    monitor = _make_monitor(state, settings, profile, alert_token, chat_id)
+    monitor = _make_monitor(state, settings, profile, alert_token, chat_id, drawdown=drawdown)
     monitor_thread = monitor.start_thread() if monitor is not None else None
     print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}", flush=True)
 
@@ -480,7 +510,7 @@ def main() -> int:
     token_path = REPO_ROOT / "data" / "oskard.token"
     token_path.write_text(api_token, encoding="ascii")  # читают Hermes-скиллы и CLI
     app = build_app(state, shadow=runner, monitor=monitor, api_token=api_token,
-                    trading_mode=trading_mode)
+                    trading_mode=trading_mode, drawdown=drawdown)
     print(
         f"oskard starting: run_id={state.run_id} profile={profile.name} "
         f"mode={mode} sandbox={_sandbox(settings)} api=http://{api_host}:{api_port} "

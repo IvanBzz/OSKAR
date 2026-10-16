@@ -11,6 +11,7 @@
 
 import html
 import io
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,6 +21,8 @@ from oskar.contracts.schemas import RiskVerdict, SetupCandidate
 from oskar.data.symbols import to_display
 
 API = "https://api.telegram.org"
+
+logger = logging.getLogger("oskar.telegram")
 
 
 @dataclass(frozen=True)
@@ -48,15 +51,31 @@ class TelegramSender:
         return bool(r.json().get("ok"))
 
     def send_text(self, text: str) -> SentMessage:
-        r = self._http.post(
-            f"{self._base}/sendMessage",
-            json={"chat_id": self._chat, "text": text, "parse_mode": "HTML"},
-        )
-        payload = r.json()
-        return SentMessage(
-            message_id=int(payload.get("result", {}).get("message_id", 0)),
-            ok=bool(payload.get("ok")),
-        )
+        """Алерт. Ответ Telegram проверяется (блок H, 2026-10-16): ok:false (HTML не разобрался —
+        «&», «<» в тексте ошибки биржи) или HTTP/сетевая ошибка -> logger.error и повтор тем же
+        текстом без parse_mode. Раньше ответ не смотрели: алерт «БЕЗ SL» мог молча не дойти."""
+        sent, why = self._post_text(text, html_mode=True)
+        if sent.ok:
+            return sent
+        logger.error("telegram alert refused (%s) - resending as plain text", why)
+        sent, why = self._post_text(text, html_mode=False)
+        if not sent.ok:
+            logger.error("telegram alert NOT delivered (%s): %s", why, text[:200])
+        return sent
+
+    def _post_text(self, text: str, *, html_mode: bool) -> tuple[SentMessage, str]:
+        body = {"chat_id": self._chat, "text": text}
+        if html_mode:
+            body["parse_mode"] = "HTML"
+        try:
+            r = self._http.post(f"{self._base}/sendMessage", json=body)
+            payload = r.json()
+            if r.status_code >= 400 or not payload.get("ok"):
+                why = str(payload.get("description", ""))[:200]
+                return SentMessage(0, False), f"HTTP {r.status_code}: {why}"
+            return SentMessage(int((payload.get("result") or {}).get("message_id", 0)), True), ""
+        except Exception as e:  # noqa: BLE001 - сеть/не-JSON; в URL токен — пишем только тип
+            return SentMessage(0, False), type(e).__name__
 
     def send_setup_card(
         self,

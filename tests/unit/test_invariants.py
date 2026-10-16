@@ -272,3 +272,52 @@ def test_unreconciled_pnl_never_proves_green(tmp_path):
         add(j, f"w{i}", reason="manual", pnl=5.0, duration=LIMIT * 2, reconciled=0)
     v = one(j, inv("loser_overhold_count", {"closed_trades": 20}))
     assert v.status == INSUFFICIENT
+
+
+# ------------------------------------------------------------- INV-004 (блок H)
+
+
+def _entry(j, did, entry, sl, tp):
+    tid = add(j, did, entry=entry)
+    j.execute("UPDATE trades SET sl_price=?, tp_price=? WHERE id=?", (sl, tp, tid))
+    j.commit()
+    return tid
+
+
+def _entry_one(j, window):
+    from oskar.risk.ladder import Caps, ProfileLimits
+
+    caps = Caps(risk_per_trade_pct=1.0, max_total_risk_pct=5.0, max_leverage=10.0,
+                confidence_cap=75, min_rr_fee_adjusted=2.0, max_open_positions=3)
+    limits = ProfileLimits(sl_dist_pct_min=0.5, sl_dist_pct_max=3.0, max_leverage=8.0)
+    ctx = Context(max_loss_hold_seconds=LIMIT, caps=caps, profile_limits=limits)
+    return METRICS["entry_price_violations"](j, window, NOW, ctx)
+
+
+def test_inv004_flags_entry_below_rr_cap_by_fill_price(tmp_path):
+    from oskar.ops.invariants import Window
+
+    j = connect(tmp_path / "j.db")
+    _entry(j, "ok", 100.0, 99.0, 103.0)      # стоп 1%, R:R (3 - 0.2) / 1 = 2.8
+    bad = _entry(j, "bera", 100.49, 99.0, 103.2)  # дрейф: R:R ~1.68
+    m = _entry_one(j, Window(closed_trades=2))
+    assert m.value == 1 and m.sufficient and f"#{bad}" in m.detail
+
+
+def test_inv004_flags_stop_outside_profile_and_tolerates_slippage(tmp_path):
+    from oskar.ops.invariants import Window
+
+    j = connect(tmp_path / "j.db")
+    _entry(j, "wide", 100.0, 96.0, 112.0)    # стоп 4% > 3%
+    _entry(j, "slip", 100.0, 99.0, 102.17)   # R:R 1.97: в пределах люфта проскальзывания
+    m = _entry_one(j, Window(closed_trades=2))
+    assert m.value == 1
+
+
+def test_inv004_missing_levels_is_not_green(tmp_path):
+    from oskar.ops.invariants import Window
+
+    j = connect(tmp_path / "j.db")
+    add(j, "nolevels")
+    m = _entry_one(j, Window(closed_trades=1))
+    assert m.value == 0 and not m.sufficient
