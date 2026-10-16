@@ -44,7 +44,12 @@ RATE_LIMIT_COOLDOWN_SEC = 60.0
 COOLDOWN_MARGIN_SEC = 5.0
 
 COOLDOWN_CODES = frozenset({"109429"})
-TRANSIENT_CODES = frozenset({"100410"})
+# 100421 «Null timestamp or timestamp mismatch»: ccxt типизирует как BadSymbol, но это подпись,
+# устаревшая в пути (16.10 20:05: ответ BingX шел 64 с при recvWindow 5 с; часы ПК точны,
+# NTP 0.3 с). Повтор с новым таймстампом безопасен — ничего не было принято.
+TRANSIENT_CODES = frozenset({"100410", "100421"})
+# Срок годности подписи BingX (макс. 60 000). 5 с ccxt-дефолта не переживают задержку маршрута.
+RECV_WINDOW_MS = 30_000
 # Токенизированные активы BingX (RWA-перпы): NCSK акции, NCFX форекс, NCCO сырье,
 # NCSI индексы — base вида NCSKAAPL2USD / NCFXEUR2JPY / NCSKAXONUSDT. Торгуются
 # сессиями, вне часов стоят на паузе (status 25) и отвечают 109415. Стратегия — крипта.
@@ -350,7 +355,8 @@ def make_bingx_exchange(api_key: str = "", secret: str = "", sandbox: bool = Tru
         "enableRateLimit": True,
         # defaultType=swap ОБЯЗАТЕЛЕН: без него fetch_balance уходит в SPOT
         # реального аккаунта даже в sandbox (VST — это swap-хост)
-        "options": {"adjustForTimeDifference": True, "defaultType": "swap"},
+        "options": {"adjustForTimeDifference": True, "defaultType": "swap",
+                    "recvWindow": RECV_WINDOW_MS},
     })
     ex.set_sandbox_mode(True)
     return ex

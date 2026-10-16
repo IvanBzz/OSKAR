@@ -569,12 +569,16 @@ class ExecutionService:
     # -------------------------------------------------------------- helpers
 
     def _retry_network(self, fn):
-        """Повтор ТОЛЬКО идемпотентных вызовов при сетевом сбое."""
+        """Повтор ТОЛЬКО идемпотентных вызовов при сетевом или временном сбое.
+
+        «transient» — 100410 и 100421 «timestamp mismatch» (16.10 20:05: плечо FIL отклонено,
+        потому что подпись устарела за 64 с пути до BingX; ccxt типизирует это как BadSymbol, и
+        без повтора исход шел в предохранитель автомата как отказ биржи)."""
         for attempt in range(1 + NETWORK_RETRIES):
             try:
                 return fn()
             except Exception as e:  # noqa: BLE001
-                if classify_error(e) != "network" or attempt >= NETWORK_RETRIES:
+                if classify_error(e) not in ("network", "transient") or attempt >= NETWORK_RETRIES:
                     raise
                 logger.warning("network error, retry %d/%d: %s", attempt + 1, NETWORK_RETRIES, e)
                 self._sleep(1.0 * (attempt + 1))

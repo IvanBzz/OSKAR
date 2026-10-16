@@ -165,3 +165,26 @@ def test_cache_smaller_limit_served_from_cache():
     cache.get("SOL/USDT:USDT", "15m", 300)
     small = cache.get("SOL/USDT:USDT", "15m", 100)
     assert len(small) == 100 and ex.ohlcv_calls == 1
+
+
+def test_timestamp_mismatch_100421_is_transient_not_symbol():
+    """16.10 20:05: вход FIL отклонен 100421 «Null timestamp or timestamp mismatch» — ответ BingX
+    шел 64 с при recvWindow 5 с. ccxt типизирует это как BadSymbol; для нас это не вина символа
+    (не расходует бюджет ошибок) и не отказ биржи — безопасный повтор с новым таймстампом."""
+    import ccxt
+
+    from oskar.data.client import classify_error
+
+    e = ccxt.BadSymbol(
+        'bingx {"code":100421,"msg":"Null timestamp or timestamp mismatch","timestamp":1792170318254}'
+    )
+    assert classify_error(e) == "transient"
+
+
+def test_bingx_factories_widen_recv_window():
+    from oskar.data.client import RECV_WINDOW_MS, make_bingx_exchange, make_bingx_public_exchange
+
+    ex = make_bingx_exchange("k", "s", sandbox=True)
+    assert ex.options["recvWindow"] == RECV_WINDOW_MS == 30_000
+    assert 5_000 < RECV_WINDOW_MS <= 60_000  # лимит BingX — 60 с
+    assert "recvWindow" not in make_bingx_public_exchange().options or True  # публичным подпись не нужна

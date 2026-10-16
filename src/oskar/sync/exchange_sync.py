@@ -19,6 +19,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from oskar.data.client import RECV_WINDOW_MS
 from oskar.data.symbols import canonical
 
 QTY_TOLERANCE = 0.001  # |ratio - 1| выше — расхождение
@@ -197,7 +198,8 @@ def make_bingx_view(api_key: str, secret: str, sandbox: bool = True) -> Exchange
         "apiKey": api_key,
         "secret": secret,
         # defaultType=swap: иначе balance уходит в SPOT реального аккаунта
-        "options": {"adjustForTimeDifference": True, "defaultType": "swap"},
+        "options": {"adjustForTimeDifference": True, "defaultType": "swap",
+                    "recvWindow": RECV_WINDOW_MS},  # подпись живет 30 с, не 5 (100421 16.10)
     })
     ex.set_sandbox_mode(True)
 

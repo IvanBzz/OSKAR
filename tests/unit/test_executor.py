@@ -213,3 +213,40 @@ def test_plan_json_roundtrip():
     p = plan()
     assert ExecutionPlan.model_validate_json(p.model_dump_json()) == p
     assert json.loads(p.model_dump_json())["schema_version"] == 1
+
+
+def test_leverage_retries_on_timestamp_mismatch_100421():
+    """16.10 20:05: set_leverage FIL отклонен 100421 (подпись устарела в пути) — раньше это был
+    немедленный «биржа отказала» без повтора и +1 в предохранитель автомата."""
+    import ccxt
+
+    from oskar.core.executor import ExecutionService
+
+    calls = {"n": 0}
+
+    def flaky_leverage():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ccxt.BadSymbol('bingx {"code":100421,"msg":"Null timestamp or timestamp mismatch"}')
+        return {"ok": True}
+
+    ex = ExecutionService.__new__(ExecutionService)
+    ex._sleep = lambda *_: None
+    assert ex._retry_network(flaky_leverage) == {"ok": True}
+    assert calls["n"] == 2
+
+
+def test_leverage_does_not_retry_real_symbol_error():
+    import ccxt
+    import pytest
+
+    from oskar.core.executor import ExecutionService
+
+    ex = ExecutionService.__new__(ExecutionService)
+    ex._sleep = lambda *_: None
+
+    def bad():
+        raise ccxt.BadSymbol('bingx {"code":109400,"msg":"symbol not exist"}')
+
+    with pytest.raises(ccxt.BadSymbol):
+        ex._retry_network(bad)
