@@ -160,7 +160,7 @@ footer{font-size:12px;color:var(--faint);font-family:var(--mono)}
   <div class="topline">
     <span class="label">OSKAR · BingX USDT-перпы · интрадей 15м</span>
     <span class="pill auto"><span class="led"></span>АВТОМАТ · VST</span>
-    <span class="pill snap mono" id="snap">срез 16.10.2026 · 05:00 МСК · R1 + H2 + I</span>
+    <span class="pill snap mono" id="snap">срез 16.10.2026 · 11:00 МСК · после ночи</span>
   </div>
   <h1>Пульт OSKAR</h1>
   <p class="lede">Что готово, что проверено на бирже и что дальше. Источники: 4 аудитора Claude (сверка с эталоном целей), Codex gpt-6-astra (ревью стратегии, планировщик, думающий центр), журнал <span class="mono">data/oskar.db</span> и логи демона.</p>
@@ -171,9 +171,31 @@ footer{font-size:12px;color:var(--faint);font-family:var(--mono)}
     <div class="kpi bad"><span class="label">Закрытых сделок</span><span class="v num">0<small> / 60</small></span><span class="s">гейт реала: PF ≥ 1.3 на 60</span></div>
     <div class="kpi mid"><span class="label">Аптайм за 7 дней</span><span class="v num">16.7<small>%</small></span><span class="s">28 ч из 168; супервизора не было</span></div>
     <div class="kpi"><span class="label">Кандидатов в журнале</span><span class="v num">266</span><span class="s">до биржи дошел 1</span></div>
-    <div class="kpi good"><span class="label">Тестов</span><span class="v num" id="kpi-tests">590</span><span class="s">в main; ветка F ждет выкатки</span></div>
+    <div class="kpi good"><span class="label">Тестов</span><span class="v num" id="kpi-tests">645</span><span class="s">в main; 4 ветки ждут решения</span></div>
     <div class="kpi"><span class="label">Вызовов LLM</span><span class="v num">98</span><span class="s">Scout 84 · Trader 14</span></div>
-    <div class="kpi"><span class="label">Коммитов</span><span class="v num" id="kpi-commits">63</span><span class="s">+2 в ветке F; только от Ивана</span></div>
+    <div class="kpi"><span class="label">Коммитов</span><span class="v num" id="kpi-commits">83</span><span class="s">+ ветки F, K, J, R3; только от Ивана</span></div>
+  </div>
+</section>
+
+<section aria-labelledby="h-night">
+  <div class="sec-head"><h2 id="h-night">Ночь 16.10 — главное</h2><span class="label">05:50 → 11:00 МСК</span></div>
+  <div class="two">
+    <div class="box">
+      <h3 class="who"><i style="background:var(--ok)"></i>Что случилось вживую</h3>
+      <ul>
+        <li><b>Первая автосделка (09:01):</b> INIT long, лимит, SL/TP прикреплены ко входу — 109420 больше нет. Не исполнилась за 60 мин, монитор снял по TTL. Проверено вживую: «вход с защитой» и «снятие по TTL».</li>
+        <li><b>Ложный стоп по просадке (09:01):</b> −16.6% без убытков. ccxt отдает «доступно к выводу», а не капитал, лимитка заморозила маржу. Исправлено и выкачено. <b>Защелку снимает Иван:</b> <code>oskar drawdown-reset</code>.</li>
+        <li><b>Общий лимит подписки:</b> ночные агенты выбрали лимит Claude, и Scout/Trader стояли с 06:30 до 08:40. Бюджеты надо развести.</li>
+      </ul>
+    </div>
+    <div class="box">
+      <h3 class="who"><i style="background:var(--wip)"></i>Что сделано в коде</h3>
+      <ul>
+        <li><b>H3 в бою:</b> 7 находок Codex по H2/I, 4 круга ревью. Panic закрывает только доказанное по id ордеров, неясное — в SAFE MODE с алертом. 645 тестов.</li>
+        <li><b>Готово в ветках:</b> K — кеш свечей, ~65 → ~2 запроса/мин; J — свечные паттерны в тени; R3 — честные counterfactuals. Плюс F — воронка.</li>
+        <li><b>Исследования:</b> сетап «разворот к гэпу» в правилах не подтвердился, лучший вариант не доказан. Фильтр по волатильности рано вводить. На 15м комиссии съедают 0.34–0.40R.</li>
+      </ul>
+    </div>
   </div>
 </section>
 
@@ -300,14 +322,14 @@ const layers = [
     ["Эскалация и автомат","src/oskar/core/escalation.py · trading_mode.py","warn",85,15,"ползунок авто/подтверждение в боте; 0 автоисполнений пока"]
   ]],
   ["Исполнение",[
-    ["Исполнитель","src/oskar/core/executor.py · execution/bingx.py","warn",92,10,"SL/TP прикреплены ко входу; R:R и стоп по фактической цене, panic/SAFE MODE прямо перед ордером (H)"],
+    ["Исполнитель","src/oskar/core/executor.py · execution/bingx.py","warn",94,35,"первая автосделка: лимит с прикрепленными SL/TP принят биржей; допуск входа под общим замком с panic (H3)"],
     ["Монитор позиций","src/oskar/core/position_monitor.py","warn",85,15,"5 с pending / 60 с полный тик, усыновление защиты, duration-stop"],
     ["Сверка с биржей","src/oskar/sync","warn",80,5,"по филлам; 0 закрытых сделок — путь не пройден ни разу"],
     ["Журнал","src/oskar/journal","ok",92,90,"SQLite, миграции; v4 добавляет когорты executed/pending/error"]
   ]],
   ["Контроль и эксплуатация",[
     ["Конституция и капсы","CONSTITUTION.md · config/caps.yaml","warn",70,60,"хеш-пин работает; процедура ст. 4 и ledger ст. 5 — нет"],
-    ["Защита капитала","risk/drawdown.py · core/env_gate.py","warn",85,20,"стоп по просадке 10% (пик 121.71 VST выставлен вживую), гейт реала — белый список, SAFE MODE переживает рестарт"],
+    ["Защита капитала","risk/drawdown.py · core/env_gate.py","warn",90,40,"стоп по просадке сработал вживую — ложно, из-за поля ccxt (исправлено); гейт реала — белый список; SAFE MODE на 2 носителях"],
     ["Emergency stop","src/oskar/core/emergency.py","warn",80,0,"/panic из TG, CLI, API; позиции вне журнала не трогает; вживую не взводился"],
     ["Инварианты ст. 5","src/oskar/ops/invariants.py","warn",60,10,"INV-004/005 объявлены; демон гоняет их каждые 6 ч с алертом (I); ledger нет"],
     ["Супервизор 24/7","scripts/supervise.ps1","warn",85,0,"готов: рестарт, запрет сна, heartbeat-сторож, алерты; ждет установки Иваном"]
@@ -359,11 +381,15 @@ for(const [a,b] of seg){const i=document.createElement("i");const x=(msk(a)-t0)/
 const days=document.getElementById("ut-days"),grid=document.getElementById("ut-grid");
 for(let d=10;d<=16;d++){const x=(msk(`2026-10-${d}T00:00`)-t0)/W*100;const s=document.createElement("span");s.style.left=x+"%";s.textContent=d+".10";days.appendChild(s);const b=document.createElement("b");b.style.left=x+"%";grid.appendChild(b)}
 // work
-const work=[["A","Прикрепленные SL/TP ко входу, монитор усыновляет защиту (фикс 109420)","ok","сделано 15.10"],["B","Сайзинг с комиссиями, целое плечо","ok","сделано 15.10"],["C","Сверка закрытых по филлам, вердикты инвариантов","ok","сделано 15.10"],["D","/panic и /status из Telegram, ротация логов без секретов","ok","сделано 15.10"],["E","Бюджет LLM по попыткам, изоляция claude -p, rate limit","ok","сделано 15.10"],["—","Режим авто / с подтверждением, ползунок /mode","ok","сделано 16.10"],["H","Защита капитала: R:R по факту, стоп по просадке, гейт реала, SAFE MODE в журнале, предохранитель по кодам · INV-004/005","ok","в бою (R1)"],["G","Супервизор 24/7: рестарт, запрет сна, heartbeat, алерты","warn","готов, ждет установки"],["—","Бюджет LLM: Scout 60/день 10/ч, Trader 30","ok","в бою (R1)"],["H2","Ревью Codex по R1: проверка перед каждой отправкой, panic ждет входы в полете, свежий equity, SAFE MODE на двух носителях","ok","в бою"],["I","Чужие ордера → SAFE MODE, approve через Hermes исполняет, инварианты каждые 6 ч, сводка 21:00 и /digest","ok","в бою"],["F","Воронка: тройки, net-R тейки, когорты v4, модель в журнале (+ фикс P2 от Codex)","wip","ветка, ждет зеленого R1"],["—","Claudexor: Codex снова видит файлы (песочница + патч)","ok","починен"]];
+const work=[["A","Прикрепленные SL/TP ко входу, монитор усыновляет защиту (фикс 109420)","ok","сделано 15.10"],["B","Сайзинг с комиссиями, целое плечо","ok","сделано 15.10"],["C","Сверка закрытых по филлам, вердикты инвариантов","ok","сделано 15.10"],["D","/panic и /status из Telegram, ротация логов без секретов","ok","сделано 15.10"],["E","Бюджет LLM по попыткам, изоляция claude -p, rate limit","ok","сделано 15.10"],["—","Режим авто / с подтверждением, ползунок /mode","ok","сделано 16.10"],["H","Защита капитала: R:R по факту, стоп по просадке, гейт реала, SAFE MODE в журнале, предохранитель по кодам · INV-004/005","ok","в бою (R1)"],["G","Супервизор 24/7: рестарт, запрет сна, heartbeat, алерты","warn","готов, ждет установки"],["—","Бюджет LLM: Scout 60/день 10/ч, Trader 30","ok","в бою (R1)"],["H2","Ревью Codex по R1: проверка перед каждой отправкой, panic ждет входы в полете, свежий equity, SAFE MODE на двух носителях","ok","в бою"],["I","Чужие ордера → SAFE MODE, approve через Hermes исполняет, инварианты каждые 6 ч, сводка 21:00 и /digest","ok","в бою"],["H3","Ревью Codex по H2/I: допуск входа после сети, panic только по доказанному id, старт не снимает SL, резервация слота, SAFE MODE при чужих ордерах","ok","в бою (ночь)"],["fix","Equity для стопа по просадке — капитал, а не «доступно к выводу»","ok","в бою (ночь)"],["F","Воронка: тройки, net-R тейки, когорты v4, модель в журнале (+ фикс P2 от Codex)","wip","ветка, ждет решения"],["K","Кеш свечей: запрос только после закрытия бара, ~65 → ~2/мин","wip","ветка, готова"],["R3","Честные counterfactuals: покрытие, жизненный цикл, R в риск-единицах, эпизоды","wip","ветка на F, готова"],["J","14 свечных паттернов в тени (решения не меняет)","wip","ветка на F, готова"],["—","Claudexor: Codex снова видит файлы (песочница + патч)","ok","починен"]];
 const wb=document.getElementById("work");
 for(const [k,t,st,s] of work){const tr=document.createElement("tr");tr.innerHTML=`<td class="k">${k}</td><td>${t}</td><td><span class="chip ${S[st][0]}">${s}</span></td>`;wb.appendChild(tr)}
 // asks
 const asks=[
+ "<b>Снять ложную защелку просадки</b>: <code>oskar drawdown-reset</code> — причина исправлена, без этого новых входов нет.",
+ "<b>Порядок выкатки веток</b>: K (кеш свечей, безопасно) → F (воронка, решение по ст. 5) → R3 и J поверх F.",
+ "<b>Правило</b>: на аккаунте бота руками не торговать (иначе panic не отличит ручной объем от ботового).",
+ "<b>Развести бюджет подписки</b>: ночью разработка выбрала лимит, и Scout/Trader стояли 2 часа.",
  "<b>Hermes: войти заново</b> — у него нет LLM с 11.10. В терминале: <code>hermes auth add nous</code>, потом «статус» в боте.",
  "<b>Установить супервизор</b> (PowerShell, из папки OSKAR): <code>powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\install_autostart.ps1</code>, затем <code>Start-ScheduledTask -TaskName 'OSKAR Supervisor'</code>. Он подхватит работающий демон.",
  "<b>Блок F (воронка)</b>: ждать зеленого вердикта R1 по ст. 5 п. 3 (первая автосделка закрыта и сверена) или выкатить сразу — твое решение.",
