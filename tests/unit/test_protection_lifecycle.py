@@ -5,6 +5,7 @@ SL/TP прикрепляются к самому входу; если биржа
 вход + защита по факту (маркет: ждем позицию, лимит: монитор при исполнении).
 """
 
+from dataclasses import replace
 from datetime import timedelta
 
 from oskar.contracts.schemas import ExecutionPlan
@@ -58,6 +59,7 @@ class ScriptedExchange(ExchangeAdapter):
         self.by_cid: dict[str, OrderState] = {}
         self.protection: list[ProtectiveOrder] = []
         self.pos: list[PositionInfo] = []
+        self.closed_qty: list[tuple[str, str, float]] = []  # close_qty: (symbol, side, qty)
 
     def normalize_qty(self, symbol, qty):
         return round(qty, 4)
@@ -102,6 +104,20 @@ class ScriptedExchange(ExchangeAdapter):
     def close_position(self, symbol, side):
         self.calls.append(("close", symbol, side))
         self.pos = []
+        return PlacedOrder("c1", "", "MARKET", "closed")
+
+    def close_qty(self, symbol, side, qty):
+        """Закрытие ровно qty (panic): позиция уменьшается, ручной остаток той же пары живет."""
+        match = [p for p in self.pos if p.symbol == symbol and p.side == side]
+        if not match or qty <= 0:
+            return None
+        done = min(qty, sum(p.qty for p in match))
+        self.calls.append(("close", symbol, side))
+        self.closed_qty.append((symbol, side, done))
+        rest = round(sum(p.qty for p in match) - done, 10)
+        self.pos = [p for p in self.pos if p not in match]
+        if rest > 0:
+            self.pos.append(replace(match[0], qty=rest))
         return PlacedOrder("c1", "", "MARKET", "closed")
 
     def positions(self):

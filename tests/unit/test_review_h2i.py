@@ -7,6 +7,10 @@
 5 — дедуп алерта о чужих ордерах отключал повторный взвод SAFE MODE после panic-reset;
 6 — аварийное закрытие in-flight слало Telegram до биржевых действий и под замком flatten;
 7 — сбой записи отметки digest вызывал повторную отправку сводки каждые 30 с.
+
+Пункты 2 и 3 упрощены в 3-м круге ревью H3 (test_review_h3_conservative): поздний вход
+проверяется по clientOrderId, а не преследуется по symbol/side; потерянная сделка на старте не
+восстанавливается — SAFE MODE и алерт, ее SL/TP на месте.
 """
 
 import threading
@@ -15,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from oskar.core import emergency as emergency_mod
-from oskar.core.emergency import engage_panic, reset_panic, safe_mode_engaged
+from oskar.core.emergency import engage_panic, reset_panic, safe_mode_engaged, unclear_entries
 from oskar.core.executor import KIND_REFUSED, make_client_order_id
 from oskar.core.ops_jobs import DIGEST_SENT_KEY, OpsScheduler, ops_config
 from oskar.core.position_monitor import ORPHAN_SCAN_SEC, PositionMonitor, _iso
@@ -157,10 +161,11 @@ def test_panic_final_pass_runs_even_if_entry_left_registry_before_wait(tmp_path)
     assert ex.closed == [(SYM, "long")] and out["exchange"]["closed"] == 1
 
 
-def test_entry_accepted_after_panic_window_is_chased_until_flat(tmp_path):
-    """Вход висит у биржи дольше окна ожидания; аварийный проход по бирже его не застал. Биржа
-    приняла вход позже, исполнитель записал открытую сделку — монитор закрывает ее по panic и
-    следит, пока отсутствие экспозиции не подтверждено."""
+def test_entry_accepted_after_panic_window_is_closed_by_client_id(tmp_path):
+    """Вход висит у биржи дольше окна ожидания; по clientOrderId его еще нет — исход неясен
+    (список неясных, ничего не закрыто). Биржа приняла вход позже, исполнитель записал открытую
+    сделку — тик монитора закрывает ровно ее qty по panic, вход снимается со списка (ревью H3,
+    3-й круг: вместо слежения по symbol/side)."""
     p = h_plan()
     svc, j, ex, state = service(tmp_path, p, price=[100.0])
     now = [T0]
@@ -174,39 +179,47 @@ def test_entry_accepted_after_panic_window_is_chased_until_flat(tmp_path):
         _, sleep, clock = _fake_time()
         out = engage_panic(state, mon, inflight_wait_sec=1.0, sleep=sleep, clock=clock)
         assert out["exchange"]["inflight_unfinished"] == [key]
+        assert out["exchange"]["unclear"] == [p.candidate_id] and out["exchange"]["closed"] == 0
+        assert list(unclear_entries(j)) == [key]
     finally:
         release.set()  # биржа приняла вход уже после окна и аварийного прохода
         worker.join(5)
     assert box["out"].ok and trade(j, p.candidate_id)["status"] == "open"
-    closes = sum(c[0] == "close" for c in ex.calls)
+    assert ex.closed_qty == []
     mon.tick_pending()
     row = trade(j, p.candidate_id)
     assert (row["status"], row["close_reason"]) == ("closed", "panic")
-    assert sum(c[0] == "close" for c in ex.calls) == closes + 1 and ex.pos == []
-    assert mon.chasing() == [key]  # отсутствие еще не подтверждено
+    assert ex.closed_qty == [(p.symbol, "long", row["qty"])] and ex.pos == []  # ровно qty сделки
+    assert unclear_entries(j) == {}
     for _ in range(3):
         now[0] += timedelta(minutes=5)
         mon.tick_pending()
-    assert mon.chasing() == []
+    assert len(ex.closed_qty) == 1  # второго закрытия нет
 
 
-def test_panic_chase_stops_after_operator_reset(tmp_path):
+def test_panic_reset_drops_unclear_entries(tmp_path):
+    """Неясные входы — до решения оператора: panic-reset снимает список (ответ называет снятые);
+    после reset монитор по ним ничего не делает, позиции пары не трогает."""
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
-    state.panic()
-    mon.chase_after_panic({"oskar-r9-0123456789ab": (SYM, "long")})
-    reset_panic(state)
+    add_trade(j, "lost", status="pending")  # вход после таймаута: id биржи нет, ордер не найден
+    out = engage_panic(state, mon)
+    assert out["exchange"]["unclear"] == ["lost"] and list(unclear_entries(j)) == ["oskar-r1-lost"]
+    res = reset_panic(state)
+    assert res["unclear_dropped"] == ["oskar-r1-lost"] and unclear_entries(j) == {}
+    assert safe_mode_engaged(j) is None and not state.safe_mode
     ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 0.0)]  # после снятия — обычная позиция
     mon.tick_pending()
-    assert mon.chasing() == [] and ex.closed == []
+    assert ex.closed == []
 
 
-# ======================================== P1-3: старт не снимает SL потерянной сделки
+# ============================= P1-3: старт не снимает SL потерянной сделки (и не присваивает)
 
 
-def test_startup_restores_lost_trade_and_keeps_its_only_protection(tmp_path):
+def test_startup_lost_trade_keeps_its_only_protection_and_is_not_restored(tmp_path):
     """Процесс упал после маркета и отдельных SL/TP, но до записи сделки (решение approved,
-    запуск зарегистрирован). Раньше старт снимал эти SL/TP как «своих сирот» ДО сверки позиций,
-    и позиция оставалась без стопа и без сделки."""
+    запуск зарегистрирован). Раньше старт снимал эти SL/TP как «своих сирот» ДО сверки позиций.
+    Учет автоматически НЕ восстанавливается (ревью H3, 3-й круг: так присваивалась и ручная
+    позиция той же пары) — SAFE MODE и алерт с позицией и ордерами OSKAR, решение за оператором."""
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     register_run(j, "r1")
     p = h_plan()
@@ -222,17 +235,18 @@ def test_startup_restores_lost_trade_and_keeps_its_only_protection(tmp_path):
     ex.orders.update({"s1": OrderState("s1", "open"), "t1": OrderState("t1", "open")})
     mon.startup_check()
     assert ex.cancelled == [] and ex.closed == []  # единственный SL на месте
-    row = trade(j, p.candidate_id)
-    assert row is not None and row["status"] == "open" and row["client_order_id"] == cid
-    assert (row["qty"], row["entry_price"], row["sl_price"], row["tp_price"]) == (3.0, 100.1, p.sl, p.tp)
-    assert (row["sl_order_id"], row["tp_order_id"]) == ("s1", "t1")  # защита усыновлена
-    outcome = j.execute("SELECT outcome FROM decisions WHERE decision_id=?", (p.candidate_id,)).fetchone()
-    assert outcome[0] == "executed"
-    assert state.safe_mode and "учет восстановлен" in safe_mode_engaged(j)["reason"]
-    assert any("учет восстановлен" in n for n in notes)
-    clock[0] += timedelta(seconds=61)
-    mon.tick()  # сопровождение как у обычной сделки: без снятий и расхождений
-    assert ex.cancelled == [] and trade(j, p.candidate_id)["status"] == "open"
+    assert trades_count(j) == 0  # учет не восстановлен
+    assert state.safe_mode and safe_mode_engaged(j) is not None
+    alert = [n for n in notes if "без сделки в журнале" in n]
+    assert len(alert) == 1
+    assert "SOL/USDT:USDT long qty 3" in alert[0] and "100.1" in alert[0]
+    assert cid + "-sl" in alert[0] and cid + "-tp" in alert[0]  # ордера OSKAR на паре
+    assert not any("SL/TP OSKAR без сделки сохранен" in n for n in notes)  # без дубля
+    for _ in range(2):
+        clock[0] += timedelta(minutes=11)
+        mon.tick()  # ни снятий, ни закрытий, ни повторных алертов
+    assert ex.cancelled == [] and ex.closed == [] and trades_count(j) == 0
+    assert len([n for n in notes if "без сделки в журнале" in n]) == 1
 
 
 def test_startup_untracked_position_without_decision_keeps_own_protection(tmp_path):
@@ -346,6 +360,7 @@ def test_panic_sends_telegram_after_exchange_actions_and_outside_flatten_lock(tm
     mon = PositionMonitor(ex, j, max_loss_hold_seconds=3600, limit_entry_ttl_seconds=3600,
                           state=state, notify=notify)
     add_trade(j, "open1", symbol="B/USDT:USDT")
+    ex.pos = [PositionInfo("B/USDT:USDT", "long", 2.0, 100.0, 0.0)]
     started, release = _blocked(ex, "place_entry")
     worker, box = _in_thread(lambda: svc.execute(p.candidate_id, "market"))
     try:
@@ -354,8 +369,9 @@ def test_panic_sends_telegram_after_exchange_actions_and_outside_flatten_lock(tm
         engage_panic(state, mon, inflight_wait_sec=1.0, sleep=sleep, clock=clock)
         assert events, "алерт panic не ушел"
         assert not any(locked for locked, _, _ in events)  # Telegram — не под замком flatten
-        assert events[0][1] == 2  # сделка журнала и вход in-flight закрыты ДО первого алерта
-        assert any("не записан за окно ожидания" in text for _, _, text in events)
+        assert events[0][1] == 1  # сделка журнала закрыта ДО первого алерта
+        # вход in-flight проверен по clientOrderId (ревью H3, 3-й круг): не найден — неясен, алерт
+        assert any("неясным исходом" in text for _, _, text in events)
     finally:
         release.set()
         worker.join(5)

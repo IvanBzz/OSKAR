@@ -129,6 +129,7 @@ def test_telegram_panic_reaches_exchange_and_replies(tmp_path):
     add_trade(j, "pend", status="pending", symbol="A/USDT:USDT")
     add_trade(j, "open1", symbol="B/USDT:USDT")
     ex.by_cid["OSKAR-r1-pend"] = OrderState("e-pend", "open")
+    ex.orders["e-pend"] = OrderState("e-pend", "canceled")  # после отмены: panic перепроверяет по id
     ex.pos = [PositionInfo("B/USDT:USDT", "long", 2.0, 100.0, -1.0)]
     fake = FakeBotApi([message_update("/panic")])
     poller = ButtonPoller(

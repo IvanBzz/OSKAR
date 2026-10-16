@@ -34,8 +34,8 @@ closePosition-ордера SL/TP, пока позиции нет — 109420 «po
   цена бралась до долгой подготовки (плечо с сетевыми повторами);
 - после филла маркета R:R и стоп считаются по цене филла: вне капа с люфтом INV-004 — авария
   fill_out_of_caps (позиция с SL/TP не закрывается, алерт, предохранитель считает);
-- реестр in-flight знает символ и сторону входа: panic ждет его опустения, а не дождавшись —
-  снимает по бирже (core/emergency.py);
+- реестр in-flight знает символ, сторону и решение входа: panic ждет его опустения, а не
+  дождавшись — проверяет вход по clientOrderId (core/emergency.py; по symbol/side не закрывает);
 - equity для входа — не старше EQUITY_MAX_AGE_SEC, иначе свежий запрос к бирже
   (equity_guarded); по нему же защелка просадки — до исполнения.
 
@@ -107,8 +107,10 @@ KIND_ERROR = "error"  # исключение/неожиданное
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()  # база clientOrderId (OSKAR-<run>-<hash>), нижний регистр
 # Символ и сторона входа «в процессе» (после чтения плана): panic, не дождавшийся записи,
-# закрывает позицию по ним (ревью Codex R1, 2026-10-16).
+# проверяет вход по clientOrderId на этой паре (ревью Codex R1; H3, 3-й круг — без закрытия по паре).
 _INFLIGHT_TARGETS: dict[str, tuple[str, str]] = {}
+# Решение входа «в процессе»: алерт panic и уровни плана для снятия его защиты (ревью H3, 3-й круг)
+_INFLIGHT_DECISIONS: dict[str, str] = {}
 # Прошли допуск к отправке (_admit под ENTRY_GATE_LOCK): вход ушел или уйдет на биржу.
 # Остальные после взвода panic отклонит допуск — panic ждет только эти (ревью Codex H2/I).
 _ADMITTED: set[str] = set()
@@ -134,6 +136,12 @@ def admitted_entries() -> dict[str, tuple[str, str] | None]:
     """{база cid: (symbol, side)} входов «в процессе», допущенных к отправке."""
     with _INFLIGHT_LOCK:
         return {key: _INFLIGHT_TARGETS.get(key) for key in _INFLIGHT if key in _ADMITTED}
+
+
+def inflight_decision(key: str) -> str | None:
+    """decision_id входа «в процессе» по базе cid; None — не в реестре."""
+    with _INFLIGHT_LOCK:
+        return _INFLIGHT_DECISIONS.get(key)
 
 
 def reserved_entries() -> dict[str, tuple[str, str, str]]:
@@ -428,6 +436,7 @@ class ExecutionService:
         key = cid_base(make_client_order_id(self._run_id, decision_id))
         with _INFLIGHT_LOCK:
             _INFLIGHT.add(key)
+            _INFLIGHT_DECISIONS[key] = decision_id
         try:
             return self._execute(decision_id, mode)
         finally:
@@ -437,6 +446,7 @@ class ExecutionService:
             with _INFLIGHT_LOCK:
                 _INFLIGHT.discard(key)
                 _INFLIGHT_TARGETS.pop(key, None)
+                _INFLIGHT_DECISIONS.pop(key, None)
                 _ADMITTED.discard(key)
 
     def _execute(self, decision_id: str, mode: str) -> ExecutionOutcome:

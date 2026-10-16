@@ -7,6 +7,10 @@ P2-1 — после panic-reset SAFE MODE из-за чужих ордеров в
 P2-2 — старт восстанавливал учет без подтверждения биржи: брал под учет позицию второй машины
        с тем же сетапом (или ручную);
 P2-3 — свой SL/TP-сирота сохранялся по совпадению символа без учета стороны и без алерта.
+
+3-й круг (упрощение): слежение по symbol/side и восстановление учета на старте убраны — тесты P1
+проверяют исход входа по id и список неясных входов, P2-2 — что учет не восстанавливается никогда
+(подробнее — test_review_h3_conservative).
 """
 
 import threading
@@ -14,8 +18,7 @@ from datetime import timedelta
 
 import pytest
 
-from oskar.core import executor as executor_mod
-from oskar.core.emergency import engage_panic, reset_panic
+from oskar.core.emergency import engage_panic, reset_panic, safe_mode_engaged, unclear_entries
 from oskar.core.executor import KIND_ENTRY_UNKNOWN, make_client_order_id
 from oskar.core.position_monitor import UNKNOWN_ENTRY_TTL_SEC, PositionMonitor
 from oskar.core.run_registry import register_run
@@ -34,11 +37,12 @@ from tests.unit.test_second_machine import FOREIGN
 # ============================== P1: panic и вход, завершившийся внутри окна со статусом pending
 
 
-def test_panic_keeps_and_chases_entry_that_timed_out_inside_window(tmp_path):
+def test_panic_keeps_entry_that_timed_out_inside_window_and_checks_it_by_id(tmp_path):
     """Сценарий ревью: place_entry падает по таймауту (ccxt 10 с < окна 15 с), по clientOrderId
     ордера нет — вход записан pending без id биржи, исполнитель вышел из реестра внутри окна
     (left пуст). Финальный проход ордер не находит — раньше ставил cancelled, а биржа принимала
-    вход позже: позиция жила мимо журнала, закрывать ее было некому."""
+    вход позже: позиция жила мимо журнала. Теперь — список неясных; биржа показала исполнение —
+    закрыта ровно его qty (3-й круг: по id, не по symbol/side)."""
     p = h_plan()
     svc, j, ex, state = service(tmp_path, p, price=[100.0])
     now = [T0]
@@ -65,9 +69,9 @@ def test_panic_keeps_and_chases_entry_that_timed_out_inside_window(tmp_path):
     assert box["out"].kind == KIND_ENTRY_UNKNOWN
     assert "inflight_unfinished" not in out["exchange"]  # left пуст
     assert trade(j, p.candidate_id)["status"] == "pending"  # исход неизвестен — не «снят»
-    assert out["exchange"]["watching"] == [p.candidate_id]
+    assert out["exchange"]["unclear"] == [p.candidate_id]
     cid = make_client_order_id("r1", p.candidate_id)
-    assert mon.chasing() == [cid_base(cid)]
+    assert list(unclear_entries(j)) == [cid_base(cid)]
     # биржа приняла вход уже после panic
     ex.by_cid[cid] = OrderState("e9", "filled", 3.0, 100.2, 0.05)
     ex.pos = [PositionInfo(p.symbol, "long", 3.0, 100.2, 0.0)]
@@ -76,7 +80,8 @@ def test_panic_keeps_and_chases_entry_that_timed_out_inside_window(tmp_path):
         mon.tick_pending()
     row = trade(j, p.candidate_id)
     assert (row["status"], row["close_reason"], row["qty"]) == ("closed", "panic", 3.0)
-    assert ex.pos == [] and ("close", p.symbol, "long") in ex.calls
+    assert ex.pos == [] and ex.closed_qty == [(p.symbol, "long", 3.0)]
+    assert unclear_entries(j) == {}
 
 
 def test_panic_closes_filled_pending_entry_and_its_protection(tmp_path):
@@ -108,18 +113,22 @@ def test_panic_partial_fill_cancels_rest_and_closes_position(tmp_path):
 
 
 @pytest.mark.parametrize("lookup", ["missing", "hiccup"])
-def test_panic_unknown_pending_entry_is_watched_not_cancelled_silently(tmp_path, lookup):
+def test_panic_unknown_pending_entry_is_kept_unclear_not_cancelled_silently(tmp_path, lookup):
     """Ордер не найден (таймаут на входе) или биржа не ответила — запись остается pending, вход —
-    на слежении по cid и symbol/side; снимается с учета, когда исход стал известен: ордера нет
-    за TTL входа с неизвестным исходом или он снят биржей."""
+    в списке неясных (SAFE MODE на обоих носителях, один алерт), позиция пары не трогается;
+    снимается с учета, когда исход стал известен по id: ордера нет за TTL входа с неизвестным
+    исходом или он снят биржей."""
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     add_trade(j, "lost", status="pending")
+    manual = PositionInfo(SYM, "long", 5.0, 100.0, 0.0)  # ручная позиция той же пары
+    ex.pos = [manual]
     if lookup == "hiccup":
         ex.fail_symbols = {SYM}
     out = engage_panic(state, mon)
     assert trade(j, "lost")["status"] == "pending"
-    assert out["exchange"]["watching"] == ["lost"] and out["exchange"]["cancelled"] == 0
-    assert mon.chasing() == ["oskar-r1-lost"]
+    assert out["exchange"]["unclear"] == ["lost"] and out["exchange"]["cancelled"] == 0
+    assert list(unclear_entries(j)) == ["oskar-r1-lost"]
+    assert "неясным исходом" in safe_mode_engaged(j)["reason"]
     clock[0] += timedelta(seconds=5)
     mon.tick_pending()
     assert trade(j, "lost")["status"] == "pending"
@@ -129,42 +138,12 @@ def test_panic_unknown_pending_entry_is_watched_not_cancelled_silently(tmp_path,
         ex.fail_symbols = set()
         ex.by_cid["OSKAR-r1-lost"] = OrderState("e1", "canceled")
     mon.tick_pending()
-    assert trade(j, "lost")["status"] == "cancelled" and ex.closed == []
+    assert trade(j, "lost")["status"] == "cancelled" and unclear_entries(j) == {}
     for _ in range(3):
         clock[0] += timedelta(minutes=2)
         mon.tick_pending()
-    assert mon.chasing() == []
-
-
-def test_panic_chases_every_entry_admitted_at_engage_even_if_done_inside_window(tmp_path):
-    """Вход, допущенный к отправке до panic, завершился внутри окна (реестр пуст, left пуст), а
-    финальный проход позицию не застал (биржа еще не показала ее). Слежение — за всеми входами,
-    допущенными на момент взвода, а не только за незавершенными к концу окна."""
-    mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
-    key = cid_base(make_client_order_id("r9", "SOLUSDTUSDT-7-long"))
-    with executor_mod._INFLIGHT_LOCK:
-        executor_mod._INFLIGHT.add(key)
-        executor_mod._INFLIGHT_TARGETS[key] = (SYM, "long")
-        executor_mod._ADMITTED.add(key)
-    t = [0.0]
-
-    def sleep(s):  # исполнитель вышел из реестра внутри окна
-        with executor_mod._INFLIGHT_LOCK:
-            executor_mod._INFLIGHT.discard(key)
-            executor_mod._INFLIGHT_TARGETS.pop(key, None)
-            executor_mod._ADMITTED.discard(key)
-        t[0] += s
-
-    try:
-        out = engage_panic(state, mon, inflight_wait_sec=15.0, sleep=sleep, clock=lambda: t[0])
-    finally:
-        sleep(0)
-    assert "inflight_unfinished" not in out["exchange"]
-    assert mon.chasing() == [key]
-    ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 0.0)]  # биржа приняла вход позже
-    clock[0] += timedelta(seconds=5)
-    mon.tick_pending()
-    assert ex.closed == [(SYM, "long")] and ex.pos == []
+    assert ex.closed == [] and ex.pos == [manual]
+    assert sum("неясным исходом" in n for n in notes) == 1
 
 
 # ======================== P2-1: SAFE MODE после reset при чужих ордерах — на следующем тике
@@ -224,9 +203,10 @@ def test_startup_does_not_restore_position_with_same_setup_orders_of_unknown_run
     assert state.safe_mode and any("чужого запуска" in n for n in notes)
 
 
-def test_startup_restores_lost_trade_only_with_exchange_confirmation(tmp_path):
-    """SL/TP прикреплены ко входу (без cid) — своей защиты по cid не видно. Учет восстанавливается,
-    только если вход найден по clientOrderId известного запуска, исполнен и qty совпадает."""
+def test_startup_never_restores_lost_trade_even_with_exchange_confirmation(tmp_path):
+    """SL/TP прикреплены ко входу (без cid). Учет не восстанавливается ни без подтверждения, ни при
+    чужом qty, ни с исполненным входом по clientOrderId (3-й круг: восстановление убрано) —
+    SAFE MODE и алерт, прикрепленная защита на месте."""
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     register_run(j, "r1")
     p = h_plan()
@@ -242,9 +222,7 @@ def test_startup_restores_lost_trade_only_with_exchange_confirmation(tmp_path):
     assert trades_count(j) == 0
     ex.by_cid[cid] = OrderState("e1", "filled", 3.0, 100.1)
     mon.startup_check()
-    row = trade(j, p.candidate_id)
-    assert row is not None and row["client_order_id"] == cid and row["status"] == "open"
-    assert (row["sl_order_id"], row["tp_order_id"]) == ("a1", "a2") and ex.cancelled == []
+    assert trades_count(j) == 0 and ex.cancelled == [] and ex.closed == []
 
 
 # ========================== P2-3: свой SL/TP-сирота — по паре symbol/side и с алертом

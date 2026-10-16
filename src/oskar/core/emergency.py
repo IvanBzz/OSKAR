@@ -13,8 +13,8 @@
 4. входы «в процессе» (2026-10-16, ревью Codex R1): исполнитель мог пройти последнюю
    проверку флагов до panic и уже слать вход — записи в журнале еще нет, flatten ее не
    видит. Ждем до PANIC_INFLIGHT_WAIT_SEC, пока реестр in-flight опустеет, и делаем
-   финальный проход по только что записанным сделкам; не опустел — алерт и снятие по
-   бирже по clientOrderId этих входов.
+   финальный проход по только что записанным сделкам; не опустел — проверка этих входов
+   по clientOrderId (ниже, 3-й круг H3).
 
 SAFE MODE (блок H, 2026-10-16) тоже переживает рестарт: супервизор блока G перезапускает
 демон, и флаг только в памяти («позиция без SL», расхождение с биржей) снимался бы молча.
@@ -34,15 +34,16 @@ SAFE MODE (блок H, 2026-10-16) тоже переживает рестарт:
   на сетевом плече);
 - финальный проход flatten — всегда: вход мог записаться и выйти из реестра между чтением
   списка первым проходом и ожиданием (раньше проход шел, только если ждали);
-- входы, не завершенные за окно, монитор преследует после panic (chase_after_panic), пока
-  отсутствие экспозиции не подтверждено: биржа могла принять запрос уже после окна;
 - Telegram — после биржевых действий и вне _FLATTEN_LOCK, одним сообщением: недоступный
   Telegram (2 таймаута по 15 с на сообщение) держал замок и откладывал закрытие позиций.
 
-Ревью Codex H2/I, 2-й круг (2026-10-16): слежение — за ВСЕМИ входами, допущенными к отправке
-на момент взвода (снимок под ENTRY_GATE_LOCK вместе с флагами), а не только за незавершенными
-к концу окна: вход, завершившийся внутри окна со статусом pending (таймаут ccxt 10 с < окна
-15 с), выходит из реестра, и биржа может принять его позже.
+Ревью Codex H3, 3-й круг (2026-10-16) — упрощение: по symbol/side panic ничего не закрывает
+«на всякий случай» (слежение chase закрывало ручную позицию той же пары и терялось при
+рестарте). Вход, не завершенный за окно, и pending без id биржи проверяются по clientOrderId /
+id ордера: исполнение доказано — закрыть ровно его qty и снять его защиту по id; не доказано —
+запись в список неясных входов (meta PANIC_UNCLEAR_KEY: переживает рестарт), SAFE MODE на обоих
+носителях и один алерт. Монитор проверяет неясные входы по id на каждом тике (core/position_monitor).
+panic-reset снимает список вместе с флагами: решение оператора.
 """
 
 import contextlib
@@ -56,11 +57,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from oskar.core.state import RuntimeState
-from oskar.journal.db import transaction
+from oskar.journal.db import WRITE_LOCK, transaction
 
 logger = logging.getLogger("oskar.emergency")
 
 PANIC_META_KEY = "panic_engaged"
+# Входы с неясным исходом при panic: {база cid: запись} JSON — переживают рестарт (ревью H3, 3-й круг)
+PANIC_UNCLEAR_KEY = "panic_unclear_entries"
 SAFE_MODE_META_KEY = "safe_mode_engaged"
 SAFE_MODE_FLAG_NAME = "safe_mode.flag"  # в data/ демона: второй носитель SAFE MODE
 PANIC_INFLIGHT_WAIT_SEC = 15.0  # panic ждет входы «в процессе» до финального прохода
@@ -96,7 +99,7 @@ def _merge_passes(*parts: dict) -> dict:
     if parts and all("error" in part for part in parts):
         return dict(parts[0])  # биржа недоступна целиком — ответ прежней формы {"error": ...}
     out = {"cancelled": 0, "closed": 0, "errors": []}
-    watching: set[str] = set()  # pending-входы с неясным исходом: запись не снята, монитор следит
+    unclear: set[str] = set()  # входы с неясным исходом: ничего не закрыто, проверка по id
     for part in parts:
         if "error" in part:
             out["errors"].append(str(part["error"]))
@@ -104,9 +107,9 @@ def _merge_passes(*parts: dict) -> dict:
         out["cancelled"] += int(part.get("cancelled", 0))
         out["closed"] += int(part.get("closed", 0))
         out["errors"].extend(part.get("errors") or [])
-        watching.update(part.get("watching") or [])
-    if watching:
-        out["watching"] = sorted(watching)
+        unclear.update(part.get("unclear") or [])
+    if unclear:
+        out["unclear"] = sorted(unclear)
     return out
 
 
@@ -129,10 +132,10 @@ def _panic_summary(exchange: dict, left: dict) -> str:
     text = (f"🚨 PANIC: снято входов {exchange.get('cancelled', 0)}, закрыто позиций "
             f"{exchange.get('closed', 0)}, ошибок {len(exchange.get('errors') or [])}")
     if left:
-        text += f"; входов в процессе после окна: {len(left)} — слежу до подтвержденного закрытия"
-    if exchange.get("watching"):
-        text += (f"; входов с неясным исходом: {len(exchange['watching'])} — запись не снята, "
-                 "слежу по бирже")
+        text += f"; входов в процессе после окна: {len(left)} — проверены по clientOrderId"
+    if exchange.get("unclear"):
+        text += (f"; входов с неясным исходом: {len(exchange['unclear'])} — по symbol/side ничего "
+                 "не закрыто, проверь позиции вручную (SAFE MODE)")
     return text
 
 
@@ -140,13 +143,8 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
                  sleep=time.sleep, clock=time.monotonic) -> dict:
     """Ст. 6 п. 1: немедленно и безусловно. Ответ — тот же JSON, что отдавал `/panic`:
     exchange=None — монитора нет (нет ключей биржи), биржа не тронута."""
-    from oskar.core.executor import admitted_entries  # executor импортирует этот модуль
-
     with ENTRY_GATE_LOCK:  # флаги ПЕРВЫМИ; замок — только против допуска входа, без сети
         state.panic()
-        # Снимок допущенных входов — в той же секции: позже допуска нет, а вход, завершившийся
-        # внутри окна, выходит из реестра (ревью Codex H2/I, 2-й круг, 2026-10-16). Только память.
-        admitted = admitted_entries()
     result = {"panic": True, "safe_mode": True, "paused": True, "exchange": None}
     try:  # флаг переживает рестарт — восстановление только явной командой
         with transaction(state.journal):
@@ -165,7 +163,10 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
     # Алерты монитора этого потока — в буфер: Telegram после биржи и вне замка (ревью Codex H2/I)
     defer = getattr(monitor, "deferred_notes", None)
     with _FLATTEN_LOCK, (defer() if defer is not None else contextlib.nullcontext([])) as notes:
-        first = _flatten_pass(monitor.panic_flatten)  # отмена ордеров + закрытие позиций
+        begin = getattr(monitor, "panic_begin", None)
+        if begin is not None:  # закрытие сделки — одна попытка за panic (неясный сбой не повторяем)
+            begin()
+        first = _flatten_pass(monitor.panic_flatten)  # отмена входов + закрытие позиций OSKAR
         # Вход, допущенный к отправке до panic: ждем его записи (ревью Codex R1, 2026-10-16)
         left = _await_inflight(inflight_wait_sec, sleep, clock)
         # Финальный проход — ВСЕГДА (ревью Codex H2/I, 2026-10-16): вход мог записаться и выйти
@@ -174,14 +175,9 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
         if left:
             logger.critical("panic: %d entr(ies) still in flight after %.0fs: %s",
                             len(left), inflight_wait_sec, sorted(left))
-            parts.append(_flatten_pass(lambda: monitor.panic_flatten_inflight(left)))
-        # Биржа может принять запрос и после окна — монитор преследует до подтверждения. Все
-        # допущенные на момент взвода, а не только left (ревью Codex H2/I, 2-й круг, 2026-10-16):
-        # финальный проход мог не застать позицию (биржа еще не показала) или найти pending без id.
-        watch = {**admitted, **left}
-        chase = getattr(monitor, "chase_after_panic", None)
-        if watch and chase is not None:
-            chase(watch)
+            # По clientOrderId, не по symbol/side (ревью H3, 3-й круг): исполнение доказано —
+            # закрыть его qty; нет — список неясных входов, SAFE MODE, алерт
+            parts.append(_flatten_pass(lambda: monitor.panic_resolve_inflight(left)))
         result["exchange"] = _merge_passes(*parts)
         if left:
             result["exchange"]["inflight_unfinished"] = sorted(left)
@@ -198,10 +194,17 @@ def reset_panic(state: RuntimeState) -> dict:
     Сначала журнал, потом память: не записалось — panic остается взведенным
     целиком (раньше флаги снимались до записи, и сбой БД давал «panic снят до
     рестарта, а после рестарта снова взведен»). Маркер-файл SAFE MODE удаляется до
-    снятия флагов в памяти: не удалился — исключение, флаги стоят."""
-    with _SAFE_MODE_LOCK:
+    снятия флагов в памяти: не удалился — исключение, флаги стоят.
+
+    Список неясных входов panic снимается здесь же (решение оператора; ревью H3, 3-й круг) и
+    возвращается в ответе (unclear_dropped). WRITE_LOCK — на журнал И память: монитор добавляет
+    в список только при взведенном panic, проверяя флаг под тем же замком, — снятый список не
+    воскреснет."""
+    with _SAFE_MODE_LOCK, WRITE_LOCK:
         with transaction(state.journal):
+            dropped = sorted(unclear_entries(state.journal))
             state.journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_META_KEY,))
+            state.journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_UNCLEAR_KEY,))
             # SAFE MODE снимается здесь же и тоже сначала в журнале (блок H, 2026-10-16)
             state.journal.execute("DELETE FROM meta WHERE key = ?", (SAFE_MODE_META_KEY,))
         if state.safe_mode_flag is not None:
@@ -210,13 +213,79 @@ def reset_panic(state: RuntimeState) -> dict:
         state.safe_mode = False
         state.safe_mode_unsaved = False
         state.safe_mode_record = None
-    return {"panic": False, "safe_mode": False, "paused": state.paused}
+    out = {"panic": False, "safe_mode": False, "paused": state.paused}
+    if dropped:
+        logger.warning("panic reset: unclear entries dropped by operator: %s", dropped)
+        out["unclear_dropped"] = dropped
+    return out
 
 
 def panic_engaged(journal) -> str | None:
     """Момент последнего panic, если он не был сброшен оператором (переживает рестарт)."""
     row = journal.execute("SELECT value FROM meta WHERE key = ?", (PANIC_META_KEY,)).fetchone()
     return row[0] if row else None
+
+
+# ------------------------------------------------- panic: входы с неясным исходом
+
+
+def unclear_entries(journal) -> dict[str, dict]:
+    """Входы panic с неясным исходом: {база cid: {"cid", "decision_id", "symbol", "side", "sl",
+    "tp", "since", "why", "state"}}. state: unclear — исход не доказан, проверка по id; closed —
+    исполнение доказано по clientOrderId и его qty закрыта, ждем записи исполнителя (учет без
+    второго закрытия); manual — закрыть не удалось, только напоминания. Битая запись — пусто + лог."""
+    row = journal.execute("SELECT value FROM meta WHERE key = ?", (PANIC_UNCLEAR_KEY,)).fetchone()
+    if row is None:
+        return {}
+    try:
+        data = json.loads(row[0])
+    except ValueError as e:
+        logger.error("panic unclear entries unreadable (%s): %r", e, row[0][:200])
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_unclear(journal, entries: dict) -> None:
+    if entries:
+        journal.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+                        (PANIC_UNCLEAR_KEY, json.dumps(entries, ensure_ascii=False, sort_keys=True)))
+    else:
+        journal.execute("DELETE FROM meta WHERE key = ?", (PANIC_UNCLEAR_KEY,))
+
+
+def add_unclear_entry(journal, key: str, info: dict, state: RuntimeState | None = None) -> bool:
+    """Записать вход в список неясных. True — новая запись (вызывающий шлет алерт один раз).
+    panic уже снят оператором (state.panic_at is None) — не пишем: проверка под WRITE_LOCK, тем же,
+    что держит reset_panic на журнал и память."""
+    with transaction(journal):
+        if state is not None and state.panic_at is None:
+            return False
+        entries = unclear_entries(journal)
+        if key in entries:
+            return False
+        entries[key] = info
+        _write_unclear(journal, entries)
+    return True
+
+
+def update_unclear_entry(journal, key: str, **fields) -> None:
+    """Поля существующей записи; записи нет (снята reset'ом) — ничего."""
+    with transaction(journal):
+        entries = unclear_entries(journal)
+        if key not in entries:
+            return
+        entries[key].update(fields)
+        _write_unclear(journal, entries)
+
+
+def drop_unclear_entry(journal, key: str) -> bool:
+    """Исход доказан — запись снимается. True — была."""
+    with transaction(journal):
+        entries = unclear_entries(journal)
+        if entries.pop(key, None) is None:
+            return False
+        _write_unclear(journal, entries)
+    return True
 
 
 # --------------------------------------------------------------- SAFE MODE
@@ -284,6 +353,23 @@ def engage_safe_mode(state: RuntimeState, reason: str) -> bool:
             return False
         state.safe_mode = True
     with _SAFE_MODE_LOCK:
+        state.safe_mode_record = _safe_mode_record(reason)
+        _persist_safe_mode(state)
+    return True
+
+
+def hold_safe_mode(state: RuntimeState, reason: str) -> bool:
+    """SAFE MODE на обоих носителях, даже если флаг в памяти уже стоит: panic ставит его в памяти
+    без записи (ревью H3, 3-й круг — неясный вход при panic: защита с причиной должна пережить и
+    рестарт, и сбой записи panic). Уже записан в meta — False, причину не перетираем."""
+    with ENTRY_GATE_LOCK:
+        state.safe_mode = True
+    with _SAFE_MODE_LOCK:
+        try:
+            if safe_mode_engaged(state.journal) is not None:
+                return False
+        except Exception as e:  # noqa: BLE001 - не прочитали: пишем (лишняя запись безвредна)
+            logger.warning("SAFE MODE record unreadable (%s) - writing", e)
         state.safe_mode_record = _safe_mode_record(reason)
         _persist_safe_mode(state)
     return True

@@ -21,6 +21,7 @@ from oskar.core.emergency import (
     restore_safe_mode,
     retry_safe_mode_persist,
     safe_mode_engaged,
+    unclear_entries,
 )
 from oskar.core.executor import (
     KIND_FILL_OUT_OF_CAPS,
@@ -153,9 +154,11 @@ def test_panic_without_inflight_still_makes_final_pass(tmp_path):
     assert calls == [1, 1] and out["exchange"] == {"cancelled": 0, "closed": 0, "errors": []}
 
 
-def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
-    """Вход так и не записан за окно: алерт и снятие по бирже по clientOrderId входа и его
-    символу/стороне. Чужие ордера (другой cid, ручные без cid) не трогаем."""
+def test_panic_checks_unfinished_inflight_entry_by_client_id(tmp_path):
+    """Вход так и не записан за окно: проверка по clientOrderId (ревью H3, 3-й круг — раньше
+    закрывалась позиция символа/стороны). Висящий вход снят по id; исполнения нет, а исполнитель
+    еще в процессе — исход неясен: позиция пары (она может быть ручной) НЕ закрывается, вход — в
+    списке неясных, алерт. Чужие ордера (другой cid, ручные без cid) не трогаем."""
     mon, j, ex, clock, notes, _, state = make_monitor(tmp_path)
     cid = executor_mod.make_client_order_id("r9", "SOLUSDTUSDT-7-long")
     key = cid_base(cid)
@@ -165,6 +168,8 @@ def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
         OpenOrderRef(SYM, "x1", "OSKAR-r9-0123456789ab", "entry"),
         OpenOrderRef(SYM, "m1", "", "sl"),
     ]
+    ex.by_cid[cid] = OrderState("e1", "open")
+    ex.orders["e1"] = OrderState("e1", "canceled")  # после отмены
     ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 0.0)]
     t = [0.0]
     with executor_mod._INFLIGHT_LOCK:  # вход прошел допуск к отправке (ревью Codex H2/I)
@@ -180,11 +185,11 @@ def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
             executor_mod._INFLIGHT_TARGETS.pop(key, None)
             executor_mod._ADMITTED.discard(key)
     assert t[0] >= 2.0  # ждали окно целиком
-    assert sorted(ex.cancelled) == ["e1", "s1"]
-    assert ex.closed == [(SYM, "long")]
+    assert ex.cancelled == ["e1"] and ex.closed == []
     assert out["exchange"]["inflight_unfinished"] == [key]
-    assert out["exchange"]["cancelled"] == 2 and out["exchange"]["closed"] == 1
-    assert any("не записан за окно ожидания" in n for n in notes)
+    assert out["exchange"]["unclear"] == [key] and out["exchange"]["closed"] == 0
+    assert list(unclear_entries(j)) == [key]
+    assert sum("неясным исходом" in n and "SOL/USDT:USDT long" in n for n in notes) == 1
 
 
 # ============================================ P1-2: R:R перед отправкой и по филлу
