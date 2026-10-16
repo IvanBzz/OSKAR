@@ -10,7 +10,10 @@
 
 Сводка: раз в сутки в ops.digest_time по ops.timezone (21:00 Europe/Moscow), текст —
 ops/digest.build_digest. Отметка «за этот день отправлено» в meta: рестарт в 21:00:30 не шлет
-вторую, а рестарт в 21:10 досылает пропущенную (окно DIGEST_GRACE).
+вторую, а рестарт в 21:10 досылает пропущенную (окно DIGEST_GRACE). Ревью Codex H2/I,
+2026-10-16: отметка ставится в памяти сразу после доставки — запись в meta упала (внешний
+write-lock SQLite), и следующий тик слал сводку снова, каждые 30 с всё окно; теперь
+повторяется только запись отметки.
 
 Поток один, тик раз в TICK_SEC — по образцу ShadowRunner/PositionMonitor (Event.wait, stop()).
 """
@@ -198,6 +201,8 @@ class OpsScheduler:
         self._now = now_fn
         start = started_at or now_fn()
         self._next_invariants = start + INVARIANTS_FIRST_DELAY
+        self._digest_sent_day: str | None = None  # доставлено (в памяти — до записи в meta)
+        self._digest_mark_unsaved = False  # отметка не записана в meta: повтор записи, не отправки
         self._stop = threading.Event()
 
     # ---------------------------------------------------------------- digest
@@ -212,6 +217,8 @@ class OpsScheduler:
         day, at = self._digest_slot(now)
         if now < at or now - at > DIGEST_GRACE:
             return False
+        if self._digest_sent_day == day:
+            return False  # доставлено этим процессом, даже если meta еще не записана
         return _meta_get(self._j, DIGEST_SENT_KEY) != day
 
     def send_digest(self, now: datetime) -> bool:
@@ -220,11 +227,25 @@ class OpsScheduler:
         res = self._notify(text) if self._notify is not None else None
         ok = res is not None and getattr(res, "ok", True) is not False
         if ok:
-            _meta_set(self._j, DIGEST_SENT_KEY, day)
+            # отметка в памяти — СРАЗУ: сбой записи в meta не повод слать сводку снова
+            self._digest_sent_day = day
+            self._digest_mark_unsaved = True
             logger.info("daily digest sent (%s)", day)
+            self._persist_digest_mark()
         else:
             logger.warning("daily digest NOT sent (%s) - retry next tick", day)
         return ok
+
+    def _persist_digest_mark(self) -> None:
+        """Отметка доставленной сводки -> meta (переживает рестарт). Сбой — повтор с тика."""
+        if not self._digest_mark_unsaved or self._digest_sent_day is None:
+            return
+        try:
+            _meta_set(self._j, DIGEST_SENT_KEY, self._digest_sent_day)
+        except Exception as e:  # noqa: BLE001 - сводка уже доставлена; повторим только запись
+            logger.error("digest mark not persisted (%s) - retry next tick, no resend", e)
+            return
+        self._digest_mark_unsaved = False
 
     # ------------------------------------------------------------------ tick
 
@@ -237,6 +258,7 @@ class OpsScheduler:
             except Exception as e:  # noqa: BLE001 - сбой проверки не роняет поток
                 logger.error("invariants check failed: %s", e)
         if self._digest_fn is not None and self._notify is not None:
+            self._persist_digest_mark()  # доставленная сводка без записанной отметки
             try:
                 if self.digest_due(now):
                     self.send_digest(now)

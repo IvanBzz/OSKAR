@@ -50,6 +50,8 @@ def test_engage_panic_sets_flags_before_persist_and_exchange(tmp_path):
 
     class Monitor:
         def panic_flatten(self):
+            if seen:  # финальный проход (всегда, ревью Codex H2/I): первый уже все снял
+                return {"cancelled": 0, "closed": 0, "errors": []}
             seen["flags"] = (state.safe_mode, state.paused, state.panic_at is not None)
             seen["persisted"] = panic_engaged(j) is not None
             return {"cancelled": 2, "closed": 1, "errors": []}

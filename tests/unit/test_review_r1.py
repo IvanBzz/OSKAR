@@ -139,7 +139,9 @@ def test_panic_waits_for_inflight_entry_and_closes_it_in_final_pass(tmp_path):
     assert executor_mod.inflight_entries() == {}
 
 
-def test_panic_without_inflight_makes_a_single_pass(tmp_path):
+def test_panic_without_inflight_still_makes_final_pass(tmp_path):
+    """Ревью Codex H2/I: финальный проход — всегда (вход мог записаться и выйти из реестра
+    между первым проходом и ожиданием; см. test_review_h2i)."""
     calls = []
 
     class Monitor:
@@ -148,7 +150,7 @@ def test_panic_without_inflight_makes_a_single_pass(tmp_path):
             return {"cancelled": 0, "closed": 0, "errors": []}
 
     out = engage_panic(RuntimeState(journal=connect(tmp_path / "j.db")), Monitor())
-    assert calls == [1] and out["exchange"] == {"cancelled": 0, "closed": 0, "errors": []}
+    assert calls == [1, 1] and out["exchange"] == {"cancelled": 0, "closed": 0, "errors": []}
 
 
 def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
@@ -165,9 +167,10 @@ def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
     ]
     ex.pos = [PositionInfo(SYM, "long", 2.0, 100.0, 0.0)]
     t = [0.0]
-    with executor_mod._INFLIGHT_LOCK:
+    with executor_mod._INFLIGHT_LOCK:  # вход прошел допуск к отправке (ревью Codex H2/I)
         executor_mod._INFLIGHT.add(key)
         executor_mod._INFLIGHT_TARGETS[key] = (SYM, "long")
+        executor_mod._ADMITTED.add(key)
     try:
         out = engage_panic(state, mon, inflight_wait_sec=2.0,
                            sleep=lambda s: t.__setitem__(0, t[0] + s), clock=lambda: t[0])
@@ -175,6 +178,7 @@ def test_panic_flattens_by_exchange_when_inflight_does_not_finish(tmp_path):
         with executor_mod._INFLIGHT_LOCK:
             executor_mod._INFLIGHT.discard(key)
             executor_mod._INFLIGHT_TARGETS.pop(key, None)
+            executor_mod._ADMITTED.discard(key)
     assert t[0] >= 2.0  # ждали окно целиком
     assert sorted(ex.cancelled) == ["e1", "s1"]
     assert ex.closed == [(SYM, "long")]

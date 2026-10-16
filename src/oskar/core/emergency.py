@@ -26,8 +26,21 @@ SAFE MODE (блок H, 2026-10-16) тоже переживает рестарт:
 носитель — маркер-файл data/safe_mode.flag (атомарно: tmp + rename); несохраненная meta
 повторяется на каждом тике монитора и runner'а; старт восстанавливает SAFE MODE по ЛЮБОМУ
 носителю; panic-reset снимает оба.
+
+Ревью Codex H2/I, 2026-10-16:
+- ENTRY_GATE_LOCK — короткая критическая секция без сети: взвод panic/SAFE MODE в памяти и
+  допуск входа к отправке (executor._admit) не перемежаются. Вход, не допущенный к моменту
+  взвода, на биржу уже не уйдет — panic ждет только допущенные (раньше ждал и вход, висящий
+  на сетевом плече);
+- финальный проход flatten — всегда: вход мог записаться и выйти из реестра между чтением
+  списка первым проходом и ожиданием (раньше проход шел, только если ждали);
+- входы, не завершенные за окно, монитор преследует после panic (chase_after_panic), пока
+  отсутствие экспозиции не подтверждено: биржа могла принять запрос уже после окна;
+- Telegram — после биржевых действий и вне _FLATTEN_LOCK, одним сообщением: недоступный
+  Telegram (2 таймаута по 15 с на сообщение) держал замок и откладывал закрытие позиций.
 """
 
+import contextlib
 import html
 import json
 import logging
@@ -55,6 +68,9 @@ _FLATTEN_LOCK = threading.Lock()
 # Запись носителей SAFE MODE: взвод, повтор с тиков и panic-reset не перемешиваются
 # (повтор после reset воскресил бы SAFE MODE в meta).
 _SAFE_MODE_LOCK = threading.Lock()
+# Взвод panic/SAFE MODE в памяти и допуск входа к отправке (ревью Codex H2/I, 2026-10-16).
+# Под ним — только память: ни сети, ни журнала; держится микросекунды.
+ENTRY_GATE_LOCK = threading.Lock()
 
 
 def _now_iso() -> str:
@@ -72,6 +88,8 @@ def _flatten_pass(fn) -> dict:
 
 
 def _merge_passes(*parts: dict) -> dict:
+    if parts and all("error" in part for part in parts):
+        return dict(parts[0])  # биржа недоступна целиком — ответ прежней формы {"error": ...}
     out = {"cancelled": 0, "closed": 0, "errors": []}
     for part in parts:
         if "error" in part:
@@ -83,27 +101,35 @@ def _merge_passes(*parts: dict) -> dict:
     return out
 
 
-def _await_inflight(wait_sec: float, sleep, clock) -> tuple[bool, dict]:
-    """(были ли входы «в процессе», оставшиеся по истечении окна {ключ cid: (symbol, side)})."""
-    from oskar.core.executor import inflight_entries  # executor импортирует этот модуль
+def _await_inflight(wait_sec: float, sleep, clock) -> dict:
+    """Входы, допущенные к отправке и не завершенные за окно: {ключ cid: (symbol, side)}.
+    Недопущенные не ждем: после взвода panic под ENTRY_GATE_LOCK их отклонит допуск."""
+    from oskar.core.executor import admitted_entries  # executor импортирует этот модуль
 
     deadline = clock() + wait_sec
-    seen = False
     while True:
-        left = inflight_entries()
-        if not left:
-            return seen, {}
-        seen = True
-        if clock() >= deadline:
-            return seen, left
+        left = admitted_entries()
+        if not left or clock() >= deadline:
+            return left
         sleep(PANIC_INFLIGHT_POLL_SEC)
+
+
+def _panic_summary(exchange: dict, left: dict) -> str:
+    if "error" in exchange:
+        return f"🚨 PANIC: биржа недоступна ({exchange['error']}) — проверь позиции вручную"
+    text = (f"🚨 PANIC: снято входов {exchange.get('cancelled', 0)}, закрыто позиций "
+            f"{exchange.get('closed', 0)}, ошибок {len(exchange.get('errors') or [])}")
+    if left:
+        text += f"; входов в процессе после окна: {len(left)} — слежу до подтвержденного закрытия"
+    return text
 
 
 def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float = PANIC_INFLIGHT_WAIT_SEC,
                  sleep=time.sleep, clock=time.monotonic) -> dict:
     """Ст. 6 п. 1: немедленно и безусловно. Ответ — тот же JSON, что отдавал `/panic`:
     exchange=None — монитора нет (нет ключей биржи), биржа не тронута."""
-    state.panic()  # флаги ПЕРВЫМИ, ничто не смеет задержать
+    with ENTRY_GATE_LOCK:  # флаги ПЕРВЫМИ; замок — только против допуска входа, без сети
+        state.panic()
     result = {"panic": True, "safe_mode": True, "paused": True, "exchange": None}
     try:  # флаг переживает рестарт — восстановление только явной командой
         with transaction(state.journal):
@@ -117,23 +143,31 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
         with _SAFE_MODE_LOCK:
             state.safe_mode_record = _safe_mode_record(f"panic не записан в журнал: {e}")
             _persist_safe_mode(state)
-    if monitor is not None:
-        with _FLATTEN_LOCK:
-            first = _flatten_pass(monitor.panic_flatten)  # отмена ордеров + закрытие позиций
-            # Вход «в процессе» мог пройти последнюю проверку флагов до panic: ждем его
-            # записи и закрываем финальным проходом (ревью Codex R1, 2026-10-16).
-            waited, left = _await_inflight(inflight_wait_sec, sleep, clock)
-            if not waited:
-                result["exchange"] = first
-                return result
-            parts = [first, _flatten_pass(monitor.panic_flatten)]
-            if left:
-                logger.critical("panic: %d entr(ies) still in flight after %.0fs: %s",
-                                len(left), inflight_wait_sec, sorted(left))
-                parts.append(_flatten_pass(lambda: monitor.panic_flatten_inflight(left)))
-            result["exchange"] = _merge_passes(*parts)
-            if left:
-                result["exchange"]["inflight_unfinished"] = sorted(left)
+    if monitor is None:
+        return result
+    # Алерты монитора этого потока — в буфер: Telegram после биржи и вне замка (ревью Codex H2/I)
+    defer = getattr(monitor, "deferred_notes", None)
+    with _FLATTEN_LOCK, (defer() if defer is not None else contextlib.nullcontext([])) as notes:
+        first = _flatten_pass(monitor.panic_flatten)  # отмена ордеров + закрытие позиций
+        # Вход, допущенный к отправке до panic: ждем его записи (ревью Codex R1, 2026-10-16)
+        left = _await_inflight(inflight_wait_sec, sleep, clock)
+        # Финальный проход — ВСЕГДА (ревью Codex H2/I, 2026-10-16): вход мог записаться и выйти
+        # из реестра между чтением списка первым проходом и ожиданием — реестр уже пуст.
+        parts = [first, _flatten_pass(monitor.panic_flatten)]
+        if left:
+            logger.critical("panic: %d entr(ies) still in flight after %.0fs: %s",
+                            len(left), inflight_wait_sec, sorted(left))
+            parts.append(_flatten_pass(lambda: monitor.panic_flatten_inflight(left)))
+            # биржа может принять запрос и после окна — монитор преследует до подтверждения
+            chase = getattr(monitor, "chase_after_panic", None)
+            if chase is not None:
+                chase(left)
+        result["exchange"] = _merge_passes(*parts)
+        if left:
+            result["exchange"]["inflight_unfinished"] = sorted(left)
+    send = getattr(monitor, "send_notes", None)
+    if send is not None:  # одним сообщением; сбой канала не роняет panic
+        send([*notes, _panic_summary(result["exchange"], left)])
     return result
 
 
@@ -225,9 +259,10 @@ def engage_safe_mode(state: RuntimeState, reason: str) -> bool:
     """Взвести SAFE MODE: флаг в памяти ПЕРВЫМ, затем маркер-файл и запись в meta с причиной
     (переживают рестарт). meta не записалась — признак state.safe_mode_unsaved, повтор с тиков
     (retry_safe_mode_persist). True — взведен этим вызовом (алерт шлет вызывающий, один раз)."""
-    if state.safe_mode:
-        return False
-    state.safe_mode = True
+    with ENTRY_GATE_LOCK:  # допуск входа и взвод не перемежаются (ревью Codex H2/I)
+        if state.safe_mode:
+            return False
+        state.safe_mode = True
     with _SAFE_MODE_LOCK:
         state.safe_mode_record = _safe_mode_record(reason)
         _persist_safe_mode(state)

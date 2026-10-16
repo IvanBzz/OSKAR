@@ -33,22 +33,37 @@ SAFE MODE пишется в meta (переживает рестарт, core/emer
 экранированием под parse_mode=HTML и ошибками биржи через short_error (без подписанных
 URL): «&» или «<» в тексте не должны молча глушить алерт «БЕЗ SL».
 
+Ревью Codex H2/I, 2026-10-16:
+- старт сверяет ПОЗИЦИИ первыми: позиция без сделки при approved-решении без сделки по тому
+  же symbol/side (вход упал до записи) — учет восстанавливается из плана, защита — усыновить
+  или поставить; иначе SAFE MODE, ничего не закрываем. Свой SL/TP-сирота снимается, только
+  если на его символе подтверждено отсутствие позиции без сделки (раньше старт снимал
+  единственный SL потерянной сделки до сверки позиций);
+- чужие ордера/позиции: SAFE MODE взводится на КАЖДОМ скане, пока они есть (дедуп — только
+  алерта): panic-reset при оставшихся ордерах второй машины снимал защиту навсегда;
+- входы, не завершенные за окно ожидания panic, преследуются на каждом тике (5 с), пока
+  отсутствие экспозиции не подтверждено (_panic_chase);
+- алерты panic копятся в буфере потока (deferred_notes) и уходят после биржевых действий,
+  вне замка flatten.
+
 Все решения — по состоянию ордеров НА БИРЖЕ, не по ценам свечей. Исключение по
 одной сделке не валит проход по остальным. realized_pnl — брутто по ценам
 исполнения минус комиссии, если биржа их отдала (иначе брутто).
 """
 
+import contextlib
 import html
 import logging
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
-from oskar.core.approvals import mark_decision
+from oskar.contracts.schemas import ExecutionPlan
+from oskar.core.approvals import default_entry_type, mark_decision
 from oskar.core.emergency import engage_safe_mode
-from oskar.core.executor import short_error
+from oskar.core.executor import make_client_order_id, short_error
 from oskar.core.run_registry import cid_run_id, run_known
 from oskar.data.client import exchange_error_code
 from oskar.execution.base import (
@@ -72,6 +87,13 @@ UNKNOWN_ENTRY_TTL_SEC = 180  # вход после таймаута не най�
 PROTECT_RETRIES = 3  # 109420 сразу после исполнения: позиция еще не видна бирже
 POSITION_MISSING_CODE = "109420"
 ORPHAN_SCAN_SEC = 600  # поиск ордеров OSKAR без сделки в журнале — при старте и раз в 10 мин
+# Преследование входов, не завершенных за окно panic (ревью Codex H2/I, 2026-10-16): снято,
+# когда исполнитель завершен и CONFIRM_TICKS проходов подряд нет ни сделки, ни ордеров, ни
+# позиции — и не раньше TTL входа с неизвестным исходом (биржа могла принять его позже).
+PANIC_CHASE_MIN_SEC = UNKNOWN_ENTRY_TTL_SEC
+# Потерянная сделка восстанавливается по approved-решению не старше этого (вход упал до записи)
+LOST_TRADE_MAX_AGE = timedelta(hours=24)
+NOTES_CHUNK_CHARS = 3500  # склейка алертов panic: запас до лимита Telegram 4096 (после экранирования)
 
 
 @dataclass
@@ -153,6 +175,10 @@ class PositionMonitor:
         self._orphan_scan_at: datetime | None = None
         self._known_runs: set[str] = set()  # run_id, подтвержденные журналом (свои сироты)
         self._reported_foreign: set[str] = set()  # "<orders|positions>:<объект>" — алерт уже был
+        # входы, не завершенные за окно panic: {база cid: {"target", "done_at", "clean"}}
+        self._chase: dict[str, dict] = {}
+        self._chase_lock = threading.Lock()
+        self._defer = threading.local()  # буфер алертов потока (panic: Telegram после биржи)
         self.last_report: dict = {}
         self.ticks = 0
         self._stop = threading.Event()
@@ -164,6 +190,7 @@ class PositionMonitor:
 
         retry_safe_mode_persist(self._state)  # SAFE MODE не записан в meta — повтор (ревью Codex R1)
         rep = MonitorReport()
+        self._guard(rep, "panic_chase", lambda: self._panic_chase(rep))  # panic — первым
         self._guard(rep, "sweeper", lambda: self._sweep_expired(rep))
         self._pending_pass(rep)
         for t in self._trades("open"):
@@ -183,6 +210,7 @@ class PositionMonitor:
         подтвержденного SL (109420 сразу после исполнения — повтор через 5 с, а не через
         минуту полного тика; идея Codex раунд 2)."""
         rep = MonitorReport()
+        self._guard(rep, "panic_chase", lambda: self._panic_chase(rep))
         self._pending_pass(rep)
         for t in self._j.execute(
             "SELECT * FROM trades WHERE status='open' AND sl_order_id IS NULL ORDER BY id"
@@ -217,11 +245,45 @@ class PositionMonitor:
 
     def _say(self, text: str) -> None:
         logger.info(text)
+        buf = getattr(self._defer, "notes", None)
+        if buf is not None:  # panic этого потока: отправка после биржи и вне замка
+            buf.append(text)
+            return
+        self._send(text)
+
+    def _send(self, text: str) -> None:
         if self._notify is not None:
             try:  # notify = send_text с parse_mode=HTML: «P&L», «<» из ошибки биржи — экранируем
                 self._notify(html.escape(text, quote=False))
             except Exception as e:  # noqa: BLE001 - канал не влияет на учет
                 logger.warning("notify failed: %s", e)
+
+    @contextlib.contextmanager
+    def deferred_notes(self):
+        """Алерты ЭТОГО потока — в список, а не в Telegram (ревью Codex H2/I, 2026-10-16): panic
+        шлет их сам после биржевых действий и вне _FLATTEN_LOCK. Вложенный вызов — тот же список."""
+        outer = getattr(self._defer, "notes", None)
+        if outer is not None:
+            yield outer
+            return
+        notes: list[str] = []
+        self._defer.notes = notes
+        try:
+            yield notes
+        finally:
+            self._defer.notes = None
+
+    def send_notes(self, notes: list[str]) -> None:
+        """Накопленные алерты — одним сообщением (недоступный Telegram — одно ожидание, не N);
+        длинный список — кусками под лимит Telegram (4096)."""
+        chunk: list[str] = []
+        for note in notes:
+            if chunk and sum(len(n) + 1 for n in chunk) + len(note) > NOTES_CHUNK_CHARS:
+                self._send("\n".join(chunk))
+                chunk = []
+            chunk.append(note)
+        if chunk:
+            self._send("\n".join(chunk))
 
     def _set_safe_mode(self, reason: str) -> None:
         if self._state is None or self._state.safe_mode:
@@ -643,18 +705,23 @@ class PositionMonitor:
 
     def _foreign_found(self, items: list[str], scope: str) -> None:
         """Ордера/позиции чужого запуска (вторая машина?): НИЧЕГО не снимаем — SAFE MODE и
-        алерт, один раз на набор (новые объекты — новый алерт; ушедшие — можно снова)."""
+        алерт. SAFE MODE — на КАЖДОМ скане, пока они есть (ревью Codex H2/I, 2026-10-16:
+        panic-reset при оставшихся ордерах снимал защиту навсегда); дедуп — только алерта:
+        новые объекты или повторный взвод после снятия — алерт, тот же набор — молча."""
         current = {f"{scope}:{x}" for x in items}
         new = current - self._reported_foreign
         self._reported_foreign = {k for k in self._reported_foreign if not k.startswith(scope + ":")}
         self._reported_foreign |= current
-        if not new:
+        if not items:
+            return
+        reengaged = self._state is not None and engage_safe_mode(
+            self._state, "на бирже ордера/позиции OSKAR чужого запуска (вторая машина?)")
+        if not new and not reengaged:
             return
         logger.critical("foreign OSKAR %s on exchange (second machine?): %s", scope, "; ".join(items))
-        if self._state is not None:
-            engage_safe_mode(self._state, "на бирже ордера/позиции OSKAR чужого запуска (вторая машина?)")
         shown = "; ".join(items[:5]) + (f" и еще {len(items) - 5}" if len(items) > 5 else "")
-        self._say(f"🛑 на бирже ордера/позиции OSKAR чужого запуска (вторая машина?): {shown} — "
+        again = "" if new else "SAFE MODE взведен снова — "
+        self._say(f"🛑 {again}на бирже ордера/позиции OSKAR чужого запуска (вторая машина?): {shown} — "
                   "новые входы остановлены (SAFE MODE), ничего не снимаю. Проверь, не запущен ли "
                   "oskard на второй машине; снять — oskar panic-reset")
 
@@ -688,6 +755,8 @@ class PositionMonitor:
         known_ids = {x for r in live for x in (r["entry_order_id"], r["sl_order_id"], r["tp_order_id"]) if x}
         known_cids |= {cid_base(str(r["client_order_id"])) for r in live}
         foreign: list[str] = []
+        exposed: set[str] | None = None  # символы с позицией без сделки; None — позиции не прочитаны
+        exposed_read = False
         for o in orders:
             cid = o.client_order_id.lower()
             if not cid.startswith("oskar-"):
@@ -698,6 +767,17 @@ class PositionMonitor:
             if run is None or not self._run_known(run):
                 foreign.append(f"{o.symbol} {o.kind} {o.client_order_id}")
                 continue
+            if o.kind != "entry":
+                # Защита (SL/TP/прочее) своего сироты может быть ЕДИНСТВЕННЫМ стопом позиции,
+                # потерянной журналом (ревью Codex H2/I, 2026-10-16): снимаем, только если на
+                # символе подтверждено отсутствие позиции без сделки.
+                if not exposed_read:
+                    exposed, exposed_read = self._exposed_symbols(), True
+                if exposed is None or o.symbol in exposed:
+                    logger.warning("own orphan %s %s %s kept: %s", o.kind, o.symbol, o.exchange_id,
+                                   "positions unknown" if exposed is None
+                                   else "position without journal trade on this symbol")
+                    continue
             self._ex.cancel_order(o.symbol, o.exchange_id)
             rep.orphans.append(f"{o.symbol}:{o.kind}:{o.exchange_id}")
             if o.kind == "entry":
@@ -708,20 +788,32 @@ class PositionMonitor:
                             o.client_order_id)
         self._foreign_found(foreign, "orders")
 
+    def _exposed_symbols(self) -> set[str] | None:
+        """Символы с позицией биржи без open/pending сделки; None — позиции не прочитаны
+        (отсутствие позиции не подтверждено — защиту не снимаем)."""
+        try:
+            return {symbol for symbol, _side in self._untracked_positions()}
+        except Exception as e:  # noqa: BLE001
+            logger.warning("positions unavailable for orphan scan (%s) - own protection kept", e)
+            return None
+
     # ---------------------------------------------------------------- startup
 
     def startup_check(self) -> MonitorReport:
-        """Старт демона, ДО запуска runner'а (первого входа): скан сирот (свои — снять,
-        чужого запуска — SAFE MODE, не трогать) и позиции биржи без сделки в журнале.
+        """Старт демона, ДО запуска runner'а (первого входа): позиции биржи без сделки в журнале
+        (потерянная сделка — восстановить учет, иначе SAFE MODE), затем скан сирот (свои —
+        снять, кроме защиты на символе с позицией без сделки; чужого запуска — SAFE MODE, не
+        трогать). Позиции — ПЕРВЫМИ (ревью Codex H2/I, 2026-10-16): скан сирот снимал
+        единственный SL потерянной сделки до сверки позиций.
         Биржа недоступна — не приговор: первый полный тик монитора повторит скан."""
         rep = MonitorReport()
+        self._guard(rep, "startup_positions", lambda: self._startup_positions(rep))
         try:
             self._scan_orphans(rep, force=True)
         except Exception as e:  # noqa: BLE001
             self._orphan_scan_at = None  # первый тик повторит
             rep.errors.append(f"orphans: {type(e).__name__}: {e}")
             logger.warning("startup orphan scan failed: %s", e)
-        self._guard(rep, "startup_positions", lambda: self._startup_positions(rep))
         logger.info("startup check: %s", rep.as_dict())
         return rep
 
@@ -743,14 +835,100 @@ class PositionMonitor:
         confirmed = {k: q for k, q in self._untracked_positions().items() if k in first}
         if not confirmed:
             return
+        lost: dict[tuple[str, str], float] = {}
         for (symbol, side), qty in confirmed.items():
+            try:
+                restored = self._restore_lost_trade(symbol, side, rep)
+            except Exception as e:  # noqa: BLE001 - не восстановили: как раньше, SAFE MODE + алерт
+                restored = None
+                rep.errors.append(f"restore {symbol} {side}: {type(e).__name__}: {e}")
+                logger.warning("lost trade %s %s not restored: %s", symbol, side, e)
+            if restored is not None:
+                continue
+            lost[(symbol, side)] = qty
             m = _untracked_msg(symbol, side, qty)
             # reconcile полного тика не повторяет тот же алерт
             self._mismatch_streak[m] = CONFIRM_TICKS
             self._reported_mismatches.add(m)
             rep.mismatches.append(m)
         self._foreign_found([f"позиция {s} {sd} qty {q:g} без сделки в журнале"
-                             for (s, sd), q in confirmed.items()], "positions")
+                             for (s, sd), q in lost.items()], "positions")
+
+    def _restore_lost_trade(self, symbol: str, side: str, rep: MonitorReport) -> str | None:
+        """Позиция без сделки, а в журнале ЕДИНСТВЕННОЕ свежее approved-решение без сделки по тому
+        же symbol/side: вход ушел, процесс упал до записи (ревью Codex H2/I, 2026-10-16). Учет —
+        из плана: сделка open, qty и цена входа ПО БИРЖЕ; защита — усыновить свою (SL/TP с cid
+        этого входа) или поставить по плану. Затем SAFE MODE + алерт: оператор проверяет.
+        Решений нет, их несколько или они старые — чья позиция, неизвестно: None, не трогаем."""
+        since = _iso(self._now() - LOST_TRADE_MAX_AGE)
+        rows = self._j.execute(
+            "SELECT pa.decision_id, pa.card_json, d.run_id FROM pending_approvals pa "
+            "JOIN decisions d ON d.decision_id = pa.decision_id "
+            "WHERE pa.resolution = 'approved' AND pa.resolved_at >= ? "
+            "AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.decision_id = pa.decision_id)", (since,),
+        ).fetchall()
+        found = []
+        for r in rows:
+            try:
+                plan = ExecutionPlan.model_validate_json(r["card_json"])
+            except Exception:  # noqa: BLE001 - битый план — не кандидат
+                continue
+            if plan.symbol == symbol and plan.side == side:
+                found.append((r["decision_id"], r["run_id"], plan))
+        if len(found) != 1:
+            return None
+        did, run_id, plan = found[0]
+        pos = [p for p in self._ex.positions() if p.symbol == symbol and p.side == side and p.qty > 0]
+        if not pos:
+            return None
+        qty = sum(p.qty for p in pos)
+        entry = (pos[0].entry_price if len(pos) == 1
+                 else sum(p.entry_price * p.qty for p in pos) / qty)  # средняя по объему
+        cid = self._lost_entry_cid(symbol, side, did, run_id)
+        with transaction(self._j):
+            self._j.execute(
+                "INSERT OR IGNORE INTO trades (run_id, decision_id, client_order_id, symbol, side, "
+                "status, entry_price, qty, leverage, risk_usd, sl_price, tp_price, setup_type, "
+                "timeframe, reasoning, opened_at, entry_type) "
+                "VALUES (?,?,?,?,?,'open',?,?,?,?,?,?,'',?,?,?,?)",
+                (cid.split("-")[1], did, cid, symbol, side, entry, qty, plan.leverage, plan.risk_usd,
+                 plan.sl, plan.tp, plan.timeframe, plan.tldr, _iso(self._now()),
+                 default_entry_type(self._j, did)),
+            )
+            self._j.execute(
+                "UPDATE decisions SET outcome='executed', outcome_detail=? WHERE decision_id=?",
+                ("restored_at_startup: позиция на бирже без записи сделки (сбой между входом и "
+                 "записью)", did),
+            )
+        logger.critical("lost trade restored at startup: %s %s %s qty=%g entry=%g cid=%s",
+                        did, symbol, side, qty, entry, cid)
+        if self._state is not None:  # флаг — до сети (защита ниже)
+            engage_safe_mode(self._state, f"позиция {symbol} {side} была без сделки в журнале — "
+                                          f"учет восстановлен по решению {did}")
+        t = self._j.execute("SELECT * FROM trades WHERE decision_id = ?", (did,)).fetchone()
+        self._guard(rep, did, lambda: self._ensure_protection(t, rep))
+        self._say(f"🛑 {symbol} {side} qty {qty:g}: позиция на бирже без сделки в журнале (вход "
+                  f"упал до записи) — учет восстановлен по решению {did}, защита по плану: SL "
+                  f"{plan.sl:.6g} / TP {plan.tp:.6g}. Новые входы остановлены (SAFE MODE) — "
+                  "проверь и сними: oskar panic-reset")
+        return did
+
+    def _lost_entry_cid(self, symbol: str, side: str, decision_id: str, run_id: str) -> str:
+        """clientOrderId входа потерянной сделки: по SL/TP на бирже с хэшем этого решения (вход
+        мог быть отправлен запуском, отличным от создавшего карточку), иначе — по запуску решения."""
+        guess = make_client_order_id(run_id, decision_id)
+        digest = guess.split("-")[2].lower()
+        try:
+            orders = self._ex.protection_orders(symbol, side)
+        except Exception as e:  # noqa: BLE001 - угадаем по решению; защиту поставит _ensure_protection
+            logger.warning("protection lookup for lost trade %s failed: %s", decision_id, e)
+            orders = []
+        for o in orders:
+            parts = (o.client_order_id or "").split("-")
+            if (len(parts) >= 3 and parts[0].lower() == "oskar" and parts[2].lower() == digest
+                    and self._run_known(parts[1].lower())):  # тот же сетап второй машины — не наш
+                return "-".join(parts[:3])
+        return guess
 
     # ----------------------------------------------------------------- panic
 
@@ -760,57 +938,64 @@ class PositionMonitor:
         rep = MonitorReport()
         out = {"cancelled": 0, "closed": 0, "errors": []}
         for t in self._trades("pending"):
-            try:
-                try:
-                    st = self._entry_state(t)
-                    if not st.is_gone and not st.is_filled:
-                        self._ex.cancel_order(t["symbol"], st.exchange_id)
-                except Exception as e:  # noqa: BLE001 - все равно снимаем защиту и закрываем запись
-                    out["errors"].append(f"{t['decision_id']}: entry: {e}")
-                self._cancel_protection(t)
-                with transaction(self._j):
-                    self._j.execute(
-                        "UPDATE trades SET status='cancelled', closed_at=? WHERE id=?",
-                        (_iso(self._now()), t["id"]),
-                    )
-                    self._j.execute(
-                        "UPDATE decisions SET outcome_detail='panic' WHERE decision_id=?",
-                        (t["decision_id"],),
-                    )
-                out["cancelled"] += 1
-            except Exception as e:  # noqa: BLE001
-                out["errors"].append(f"{t['decision_id']}: {e}")
+            self._panic_cancel_pending(t, out)
         for t in self._trades("open"):
-            try:
-                order = self._ex.close_position(t["symbol"], t["side"])
-                self._cancel_protection(t)
-                for o in self._ex.protection_orders(t["symbol"], t["side"]):  # прикрепленные без id
-                    if o.status == "open":
-                        self._ex.cancel_order(t["symbol"], o.exchange_id)
-                exit_price, fee = None, None
-                if order is not None and order.exchange_id:
-                    try:
-                        st = self._ex.order_status(t["symbol"], exchange_id=order.exchange_id)
-                        exit_price, fee = st.avg_price, st.fee
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("panic close lookup failed for %s: %s", t["decision_id"], e)
-                self._close(t, rep, exit_price, "panic", fee)
-                out["closed"] += 1
-            except Exception as e:  # noqa: BLE001
-                out["errors"].append(f"{t['decision_id']}: {e}")
-        self._say(f"🚨 PANIC: снято входов {out['cancelled']}, закрыто позиций {out['closed']}, "
-                  f"ошибок {len(out['errors'])}")
+            self._panic_close_open(t, rep, out)
+        # сводку шлет engage_panic — после финального прохода и вне замка (ревью Codex H2/I)
+        logger.warning("panic flatten pass: cancelled %d, closed %d, errors %d",
+                       out["cancelled"], out["closed"], len(out["errors"]))
         return out
+
+    def _panic_cancel_pending(self, t: sqlite3.Row, out: dict) -> None:
+        try:
+            try:
+                st = self._entry_state(t)
+                if not st.is_gone and not st.is_filled:
+                    self._ex.cancel_order(t["symbol"], st.exchange_id)
+            except Exception as e:  # noqa: BLE001 - все равно снимаем защиту и закрываем запись
+                out["errors"].append(f"{t['decision_id']}: entry: {e}")
+            self._cancel_protection(t)
+            with transaction(self._j):
+                self._j.execute(
+                    "UPDATE trades SET status='cancelled', closed_at=? WHERE id=?",
+                    (_iso(self._now()), t["id"]),
+                )
+                self._j.execute(
+                    "UPDATE decisions SET outcome_detail='panic' WHERE decision_id=?",
+                    (t["decision_id"],),
+                )
+            out["cancelled"] += 1
+        except Exception as e:  # noqa: BLE001
+            out["errors"].append(f"{t['decision_id']}: {e}")
+
+    def _panic_close_open(self, t: sqlite3.Row, rep: MonitorReport, out: dict) -> None:
+        try:
+            order = self._ex.close_position(t["symbol"], t["side"])
+            self._cancel_protection(t)
+            for o in self._ex.protection_orders(t["symbol"], t["side"]):  # прикрепленные без id
+                if o.status == "open":
+                    self._ex.cancel_order(t["symbol"], o.exchange_id)
+            exit_price, fee = None, None
+            if order is not None and order.exchange_id:
+                try:
+                    st = self._ex.order_status(t["symbol"], exchange_id=order.exchange_id)
+                    exit_price, fee = st.avg_price, st.fee
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("panic close lookup failed for %s: %s", t["decision_id"], e)
+            self._close(t, rep, exit_price, "panic", fee)
+            out["closed"] += 1
+        except Exception as e:  # noqa: BLE001
+            out["errors"].append(f"{t['decision_id']}: {e}")
 
     def panic_flatten_inflight(self, entries: dict) -> dict:
         """Panic, а вход «в процессе» не записан в журнал за окно ожидания (ревью Codex R1,
         2026-10-16): снять по бирже. entries — {база cid OSKAR-<run>-<hash>: (symbol, side) | None}.
         Ордера с этой базой cid (вход, -sl/-tp) — отмена; позиция символа/стороны входа —
-        рыночное закрытие и снятие ее SL/TP (прикрепленные — без cid)."""
+        рыночное закрытие и снятие ее SL/TP (прикрепленные — без cid).
+        Алерт — ПОСЛЕ биржевых действий (ревью Codex H2/I, 2026-10-16): недоступный Telegram
+        откладывал отмену и закрытие на два таймаута."""
         out = {"cancelled": 0, "closed": 0, "errors": []}
         keys = {cid_base(k) for k in entries}
-        self._say(f"🚨 PANIC: вход в процессе не записан за окно ожидания ({len(keys)}) — "
-                  "снимаю по бирже по clientOrderId, проверь биржу")
         try:
             for o in self._ex.open_orders_all():
                 if o.client_order_id and cid_base(o.client_order_id) in keys:
@@ -830,13 +1015,103 @@ class PositionMonitor:
                         self._ex.cancel_order(symbol, o.exchange_id)
             except Exception as e:  # noqa: BLE001
                 out["errors"].append(f"{key}: {e}")
+        self._say(f"🚨 PANIC: вход в процессе не записан за окно ожидания ({len(keys)}) — снято по "
+                  f"бирже по clientOrderId: ордеров {out['cancelled']}, позиций {out['closed']}, "
+                  f"ошибок {len(out['errors'])}; проверь биржу")
         return out
+
+    # ------------------------------------------------------ panic: преследование
+
+    def chase_after_panic(self, entries: dict) -> None:
+        """Входы, не завершенные за окно ожидания panic (ревью Codex H2/I, 2026-10-16): биржа
+        могла принять запрос уже после аварийного прохода. Монитор снимает их на каждом тике,
+        пока отсутствие экспозиции не подтверждено. entries — {база cid: (symbol, side) | None}."""
+        with self._chase_lock:
+            for key, target in entries.items():
+                self._chase.setdefault(cid_base(key), {"target": target, "done_at": None, "clean": 0})
+
+    def chasing(self) -> list[str]:
+        with self._chase_lock:
+            return sorted(self._chase)
+
+    def _panic_chase(self, rep: MonitorReport) -> None:
+        from oskar.core.emergency import _FLATTEN_LOCK
+        from oskar.core.executor import inflight_client_ids
+
+        with self._chase_lock:
+            items = dict(self._chase)
+        if not items:
+            return
+        if self._state is not None and self._state.panic_at is None:
+            logger.warning("panic reset by operator - chase of %s dropped", sorted(items))
+            with self._chase_lock:
+                self._chase.clear()
+            return
+        if not _FLATTEN_LOCK.acquire(blocking=False):
+            return  # engage_panic сейчас снимает сам — следующим тиком
+        try:
+            with self.deferred_notes() as notes:
+                inflight = inflight_client_ids()
+                for key, info in items.items():
+                    self._guard(rep, f"panic_chase {key}",
+                                lambda key=key, info=info: self._chase_one(key, info, inflight, rep))
+        finally:
+            _FLATTEN_LOCK.release()
+        self.send_notes(notes)  # Telegram — вне замка
+
+    def _chase_one(self, key: str, info: dict, inflight: set[str], rep: MonitorReport) -> None:
+        if key in inflight:  # исполнитель еще ждет биржу — исход узнаем после
+            info["done_at"], info["clean"] = None, 0
+            return
+        now = self._now()
+        if info["done_at"] is None:
+            info["done_at"] = now
+        clean, info["clean"] = info["clean"], 0  # сбой прохода — не «чисто»: счет заново
+        out = {"cancelled": 0, "closed": 0, "errors": []}
+        found = False
+        for t in self._j.execute(
+            "SELECT * FROM trades WHERE status IN ('pending','open') ORDER BY id"
+        ).fetchall():
+            if cid_base(str(t["client_order_id"])) != key:
+                continue
+            found = True  # исполнитель записал вход после panic
+            if t["status"] == "pending":
+                self._panic_cancel_pending(t, out)
+            else:
+                self._panic_close_open(t, rep, out)
+        for o in self._ex.open_orders_all():
+            if o.client_order_id and cid_base(o.client_order_id) == key:
+                found = True
+                self._ex.cancel_order(o.symbol, o.exchange_id)
+                out["cancelled"] += 1
+        target = info["target"]
+        if target is not None and self._find_position(*target) is not None:
+            found = True
+            if self._ex.close_position(*target) is not None:
+                out["closed"] += 1
+            for o in self._ex.protection_orders(*target):
+                if o.status == "open":
+                    self._ex.cancel_order(target[0], o.exchange_id)
+        if found or out["errors"]:
+            logger.critical("panic chase %s: exposure after window: %s", key, out)
+            self._say(f"🚨 PANIC: вход {key}, завершившийся после окна ожидания, снят по бирже: "
+                      f"ордеров {out['cancelled']}, позиций {out['closed']}, ошибок "
+                      f"{len(out['errors'])}")
+            return
+        info["clean"] = clean + 1
+        if info["clean"] >= CONFIRM_TICKS and (now - info["done_at"]).total_seconds() >= PANIC_CHASE_MIN_SEC:
+            with self._chase_lock:
+                self._chase.pop(key, None)
+            logger.warning("panic chase %s: no exposure confirmed - done", key)
 
     # ---------------------------------------------------------------- thread
 
     def _has_pending(self) -> bool:
         # pending-входы ИЛИ open без подтвержденного SL (перепроверка Codex: при одной open
-        # без стопа быстрый проход не запускался — повтор ждал полного тика)
+        # без стопа быстрый проход не запускался — повтор ждал полного тика); ИЛИ входы,
+        # преследуемые после panic (ревью Codex H2/I) — каждые 5 с, а не раз в минуту
+        if self.chasing():
+            return True
         return self._j.execute(
             "SELECT 1 FROM trades WHERE status='pending' "
             "OR (status='open' AND sl_order_id IS NULL) LIMIT 1"
