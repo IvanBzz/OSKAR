@@ -44,6 +44,14 @@ id ордера: исполнение доказано — закрыть ров
 запись в список неясных входов (meta PANIC_UNCLEAR_KEY: переживает рестарт), SAFE MODE на обоих
 носителях и один алерт. Монитор проверяет неясные входы по id на каждом тике (core/position_monitor).
 panic-reset снимает список вместе с флагами: решение оператора.
+
+Ревью H3, 4-й круг (2026-10-16):
+- повторный /panic (второй канал или повторное нажатие) не создает запись неясного входа заново:
+  берет сохраненную (closed — второго закрытия нет, manual — не трогать); запись — upsert
+  (upsert_unclear_entry), а не insert, который молча не обновлял существующий ключ;
+- engage_panic, ждущий _FLATTEN_LOCK, виден тику монитора (flatten_wanted): тот уступает замок
+  между элементами, а учет open-сделок под panic (SL/TP по id, позиции) ведет вне замка — /panic
+  не ждет сетевых вызовов полного тика.
 """
 
 import contextlib
@@ -73,6 +81,10 @@ PANIC_INFLIGHT_POLL_SEC = 0.25
 # параллельно: второй ждет первого и проходит по уже пустым спискам. Флаги
 # второго вызова ставятся ДО замка — ожидание касается только биржевой части.
 _FLATTEN_LOCK = threading.Lock()
+# Сколько engage_panic ждут _FLATTEN_LOCK (ревью H3, 4-й круг): тик монитора при panic берет замок
+# без ожидания и уступает его между элементами, пока счетчик > 0. Под замком счетчика — только он.
+_FLATTEN_WAITERS = 0
+_FLATTEN_WAITERS_LOCK = threading.Lock()
 # Запись носителей SAFE MODE: взвод, повтор с тиков и panic-reset не перемешиваются
 # (повтор после reset воскресил бы SAFE MODE в meta).
 _SAFE_MODE_LOCK = threading.Lock()
@@ -86,6 +98,30 @@ def _now_iso() -> str:
 
 
 # ------------------------------------------------------------------- panic
+
+
+def flatten_wanted() -> bool:
+    """engage_panic ждет _FLATTEN_LOCK: тик монитора должен его уступить (ревью H3, 4-й круг)."""
+    with _FLATTEN_WAITERS_LOCK:
+        return _FLATTEN_WAITERS > 0
+
+
+@contextlib.contextmanager
+def _flatten_lock():
+    """_FLATTEN_LOCK для engage_panic: пока ждем, flatten_wanted() — True (тик уступает замок
+    между элементами, а не держит его на весь проход со всеми сетевыми вызовами)."""
+    global _FLATTEN_WAITERS
+    with _FLATTEN_WAITERS_LOCK:
+        _FLATTEN_WAITERS += 1
+    try:
+        _FLATTEN_LOCK.acquire()
+    finally:
+        with _FLATTEN_WAITERS_LOCK:
+            _FLATTEN_WAITERS -= 1
+    try:
+        yield
+    finally:
+        _FLATTEN_LOCK.release()
 
 
 def _flatten_pass(fn) -> dict:
@@ -162,7 +198,7 @@ def engage_panic(state: RuntimeState, monitor=None, *, inflight_wait_sec: float 
         return result
     # Алерты монитора этого потока — в буфер: Telegram после биржи и вне замка (ревью Codex H2/I)
     defer = getattr(monitor, "deferred_notes", None)
-    with _FLATTEN_LOCK, (defer() if defer is not None else contextlib.nullcontext([])) as notes:
+    with _flatten_lock(), (defer() if defer is not None else contextlib.nullcontext([])) as notes:
         begin = getattr(monitor, "panic_begin", None)
         if begin is not None:  # закрытие сделки — одна попытка за panic (неясный сбой не повторяем)
             begin()
@@ -266,6 +302,21 @@ def add_unclear_entry(journal, key: str, info: dict, state: RuntimeState | None 
         entries[key] = info
         _write_unclear(journal, entries)
     return True
+
+
+def upsert_unclear_entry(journal, key: str, info: dict, state: RuntimeState | None = None) -> bool:
+    """Записать или обновить вход в списке неясных (ревью H3, 4-й круг: повторный /panic закрывал
+    вход, а add_unclear_entry не обновлял уже сохраненный ключ — state оставался unclear, и тик
+    закрывал его qty второй раз). Поля существующей записи сохраняются, info — поверх. panic снят
+    оператором — не пишем (как add_unclear_entry). True — запись новая."""
+    with transaction(journal):
+        if state is not None and state.panic_at is None:
+            return False
+        entries = unclear_entries(journal)
+        new = key not in entries
+        entries[key] = {**entries.get(key, {}), **info}
+        _write_unclear(journal, entries)
+    return new
 
 
 def update_unclear_entry(journal, key: str, **fields) -> None:

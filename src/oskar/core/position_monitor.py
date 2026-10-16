@@ -58,6 +58,16 @@ URL): «&» или «<» в тексте не должны молча глуши
 - позиция без сделки на старте — SAFE MODE и алерт с данными позиции и ордерами OSKAR на ней;
   учет не восстанавливается, SL/TP OSKAR на этой паре не снимаются.
 
+Ревью H3, 4-й круг (2026-10-16):
+- вход, закрытый по clientOrderId, не закрывается второй раз: повторный /panic берет сохраненную
+  запись (closed/manual), запись — upsert, а исход, решенный процессом, — еще и в памяти
+  (_cid_done), проверяемой перед любым close_qty: сбой записи meta не повторяет закрытие;
+- panic до close_qty open-сделки проверяет ее SL/TP по id: сработал — учет sl_hit/tp_hit без
+  закрытия (иначе срезал бы ручную часть пары); проверить не удалось — не закрывает, SAFE MODE;
+- тик под panic держит _FLATTEN_LOCK только на том, что может закрыть по id, уступая его ждущему
+  engage_panic между элементами; учет прочих open-сделок — вне замка. Закрытие в журнале — только
+  из open/pending (panic и тик не перетирают учет друг друга).
+
 Все решения — по состоянию ордеров НА БИРЖЕ, не по ценам свечей. Исключение по
 одной сделке не валит проход по остальным. realized_pnl — брутто по ценам
 исполнения минус комиссии, если биржа их отдала (иначе брутто).
@@ -81,6 +91,7 @@ from oskar.core.emergency import (
     hold_safe_mode,
     unclear_entries,
     update_unclear_entry,
+    upsert_unclear_entry,
 )
 from oskar.core.executor import short_error
 from oskar.core.run_registry import cid_run_id, run_known
@@ -202,7 +213,13 @@ class PositionMonitor:
         # panic (ревью H3, 3-й круг): закрытие сделки — одна попытка за panic (неясный сбой мог
         # дойти до биржи — повтор закрыл бы ручную часть пары); алерт об open-сделке — один раз
         self._panic_tried: set[int] = set()
+        self._panic_unchecked: set[int] = set()  # SL/TP по id не проверены в этом panic (алерт был)
         self._panic_open_alerted: set[int] = set()
+        # Исход входа по cid, решенный этим процессом: {ключ: поля записи} — closed (его qty
+        # закрыта) или manual (решение оператора). Проверяется перед ЛЮБЫМ close_qty по cid и
+        # для сделки (ревью H3, 4-й круг): повторный /panic или несохраненная meta не закрывают
+        # второй раз. Не чистится: ключ cid уникален на решение, повторно закрывать его нечего.
+        self._cid_done: dict[str, dict] = {}
         self._unclear_alerted: set[str] = set()  # дедуп алерта, если запись в meta не удалась
         self._unclear_reminded_at: datetime | None = None
         self.last_report: dict = {}
@@ -627,7 +644,9 @@ class PositionMonitor:
             return
         self._missing.pop(did, None)
         if panic:
-            self._panic_open_alert(t)
+            cur = self._reload(t)  # тик под panic идет вне замка: panic мог закрыть ее параллельно
+            if cur is not None and cur["status"] == "open":
+                self._panic_open_alert(t)
             return
 
         if self._ensure_protection(t, rep, sl, tp):
@@ -662,10 +681,12 @@ class PositionMonitor:
     def _close(
         self, t: sqlite3.Row, rep: MonitorReport,
         exit_price: float | None, reason: str, exit_fee: float | None,
-    ) -> None:
+    ) -> bool:
         """Закрытие по данным монитора. reconciled=0 ВСЕГДА: «сверено» ставит только
         sync/reconcile.py по филлам биржи (ст. 1 п. 1); иначе sl/tp/duration-закрытия
-        сверка не увидела бы никогда, а INV-003 навсегда осталась бы без данных."""
+        сверка не увидела бы никогда, а INV-003 навсегда осталась бы без данных.
+        Только из open/pending (ревью H3, 4-й круг: учет open под panic идет вне замка flatten —
+        panic и тик не перетирают закрытие друг друга). False — сделка уже закрыта другим путем."""
         now = self._now()
         opened = _parse_iso(t["opened_at"])
         duration = int((now - opened).total_seconds()) if opened else None
@@ -675,17 +696,22 @@ class PositionMonitor:
             pnl = sign * (exit_price - t["entry_price"]) * t["qty"]
             pnl -= (t["entry_fees"] or 0.0) + (exit_fee or 0.0)
         with transaction(self._j):
-            self._j.execute(
+            cur = self._j.execute(
                 "UPDATE trades SET status='closed', exit_price=?, close_reason=?, exit_fees=?, "
-                "realized_pnl=?, closed_at=?, duration_seconds=?, reconciled=0 WHERE id=?",
+                "realized_pnl=?, closed_at=?, duration_seconds=?, reconciled=0 "
+                "WHERE id=? AND status IN ('open','pending')",
                 (exit_price, reason, exit_fee, pnl, _iso(now), duration, t["id"]),
             )
+        if cur.rowcount == 0:
+            logger.info("trade %s already closed - %s not booked", t["decision_id"], reason)
+            return False
         rep.closed.append((t["decision_id"], reason))
         label = {"sl_hit": "🛑 стоп", "tp_hit": "🎯 тейк", "duration_timeout": "⏱ стоп по времени",
                  "manual": "✋ закрыта извне", "panic": "🚨 panic"}.get(reason, reason)
         pnl_txt = f", P&L {pnl:+.2f}" if pnl is not None else ""
         px_txt = f" @ {exit_price:.6g}" if exit_price is not None else ""
         self._say(f"{label}: {t['symbol']} {t['side']}{px_txt}{pnl_txt}")
+        return True
 
     # ------------------------------------------------------------- reconcile
 
@@ -959,8 +985,10 @@ class PositionMonitor:
     # рестарт), SAFE MODE и один алерт; по symbol/side «на всякий случай» не закрывается ничего.
 
     def panic_begin(self) -> None:
-        """engage_panic: новый panic — закрытие сделок снова разрешено (по одной попытке)."""
+        """engage_panic: новый panic — закрытие сделок снова разрешено (по одной попытке).
+        Решенные по cid входы (_cid_done) не сбрасываются: второе закрытие задело бы ручную часть."""
         self._panic_tried.clear()
+        self._panic_unchecked.clear()
 
     def panic_flatten(self) -> dict:
         """Ст. 6: снять входы OSKAR и закрыть его позиции. Флаги уже стоят — сюда после них.
@@ -978,9 +1006,10 @@ class PositionMonitor:
     def _panic_trade(self, t: sqlite3.Row, rep: MonitorReport, out: dict, items: dict) -> None:
         """Сделка журнала при panic. Неясный вход уже закрыт по clientOrderId (state closed) — только
         учет; закрыть его не удалось (manual) — не трогаем, решение оператора; иначе open — закрыть
-        ее qty, pending — исход по id."""
+        ее qty, pending — исход по id. Состояние, решенное этим процессом (_cid_done), — главнее
+        meta: запись могла не сохраниться (ревью H3, 4-й круг)."""
         key = cid_base(str(t["client_order_id"]))
-        state = (items.get(key) or {}).get("state")
+        state = (self._cid_done.get(key) or items.get(key) or {}).get("state")
         try:
             if state == "closed":
                 self._book_closed_by_cid(t, rep, key)
@@ -1028,9 +1057,35 @@ class PositionMonitor:
     def _panic_close_open(self, t: sqlite3.Row, rep: MonitorReport, out: dict) -> bool:
         """Закрыть ровно qty сделки (close_qty: ручная часть той же пары остается) и снять ее защиту
         по id; учет — closed/panic. Одна попытка за panic: сбой мог дойти до биржи, а повтор закрыл бы
-        ручную часть пары — алерт, решение за оператором (повторный /panic пробует снова)."""
+        ручную часть пары — алерт, решение за оператором (повторный /panic пробует снова).
+
+        Ревью H3, 4-й круг (P2-1): до close_qty — SL/TP сделки по id (журнал узнает о сработавшем
+        стопе только на полном тике, а close_qty после него срезал бы ручную часть пары). Сработал —
+        учет sl_hit/tp_hit без закрытия; проверить не удалось — не закрываем (не доказано, что
+        позиция еще своя): SAFE MODE и один алерт за panic, на бирже ничего не сделано — повтор
+        (финальный проход, тик неясного входа, повторный /panic) безопасен."""
         did, key = t["decision_id"], cid_base(str(t["client_order_id"]))
         if t["id"] in self._panic_tried:
+            return False
+        cur = self._reload(t)
+        if cur is None or cur["status"] != "open":
+            return False  # учтена другим путем (тик под panic идет вне замка flatten)
+        t = cur
+        try:
+            if self._close_if_protection_filled(t, rep):  # учет sl_hit/tp_hit, парный ордер снят
+                logger.warning("panic: %s protection already filled - booked, nothing closed", did)
+                self._unclear_resolved(key)
+                return False
+        except Exception as e:  # noqa: BLE001 - не проверили — не закрываем
+            if t["id"] not in self._panic_unchecked:
+                self._panic_unchecked.add(t["id"])
+                self._panic_open_alerted.add(t["id"])  # тик не дублирует алерт об open-сделке
+                out["errors"].append(f"{did}: SL/TP по id не проверены: {short_error(e)}")
+                self._hold_safe_mode(f"panic: {t['symbol']} {t['side']} ({did}) SL/TP не проверены")
+                self._say(f"🛑 panic: {t['symbol']} {t['side']} qty {float(t['qty'] or 0):g} ({did}) "
+                          f"не закрыта — SL/TP по id не проверены ({short_error(e)}): сработавший стоп "
+                          "+ закрытие срезали бы ручную часть пары. Повторю на финальном проходе; не "
+                          "выйдет — закрой вручную или повтори /panic (SAFE MODE)")
             return False
         self._panic_tried.add(t["id"])
         qty = float(t["qty"] or 0)
@@ -1044,6 +1099,8 @@ class PositionMonitor:
             self._say(f"🛑 panic: {t['symbol']} {t['side']} qty {qty:g} ({did}) закрыть не удалось "
                       f"({short_error(e)}) — закрой вручную; сам не повторяю (запрос мог дойти до биржи)")
             return False
+        # qty закрыта — сначала память: сбой учета ниже не приведет ко второму закрытию (4-й круг)
+        self._cid_done[key] = {"state": "closed", "closed_qty": qty}
         out["errors"].extend(f"{did}: {e}" for e in self._cancel_own_protection(
             t["symbol"], t["side"], key, qty or None, t["sl_price"], t["tp_price"],
             (t["sl_order_id"], t["tp_order_id"])))
@@ -1073,41 +1130,61 @@ class PositionMonitor:
         """Входы, не завершенные за окно ожидания panic (ревью Codex R1; H3, 3-й круг): записи в
         журнале нет — исход по clientOrderId. Исполнение доказано — закрыть ровно его qty, защиту
         снять по id; не доказано — список неясных, SAFE MODE, алерт. По symbol/side не закрывается
-        ничего. entries — {база cid OSKAR-<run>-<hash>: (symbol, side) | None}."""
+        ничего. entries — {база cid OSKAR-<run>-<hash>: (symbol, side) | None}.
+
+        Повторный /panic (ревью H3, 4-й круг: второй канал или повторное нажатие, исполнитель еще в
+        процессе) берет СОХРАНЕННУЮ запись, а не новую unclear: closed — его qty уже закрыта, второго
+        закрытия нет; manual — не трогаем, решение оператора (вход — в сводку неясных)."""
         from oskar.core.executor import inflight_client_ids, inflight_decision
 
         out = _panic_out()
         rep = MonitorReport()
         inflight = inflight_client_ids()
+        try:
+            stored = unclear_entries(self._j)
+        except Exception as e:  # noqa: BLE001 - закрытое этим процессом помнит _cid_done
+            logger.error("panic unclear entries unreadable: %s", e)
+            stored = {}
         for key, target in entries.items():
             if target is None:
                 continue  # план не прочитан — допуска к отправке не было
-            item = self._new_item(key, target[0], target[1], inflight_decision(key))
+            known = stored.get(key)
+            item = (dict(known) if known is not None
+                    else self._new_item(key, target[0], target[1], inflight_decision(key)))
             try:
                 why = self._step_entry(key, item, inflight, rep, out, fresh=True)
             except Exception as e:  # noqa: BLE001 - не проверили — исход неясен, а не «нет»
                 why = f"проверка по clientOrderId упала: {type(e).__name__}: {e}"
             if why is not None:
                 self._mark_unclear(key, item, why, out)
+            elif known is not None and known.get("state") == "manual":
+                out.setdefault("unclear", []).append(item.get("decision_id") or key)
         return out
 
     def _step_entry(self, key: str, item: dict, inflight: set[str], rep: MonitorReport, out: dict,
                     *, fresh: bool = False) -> str | None:
-        """Неясный вход panic: запись списка (fresh — только что не завершенный за окно, записи еще
-        нет). Возвращает причину, если исход по-прежнему не доказан.
+        """Неясный вход panic: запись списка. fresh — вызов из engage_panic для входа, не
+        завершенного за окно: записи в meta может еще не быть (сохранение — upsert), а сделку,
+        записанную исполнителем только что, ведем сразу. Возвращает причину, если исход по-прежнему
+        не доказан.
 
-        Сделка уже в журнале — ее ведет путь сделок panic (_panic_trade). Иначе — исход по
-        clientOrderId, в том числе пока исполнитель в процессе (ревью Codex H3, 2-й круг: биржа
-        могла принять вход, а исполнитель еще ждет ответа). Исполнение доказано — закрыть ровно
-        его qty; исполнитель запишет сделку позже — запись остается (state closed), учет без
-        второго закрытия. Ордера нет за UNKNOWN_ENTRY_TTL_SEC и исполнитель завершен — входа нет."""
+        Сделка уже в журнале — ее ведет путь сделок panic (_panic_trade) с состоянием этой записи.
+        Иначе — исход по clientOrderId, в том числе пока исполнитель в процессе (ревью Codex H3,
+        2-й круг: биржа могла принять вход, а исполнитель еще ждет ответа). Исполнение доказано —
+        закрыть ровно его qty; исполнитель запишет сделку позже — запись остается (state closed),
+        учет без второго закрытия. Ордера нет за UNKNOWN_ENTRY_TTL_SEC и исполнитель завершен —
+        входа нет. Исход, решенный этим процессом (_cid_done), главнее записи: meta могла не
+        сохраниться, а второй close_qty срезал бы ручную часть пары (ревью H3, 4-й круг)."""
         t = self._trade_by_key(key)
         if t is not None:
             if t["status"] not in ("pending", "open"):
                 self._unclear_resolved(key)
-            elif fresh:  # записан после финального прохода — тот же путь, что у сделок
-                self._panic_trade(t, rep, out, {})
+            elif fresh:  # записан после финального прохода — путь сделок с состоянием записи
+                self._panic_trade(t, rep, out, {key: item})
             return None
+        done = self._cid_done.get(key)
+        if done is not None and item.get("state", "unclear") != done["state"]:
+            self._put_item(key, item, fresh, **done)  # запись отстала от памяти — догоняет
         state = item.get("state", "unclear")
         if state != "unclear":
             if state == "closed" and key not in inflight:
@@ -1128,15 +1205,15 @@ class PositionMonitor:
         if kind == "none":
             if key in inflight:
                 return "вход снят биржей, исполнитель еще в процессе"
-            if not fresh:
-                self._unclear_resolved(key, f"✅ panic: вход {label} ({symbol} {side}) не исполнен — "
-                                            "снят со списка неясных")
+            # алерт — только если запись была (только что не завершенный вход без записи — молча)
+            self._unclear_resolved(key, f"✅ panic: вход {label} ({symbol} {side}) не исполнен — "
+                                        "снят со списка неясных")
             return None
         if kind == "unknown":
             return why
         qty = float(st.filled_qty or 0)  # исполнен — доказано по clientOrderId
         if qty <= 0:
-            self._put_item(key, item, fresh, state="manual", why="исполнен, объем биржа не отдала")
+            self._settle(key, item, fresh, state="manual", why="исполнен, объем биржа не отдала")
             self._hold_safe_mode(f"panic: вход {label} ({symbol} {side}) исполнен, объем неизвестен")
             out["errors"].append(f"{label}: исполнен, объем неизвестен")
             self._say(f"🛑 panic: вход {label} исполнен, но объем биржа не отдала — закрой {symbol} "
@@ -1145,13 +1222,16 @@ class PositionMonitor:
         try:
             order = self._ex.close_qty(symbol, side, qty)
         except Exception as e:  # noqa: BLE001
-            self._put_item(key, item, fresh, state="manual", why=f"закрыть не удалось: {short_error(e)}")
+            self._settle(key, item, fresh, state="manual", why=f"закрыть не удалось: {short_error(e)}")
             self._hold_safe_mode(f"panic: вход {label} ({symbol} {side}) закрыть не удалось")
             out["errors"].append(f"{label}: {short_error(e)}")
             self._say(f"🛑 panic: вход {label} исполнен после окна (qty {qty:g}), закрыть не удалось "
                       f"({short_error(e)}) — закрой {symbol} {side} qty {qty:g} вручную; сам не "
                       "повторяю (запрос мог дойти до биржи)")
             return None
+        # qty закрыта — сначала память (ревью H3, 4-й круг): сбой записи meta ниже не приведет ко
+        # второму close_qty ни на тике, ни при повторном /panic
+        self._cid_done[key] = {"state": "closed", "closed_qty": qty}
         errors = self._cancel_own_protection(symbol, side, key, qty, item.get("sl"), item.get("tp"), ())
         out["errors"].extend(f"{label}: {e}" for e in errors)
         if order is not None:
@@ -1163,8 +1243,8 @@ class PositionMonitor:
         self._say(f"🚨 panic: вход {label} исполнен после окна ожидания (по clientOrderId) — {what}; "
                   f"защита снята по id{f', ошибок {len(errors)}' if errors else ''}")
         if key in inflight:  # исполнитель запишет сделку позже — учет без второго закрытия
-            self._put_item(key, item, fresh, state="closed", closed_qty=qty)
-        elif not fresh:
+            self._put_item(key, item, fresh, **self._cid_done[key])
+        else:
             self._unclear_resolved(key)
         return None
 
@@ -1294,15 +1374,24 @@ class PositionMonitor:
             logger.error("panic unclear entry %s not updated: %s", key, e)
 
     def _put_item(self, key: str, item: dict, fresh: bool, **fields) -> None:
+        """Поля записи неясного входа. fresh — upsert (ревью H3, 4-й круг: insert не обновлял уже
+        сохраненный ключ — после повторного /panic state оставался unclear, и тик закрывал вход
+        второй раз); иначе — только существующая запись (снятая reset'ом не воскресает)."""
         item.update(fields)
         try:
             if fresh:
-                add_unclear_entry(self._j, key, item, self._state)
+                upsert_unclear_entry(self._j, key, item, self._state)
                 self._unclear_reminded_at = self._now()  # алерт об исходе уже ушел
             else:
                 update_unclear_entry(self._j, key, **fields)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - исход помнит _cid_done; повтор записи — с тика
             logger.error("panic unclear entry %s not saved: %s", key, e)
+
+    def _settle(self, key: str, item: dict, fresh: bool, **fields) -> None:
+        """Исход входа решен этим процессом (manual — решение оператора): сначала память, затем
+        meta — несохраненная запись не вернет вход в автоматику ни на тике, ни при повторном /panic."""
+        self._cid_done[key] = dict(fields)
+        self._put_item(key, item, fresh, **fields)
 
     def _unclear_resolved(self, key: str, note: str | None = None) -> None:
         try:
@@ -1340,35 +1429,75 @@ class PositionMonitor:
         """Тик при взведенном panic, в том числе восстановленном после рестарта (ревью Codex H3,
         2-й круг, P1-4: поздний fill шел в обычное сопровождение и получал защиту). Неясные входы —
         по id; pending — исход по id; open неясного входа — закрыть ее qty (одна попытка); прочие
-        open (полный тик) — учет по id ордеров защиты и алерт. Новая защита не ставится. Под
-        _FLATTEN_LOCK без ожидания: engage_panic снимает сам — следующим тиком."""
-        from oskar.core.emergency import _FLATTEN_LOCK
-        from oskar.core.executor import inflight_client_ids
+        open (полный тик) — учет по id ордеров защиты и алерт. Новая защита не ставится.
 
-        if not _FLATTEN_LOCK.acquire(blocking=False):
+        Ревью H3, 4-й круг (P2-2): под _FLATTEN_LOCK (без ожидания: занят — engage_panic снимает
+        сам) — только то, что может закрыть по id, и по одному элементу: engage_panic ждет замок —
+        тик уступает его после текущего элемента. Учет прочих open — после, ВНЕ замка: на бирже он
+        ничего не закрывает, а /panic не ждет его сетевых вызовов (раньше — весь полный тик)."""
+        from oskar.core.emergency import _FLATTEN_LOCK, flatten_wanted
+
+        if flatten_wanted() or not _FLATTEN_LOCK.acquire(blocking=False):
             return
         notes: list[str] = []
         try:
             with self.deferred_notes() as notes:
-                out = _panic_out()
-                # реестр — ДО журнала: исполнитель пишет сделку раньше, чем выходит из реестра
-                inflight = inflight_client_ids()
-                for key, item in unclear_entries(self._j).items():
-                    self._guard(rep, f"panic {key}",
-                                lambda key=key, item=item: self._step_entry(key, item, inflight, rep, out))
-                items = unclear_entries(self._j)
-                for t in self._trades("pending"):
-                    self._guard(rep, t["decision_id"], lambda t=t: self._panic_trade(t, rep, out, items))
-                for t in self._trades("open"):
-                    if cid_base(str(t["client_order_id"])) in items:
-                        self._guard(rep, t["decision_id"],
-                                    lambda t=t: self._panic_trade(t, rep, out, items))
-                    elif full:
-                        self._guard(rep, t["decision_id"], lambda t=t: self._check_open(t, rep, panic=True))
-                rep.errors.extend(out["errors"])
+                try:
+                    own = self._panic_locked_pass(rep)
+                finally:
+                    _FLATTEN_LOCK.release()
         finally:
-            _FLATTEN_LOCK.release()
             self.send_notes(notes)  # Telegram — вне замка (и при сбое прохода)
+        if own is None or not full:
+            return
+        notes = []
+        try:
+            with self.deferred_notes() as notes:
+                for t in self._trades("open"):
+                    if flatten_wanted() or _FLATTEN_LOCK.locked():
+                        break  # panic идет — open-сделки ведет он
+                    if cid_base(str(t["client_order_id"])) in own:
+                        continue  # ведет проход под замком
+                    self._guard(rep, t["decision_id"], lambda t=t: self._panic_check_open(t, rep))
+        finally:
+            self.send_notes(notes)
+
+    def _panic_locked_pass(self, rep: MonitorReport) -> set[str] | None:
+        """Часть тика под panic под _FLATTEN_LOCK: неясные входы, pending, open неясного входа или
+        решенного по cid. -> ключи, которые она ведет; None — engage_panic ждет замок, проход
+        прерван (оставшееся сделает он)."""
+        from oskar.core.emergency import flatten_wanted
+        from oskar.core.executor import inflight_client_ids
+
+        out = _panic_out()
+        try:
+            # реестр — ДО журнала: исполнитель пишет сделку раньше, чем выходит из реестра
+            inflight = inflight_client_ids()
+            for key, item in unclear_entries(self._j).items():
+                if flatten_wanted():
+                    return None
+                self._guard(rep, f"panic {key}",
+                            lambda key=key, item=item: self._step_entry(key, item, inflight, rep, out))
+            items = unclear_entries(self._j)
+            own = set(items) | set(self._cid_done)
+            for t in self._trades("pending"):
+                if flatten_wanted():
+                    return None
+                self._guard(rep, t["decision_id"], lambda t=t: self._panic_trade(t, rep, out, items))
+            for t in self._trades("open"):
+                if cid_base(str(t["client_order_id"])) not in own:
+                    continue
+                if flatten_wanted():
+                    return None
+                self._guard(rep, t["decision_id"], lambda t=t: self._panic_trade(t, rep, out, items))
+            return own
+        finally:
+            rep.errors.extend(out["errors"])
+
+    def _panic_check_open(self, t: sqlite3.Row, rep: MonitorReport) -> None:
+        cur = self._reload(t)  # проход вне замка: panic мог закрыть ее, пока шли сетевые вызовы
+        if cur is not None and cur["status"] == "open":
+            self._check_open(cur, rep, panic=True)
 
     def _panic_open_alert(self, t: sqlite3.Row) -> None:
         if t["id"] in self._panic_open_alerted:
