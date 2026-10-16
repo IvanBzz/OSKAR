@@ -1,4 +1,8 @@
-"""Управление oskard через локальный API. Только stdlib — venv-независим."""
+"""Управление oskard через локальный API. Только stdlib — venv-независим.
+
+Блок I, 2026-10-16: SKILL.md обещал /positions и /pnl, которых в скрипте не было. Добавлены
+positions (GET /positions), pnl [часы] (GET /pnl), mode [auto|confirm] (GET/POST /mode).
+"""
 
 import json
 import os
@@ -11,11 +15,17 @@ BASE = "http://127.0.0.1:8321"
 COMMANDS = {
     "status": ("GET", "/status"),
     "pending": ("GET", "/pending"),
+    "positions": ("GET", "/positions"),
+    "pnl": ("GET", "/pnl"),
+    "mode": ("GET", "/mode"),
     "pause": ("POST", "/pause"),
     "resume": ("POST", "/resume"),
     "panic": ("POST", "/panic"),
     "panic-reset": ("POST", "/panic/reset"),
 }
+MODES = ("auto", "confirm")
+USAGE = (f"usage: oskarctl.py [{'|'.join(COMMANDS)}]  "
+         "| oskarctl.py mode [auto|confirm] | oskarctl.py pnl [hours, 0 = all]")
 
 
 def _oskar_home() -> Path:
@@ -44,11 +54,35 @@ def api_token() -> str:
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def request_for(args: list[str]) -> tuple[str, str] | None:
+    """(метод, путь) для аргументов командной строки; None — неверный вызов."""
+    if not args or args[0] not in COMMANDS:
+        return None
+    command, rest = args[0], args[1:]
+    method, path = COMMANDS[command]
+    if command == "mode" and rest:
+        if len(rest) != 1 or rest[0] not in MODES:
+            return None
+        return "POST", f"/mode/{rest[0]}"
+    if command == "pnl" and rest:
+        try:
+            hours = float(rest[0])
+        except ValueError:
+            return None
+        if len(rest) != 1 or hours < 0:
+            return None
+        return method, f"{path}?hours={hours:g}"
+    if rest:
+        return None
+    return method, path
+
+
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
-        print(f"usage: oskarctl.py [{'|'.join(COMMANDS)}]")
+    target = request_for(sys.argv[1:])
+    if target is None:
+        print(USAGE)
         return 2
-    method, path = COMMANDS[sys.argv[1]]
+    method, path = target
     req = urllib.request.Request(BASE + path, method=method, headers={"X-Oskar-Token": api_token()})
     if method == "POST":
         req.data = b""

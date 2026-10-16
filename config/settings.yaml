@@ -59,6 +59,12 @@ safe_mode:
                                    # автоматически не снимается (урок v1): oskar drawdown-reset
   token_budget_floor_pct: 20       # НЕ РЕАЛИЗОВАН: бюджеты LLM — жесткие daily/hourly лимиты
 
+ops:                               # фоновые задачи демона (core/ops_jobs.py, блок I 2026-10-16)
+  digest_time: "21:00"             # дневная сводка в сигнальный бот (и /digest по запросу), HH:MM
+  timezone: Europe/Moscow          # часовой пояс digest_time
+  invariants_every_hours: 6        # прогон ops/invariants (первый — через 10 мин после старта);
+                                   # red -> алерт, тот же red повторно — не чаще раза в 24 ч
+
 journal:
   db_path: data/oskar.db           # от корня репо; читает демон (oskar sync diff пока зашит на этот путь)
   archive_before_run: true         # не подключен: архив журнала только при смене его схемы

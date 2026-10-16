@@ -378,8 +378,9 @@ def test_orphan_oskar_orders_cancelled_known_and_foreign_untouched(tmp_path):
     ex.open_list = [
         OpenOrderRef(SYM, "d1-sl", "OSKAR-r1-d1-sl", "sl"),               # своя живая сделка
         OpenOrderRef(SYM, "x9", "oskar-r1-d1-sl-r2", "sl"),               # та же сделка (база cid)
-        OpenOrderRef("A/USDT:USDT", "o1", "OSKAR-dead-abc123", "entry"),  # сирота-вход
-        OpenOrderRef("B/USDT:USDT", "o2", "OSKAR-old-def456-tp", "tp"),   # остаток закрытой сделки
+        # run r1 журналу известен — свои сироты (чужой run_id — блок I, test_second_machine.py)
+        OpenOrderRef("A/USDT:USDT", "o1", "OSKAR-r1-abc123", "entry"),    # сирота-вход
+        OpenOrderRef("B/USDT:USDT", "o2", "OSKAR-r1-def456-tp", "tp"),    # остаток закрытой сделки
         OpenOrderRef("C/USDT:USDT", "m1", "manual-ivan", "entry"),         # ручной ордер Ивана
         OpenOrderRef("C/USDT:USDT", "a1", "", "sl"),                       # прикрепленный биржей
     ]

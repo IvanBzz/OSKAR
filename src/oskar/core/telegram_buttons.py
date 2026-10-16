@@ -14,6 +14,9 @@
 доходило. Теперь тот же long-poll берет и `message`. От allowlist-автора в
 allowlist-чате (та же проверка, что у кнопок) исполняются `/panic` — сразу,
 первым в пачке — и `/status`; всё прочее молча игнорируется.
+
+Блок I, 2026-10-16: `/digest` — сводка за 24 ч (ops/digest.py); каждая команда — INFO-строка
+в логе (имя команды, без текста сообщения и токена).
 """
 
 import html
@@ -51,10 +54,13 @@ ALLOWED_UPDATES = '["callback_query","message"]'
 PANIC_COMMAND = "panic"
 STATUS_COMMAND = "status"
 MODE_COMMAND = "mode"
+DIGEST_COMMAND = "digest"
 MODE_VERB = "mode"
+KNOWN_COMMANDS = (PANIC_COMMAND, STATUS_COMMAND, MODE_COMMAND, DIGEST_COMMAND)
 BOT_COMMANDS = [
     {"command": "mode", "description": "режим: автомат / с подтверждением"},
     {"command": "status", "description": "состояние OSKAR одной строкой"},
+    {"command": "digest", "description": "сводка за 24 ч: воронка, сделки, P&L, инварианты"},
     {"command": "panic", "description": "EMERGENCY STOP: снять входы, закрыть позиции"},
 ]
 
@@ -176,6 +182,7 @@ class ButtonPoller:
         on_panic=None,  # () -> dict (ответ engage_panic); демон передает engage_panic(state, monitor)
         on_status=None,  # () -> str: одна строка для /status
         on_mode=None,  # (new_mode | None) -> текущий режим; None — переключателя нет
+        on_digest=None,  # () -> str: сводка за 24 ч (HTML, уже экранирована); None — нет сводки
     ):
         if not token or not allowed_chat_id:
             raise ValueError("signals bot token and chat id are required")
@@ -190,6 +197,7 @@ class ButtonPoller:
         self._on_panic = on_panic or (lambda: engage_panic(state))
         self._on_status = on_status or (lambda: status_line(state))
         self._on_mode = on_mode
+        self._on_digest = on_digest
         self._offset = 0
         self.not_ok_streak = 0
         self._stop = threading.Event()
@@ -257,6 +265,9 @@ class ButtonPoller:
             )
             return  # чужим не отвечаем
         command = parse_command(msg.get("text") or "")
+        if command in KNOWN_COMMANDS:
+            # блок I, 2026-10-16: команды видны в data/oskard.log (без текста сообщения и токена)
+            logger.info("telegram command /%s (allowlisted chat)", command)
         if command == PANIC_COMMAND:
             self._reply(self._run_panic(msg))
         elif command == STATUS_COMMAND:
@@ -267,7 +278,18 @@ class ButtonPoller:
             else:
                 text, keyboard = mode_message(self._on_mode(None))
                 self._reply(text, keyboard)
+        elif command == DIGEST_COMMAND:
+            self._reply(self._run_digest())
         # не команда / неизвестная команда — молча
+
+    def _run_digest(self) -> str:
+        if self._on_digest is None:
+            return "сводка не подключена"
+        try:
+            return str(self._on_digest())
+        except Exception as e:  # noqa: BLE001 - сводка не роняет поллер
+            logger.error("digest failed: %s", e)
+            return f"сводка недоступна: {_esc(e)}"
 
     def _run_panic(self, msg: dict) -> str:
         self._state.panic()  # флаги — сразу, даже если обработчик ниже сломан (ст. 6 п. 2)
@@ -434,7 +456,7 @@ class ButtonPoller:
     # ---------------------------------------------------------------- thread
 
     def register_commands(self) -> None:
-        """Меню команд сигнального бота (/mode /status /panic) — подсказка в Telegram."""
+        """Меню команд сигнального бота (/mode /status /digest /panic) — подсказка в Telegram."""
         try:
             self._http.post(f"{self._base}/setMyCommands", json={"commands": BOT_COMMANDS})
         except Exception as e:  # noqa: BLE001 - меню вторично

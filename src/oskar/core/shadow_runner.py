@@ -19,6 +19,11 @@ Cooldown kline-эндпоинта (бан 109429 / бюджет ошибок к�
 пересборка вотчлиста ждут окончания паузы — одна строка в лог, не шторм
 ошибок по 20 символам каждый тик. Прерванный скан старый вотчлист не трогает:
 частичный топ перекошен к началу алфавита.
+
+Защелка просадки / panic (блок I, 2026-10-16): пока стоит защелка drawdown_halt (блок H) или
+panic, цикл (run_once) не запускается — иначе кандидаты уходили к Scout/Trader, бюджет LLM
+тратился, а исполнитель все равно отказывал. Строка в лог — раз в HALT_LOG_SEC; дорешивание
+counterfactuals и equity идут как обычно. SAFE MODE и пауза цикл останавливают сами.
 """
 
 import html
@@ -27,10 +32,11 @@ import threading
 import time
 
 from oskar.core.cycle import ShadowCycle
-from oskar.core.emergency import engage_safe_mode, retry_safe_mode_persist
+from oskar.core.emergency import engage_safe_mode, panic_engaged, retry_safe_mode_persist
 from oskar.core.state import RuntimeState
 from oskar.data.client import classify_error
 from oskar.data.scanner import scan
+from oskar.risk.drawdown import read_halt
 
 logger = logging.getLogger("oskar.shadow")
 
@@ -46,6 +52,7 @@ NET_STREAK_FACTOR = 4  # сетевые сбои: серия в 4 раза дл�
 # по 25 мин (15.10) — сторож супервизора («лог не обновлялся 15 мин») срабатывал бы ложно.
 # Формат строки — контракт с scripts/supervise.ps1 ($HeartbeatPattern), см. тест.
 HEARTBEAT_SEC = 300.0
+HALT_LOG_SEC = 1800.0  # «цикл стоит: защелка просадки/panic» — не чаще раза в 30 мин
 
 
 class ShadowRunner:
@@ -97,6 +104,7 @@ class ShadowRunner:
         self._equity_interval = EQUITY_SEC
         self._heartbeat_at: float | None = None  # None — первый пульс сразу после старта потока
         self._candidates_at: float | None = None  # последний тик с кандидатами (часы self._clock)
+        self._halt_logged_at: float | None = None  # последняя строка «цикл стоит» (None — не стоит)
         self._stop = threading.Event()
 
     # ---------------------------------------------------------------- equity
@@ -210,6 +218,26 @@ class ShadowRunner:
             except Exception as ne:  # noqa: BLE001
                 logger.warning("notify failed: %s", ne)
 
+    def _entries_halted(self) -> str | None:
+        """panic или защелка просадки — в памяти и в meta журнала (переживают рестарт)."""
+        st = self._state
+        try:
+            if st.panic_at is not None or panic_engaged(st.journal):
+                return "panic"
+            halt = read_halt(st.journal)
+        except Exception as e:  # noqa: BLE001 - meta не прочитана: цикл решит сам (он тоже читает журнал)
+            logger.warning("entry halt flags unreadable: %s", e)
+            return None
+        return None if halt is None else f"стоп по просадке −{halt.pct:.1f}% от пика ${halt.peak:.2f}"
+
+    def _skip_cycle(self, now: float, why: str) -> None:
+        """Тик без цикла: поток жив (тик считается, пульс идет), к Scout/Trader никто не уходит."""
+        self.ticks += 1
+        self.last_report = {"halted": why}
+        if self._halt_logged_at is None or now - self._halt_logged_at >= HALT_LOG_SEC:
+            self._halt_logged_at = now
+            logger.warning("cycle skipped: %s - no escalation to Scout/Trader until it is lifted", why)
+
     def tick(self) -> None:
         """Один такт. Все падения инфраструктуры ловятся здесь."""
         retry_safe_mode_persist(self._state)  # SAFE MODE не записан в meta — повтор (ревью Codex R1)
@@ -245,27 +273,34 @@ class ShadowRunner:
             return
         self._cooldown_announced = False
 
-        try:
-            report = self._cycle.run_once(self.watchlist, self.equity_usd)
-        except Exception as e:  # noqa: BLE001 - инфраструктура (сеть/биржа/логика)
-            self._fail(e, "cycle")
-            return
-        self.ticks += 1
-        self.last_report = {
-            "scanned": report.scanned, "scored": report.scored,
-            "candidates": report.candidates, "risk_passed": report.risk_passed,
-            "errors": len(report.errors),
-        }
-        if report.candidates:
-            self._candidates_at = now
-            logger.info("tick %d: %s", self.ticks, self.last_report)
-        for e in report.errors:
-            if e not in self._seen_cycle_errors:
-                self._seen_cycle_errors.add(e)
-                logger.warning("cycle error (далее молчу до смены вотчлиста): %s", e)
-        if report.scanned and len(report.errors) >= report.scanned:
-            self._fail(RuntimeError(f"all {report.scanned} symbols failed"), "cycle")
-            return
+        halt = self._entries_halted()
+        if halt is not None:
+            self._skip_cycle(now, halt)
+        else:
+            if self._halt_logged_at is not None:
+                logger.warning("cycle resumed: entry halt lifted")
+                self._halt_logged_at = None
+            try:
+                report = self._cycle.run_once(self.watchlist, self.equity_usd)
+            except Exception as e:  # noqa: BLE001 - инфраструктура (сеть/биржа/логика)
+                self._fail(e, "cycle")
+                return
+            self.ticks += 1
+            self.last_report = {
+                "scanned": report.scanned, "scored": report.scored,
+                "candidates": report.candidates, "risk_passed": report.risk_passed,
+                "errors": len(report.errors),
+            }
+            if report.candidates:
+                self._candidates_at = now
+                logger.info("tick %d: %s", self.ticks, self.last_report)
+            for e in report.errors:
+                if e not in self._seen_cycle_errors:
+                    self._seen_cycle_errors.add(e)
+                    logger.warning("cycle error (далее молчу до смены вотчлиста): %s", e)
+            if report.scanned and len(report.errors) >= report.scanned:
+                self._fail(RuntimeError(f"all {report.scanned} symbols failed"), "cycle")
+                return
 
         if now - self._resolve_at >= RESOLVE_SEC:
             for symbol in self._resolve_symbols():

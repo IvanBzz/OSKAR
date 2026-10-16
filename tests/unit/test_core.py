@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from oskar.core.api import build_app
 from oskar.core.cycle import CycleConfig, ShadowCycle
 from oskar.core.daemon import SingleInstanceError, check_port_free
+from oskar.core.executor import ExecutionOutcome
 from oskar.core.state import RuntimeState
 from oskar.detect.smc import SmcConfig
 from oskar.journal.db import connect
@@ -29,8 +30,18 @@ def state(tmp_path):
 
 
 @pytest.fixture
-def client(state):
-    return TestClient(build_app(state))
+def executed():
+    return []
+
+
+@pytest.fixture
+def client(state, executed):
+    # approve через API исполняет (блок I, 2026-10-16): исполнитель-заглушка
+    def execute(decision_id, mode):
+        executed.append((decision_id, mode))
+        return ExecutionOutcome(True, f"{mode}: исполнено", entry_type=mode, entry_sent=True)
+
+    return TestClient(build_app(state, execute_fn=execute))
 
 
 def add_pending(state, decision_id="d1", expires_in_min=10):
@@ -53,10 +64,11 @@ def test_status(client, state):
     assert r["paused"] is False and r["safe_mode"] is False
 
 
-def test_approve_flow(client, state):
+def test_approve_flow(client, state, executed):
     add_pending(state, "d1")
     assert client.get("/pending").json()[0]["decision_id"] == "d1"
     assert client.post("/decisions/d1/approve").json()["resolution"] == "approved"
+    assert executed == [("d1", "market")]  # без плана в карточке — маркет
     assert client.get("/pending").json() == []
     # повторное разрешение отвергается
     assert client.post("/decisions/d1/reject").status_code == 409

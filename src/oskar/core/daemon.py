@@ -5,8 +5,11 @@
 2. Single-instance lock: файловый замок + пробный бинд порта API (settings.api,
    по умолчанию 127.0.0.1:8321) — занят = второй экземпляр, громкая ошибка
    (v1: два экземпляра слили ADA в двойную позицию)
-3. Журнал (settings.journal.db_path) + RuntimeState (run_id)
-4. uvicorn с управляющим API; при выходе — stop + join фоновых потоков
+3. Журнал (settings.journal.db_path) + RuntimeState (run_id, запуск записан в meta)
+4. Проверка биржи ДО первого входа (блок I, 2026-10-16): свои сироты — снять, ордера/позиции
+   OSKAR чужого запуска (вторая машина?) — SAFE MODE, ничего не снимаем; затем потоки
+   runner / монитор / ops (инварианты, дневная сводка) / кнопки
+5. uvicorn с управляющим API; при выходе — stop + join фоновых потоков
 
 Торговый цикл (ShadowCycle) в Фазе 1 запускается отдельно/вручную;
 фоновый поток цикла подключается вместе с исполнением в Фазе 2.
@@ -314,6 +317,42 @@ def _make_monitor(state, settings, profile, token: str, chat_id: str, drawdown=N
     )
 
 
+def _make_digest_fn(state, runner, trading_mode, settings, profile, cfg):
+    """Текст дневной сводки (блок I, 2026-10-16): журнал + состояние демона + свежие вердикты
+    инвариантов (без алертов — их шлет InvariantWatch). То же у /digest в боте."""
+    from datetime import UTC, datetime
+
+    from oskar.core.emergency import safe_mode_engaged
+    from oskar.ops.digest import RuntimeSnapshot, build_digest
+    from oskar.ops.invariants import evaluate
+
+    a = settings.get("agents", {})
+    budgets = {
+        "scout": int(a.get("scout", {}).get("daily_budget", 30)),
+        "trader": int(a.get("trader", {}).get("daily_budget", 20)),
+    }
+
+    def digest() -> str:
+        now = datetime.now(UTC)
+        try:
+            verdicts = evaluate(state.journal, now, max_loss_hold_seconds=profile.max_loss_hold_seconds)
+        except Exception as e:  # noqa: BLE001 - сводка без вердиктов лучше, чем без сводки
+            print(f"WARNING: digest invariants failed: {e}", flush=True)
+            verdicts = None
+        info = safe_mode_engaged(state.journal) if state.safe_mode else None
+        snap = RuntimeSnapshot(
+            run_id=state.run_id, uptime_sec=state.uptime_sec, runner_ticks=runner.ticks,
+            safe_mode=state.safe_mode, safe_reason=(info or {}).get("reason") or None,
+            paused=state.paused, panic=state.panic_at is not None,
+            mode=trading_mode.get() if trading_mode is not None else None,
+            equity_usd=runner.equity_usd, equity_source=runner.equity_source, budgets=budgets,
+        )
+        return build_digest(state.journal, now, snap, verdicts=verdicts,
+                            local_now=now.astimezone(cfg.tz), tz_label=cfg.tz_label)
+
+    return digest
+
+
 def _make_equity_fn(settings):
     """Equity с биржи при наличии ключей; None-фоллбек внутри runner'а.
     Среда — та же, что у исполнения (раньше sandbox был зашит True: реальные
@@ -384,6 +423,13 @@ def main() -> int:
     profile = load_active_profile()
     scanner = load_scanner_settings(settings)
     cycle_cfg = build_cycle_config(profile, scanner, settings)
+    from oskar.core.ops_jobs import ops_config
+
+    try:
+        ops_cfg = ops_config(settings)  # блок I: сводка и инварианты по расписанию
+    except ValueError as e:
+        print(f"REFUSING TO START: {e}", flush=True)
+        return 6
 
     # одна среда для исполнения, equity и монитора; реал закрыт гейтом Фазы 5. Белый список
     # (блок H, 2026-10-16): был черный — «real»/«Live»/опечатка + sandbox:false шли на реал.
@@ -402,6 +448,14 @@ def main() -> int:
 
     # маркер-файл — второй носитель SAFE MODE (ревью Codex R1, 2026-10-16)
     state = RuntimeState(journal=journal, safe_mode_flag=REPO_ROOT / "data" / SAFE_MODE_FLAG_NAME)
+    # Запуск известен журналу с первой секунды: его сироты — «свои» (снимаются), ордера
+    # OSKAR с незнакомым run_id — чужая машина (блок I, 2026-10-16, core/run_registry.py)
+    from oskar.core.run_registry import register_run
+
+    try:
+        register_run(journal, state.run_id)
+    except Exception as e:  # noqa: BLE001 - без записи сироты этого запуска сочтутся чужими (не снимем)
+        print(f"WARNING: run {state.run_id} not registered in journal: {e}", flush=True)
 
     import os
     import secrets
@@ -413,12 +467,13 @@ def main() -> int:
     load_dotenv(REPO_ROOT / ".env")  # ДО чтения Telegram-переменных: иначе поллер и алерты молча OFF
     signals_token = os.getenv("TELEGRAM_SIGNALS_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
-    alert = None
+    alert = alert_sender = None
     alert_token = signals_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
     if alert_token and chat_id:
         from oskar.core.telegram_out import TelegramSender
 
-        alert = TelegramSender(alert_token, chat_id).send_text
+        alert_sender = TelegramSender(alert_token, chat_id)  # тот же бот, что шлет карточки
+        alert = alert_sender.send_text
 
     engaged = panic_engaged(journal)
     if engaged:
@@ -487,13 +542,34 @@ def main() -> int:
     print(f"execution mode: {trading_mode.get()} (auto allowed: {trading_mode.allowed})", flush=True)
     cycle._escalator = _make_escalator(state, caps, profile, settings, runner, cache,
                                        auto_executor=auto_executor)
-    runner_thread = runner.start_thread()
 
     # Монитор — ДО поллера: Telegram /panic зовет monitor.panic_flatten(), а /panic,
     # пролежавший в очереди Telegram, поллер исполнит на первом же опросе.
     monitor = _make_monitor(state, settings, profile, alert_token, chat_id, drawdown=drawdown)
+    if monitor is not None:
+        # Блок I, 2026-10-16: сироты и позиции без сделки — ДО первого входа (runner еще не
+        # запущен). Ордера OSKAR чужого запуска (вторая машина?) -> SAFE MODE, ничего не снимаем.
+        startup = monitor.startup_check()
+        print(f"startup exchange check: orphans cancelled {len(startup.orphans)}, "
+              f"untracked positions {len(startup.mismatches)}, errors {len(startup.errors)}"
+              f"{' - SAFE MODE' if state.safe_mode else ''}", flush=True)
+    runner_thread = runner.start_thread()
     monitor_thread = monitor.start_thread() if monitor is not None else None
     print(f"position monitor: {'ON' if monitor is not None else 'OFF (no keys)'}", flush=True)
+
+    # Инварианты по расписанию + дневная сводка (блок I, 2026-10-16)
+    from oskar.core.ops_jobs import InvariantWatch, OpsScheduler
+
+    digest_fn = _make_digest_fn(state, runner, trading_mode, settings, profile, ops_cfg)
+    ops = OpsScheduler(
+        journal, ops_cfg,
+        watch=InvariantWatch(journal, alert, max_loss_hold_seconds=profile.max_loss_hold_seconds),
+        digest_fn=digest_fn, notify=alert,
+    )
+    ops_thread = ops.start_thread()
+    print(f"ops: invariants every {ops_cfg.invariants_every}, digest "
+          f"{ops_cfg.digest_at.strftime('%H:%M')} {ops_cfg.tz_name} "
+          f"({'ON' if alert is not None else 'OFF: telegram not configured'})", flush=True)
 
     poller = poller_thread = None
     if signals_token and chat_id:
@@ -510,17 +586,28 @@ def main() -> int:
             on_panic=lambda: engage_panic(state, monitor),
             on_status=lambda: f"{status_line(state, runner)} · режим: {trading_mode.get()}",
             on_mode=on_mode if auto_executor is not None else None,
+            on_digest=digest_fn,
         )
         poller_thread = poller.start_thread()
-        print(f"button poller: ON (signals bot, /mode /panic /status), execution: "
+        print(f"button poller: ON (signals bot, /mode /panic /status /digest), execution: "
               f"{'ON' if executor is not None else 'OFF (no keys)'}", flush=True)
+
+    def card_done(decision_id: str) -> None:
+        """approve через API закрыл решение — снять кнопки с карточки (нажимать нечего)."""
+        row = journal.execute(
+            "SELECT telegram_message_id FROM pending_approvals WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
+        if alert_sender is not None and row is not None and row[0]:
+            alert_sender.remove_buttons(row[0])
 
     # токен API: страница в браузере на этой же машине не должна жать panic/approve
     api_token = os.getenv("OSKAR_API_TOKEN", "") or secrets.token_hex(16)
     token_path = REPO_ROOT / "data" / "oskard.token"
     token_path.write_text(api_token, encoding="ascii")  # читают Hermes-скиллы и CLI
+    # approve через API (Hermes) — тот же охраняемый исполнитель, что у кнопок и автомата
     app = build_app(state, shadow=runner, monitor=monitor, api_token=api_token,
-                    trading_mode=trading_mode, drawdown=drawdown)
+                    trading_mode=trading_mode, drawdown=drawdown,
+                    execute_fn=guarded_execute, on_card_done=card_done)
     print(
         f"oskard starting: run_id={state.run_id} profile={profile.name} "
         f"mode={mode} sandbox={_sandbox(settings)} api=http://{api_host}:{api_port} "
@@ -532,7 +619,8 @@ def main() -> int:
     # log_config=None: uvicorn не ставит свои хендлеры в stderr, его WARNING+ идут
     # через корневые — с ротацией и вычисткой секретов
     uvicorn.run(app, host=api_host, port=api_port, log_level="warning", log_config=None)
-    stuck = stop_and_join([(runner, runner_thread), (poller, poller_thread), (monitor, monitor_thread)])
+    stuck = stop_and_join([(runner, runner_thread), (poller, poller_thread), (monitor, monitor_thread),
+                           (ops, ops_thread)])
     if stuck:
         print(f"shutdown: still busy after {THREAD_JOIN_TIMEOUT_SEC:.0f}s: {', '.join(stuck)} "
               "(daemon threads end with the process)", flush=True)

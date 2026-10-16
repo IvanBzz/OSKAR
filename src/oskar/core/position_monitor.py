@@ -24,7 +24,10 @@
    расхождение два тика подряд -> SAFE MODE + Telegram, один раз на ключ;
 5. стоп по просадке (блок H, 2026-10-16): пик equity и защелка drawdown_halt в meta
    (risk/drawdown.py). Защелка закрывает только НОВЫЕ входы — сопровождение и защита
-   открытых позиций выше идут как обычно.
+   открытых позиций выше идут как обычно;
+6. сироты (раз в 10 мин и при старте демона ДО первого входа, блок I 2026-10-16): ордер
+   OSKAR своего запуска без сделки — снять; чужого запуска (вторая машина?) — не трогать,
+   SAFE MODE + алерт. Позиция без сделки при старте — так же (SAFE MODE, не закрываем).
 
 SAFE MODE пишется в meta (переживает рестарт, core/emergency.py). Алерты — с
 экранированием под parse_mode=HTML и ошибками биржи через short_error (без подписанных
@@ -46,6 +49,7 @@ from datetime import UTC, datetime
 from oskar.core.approvals import mark_decision
 from oskar.core.emergency import engage_safe_mode
 from oskar.core.executor import short_error
+from oskar.core.run_registry import cid_run_id, run_known
 from oskar.data.client import exchange_error_code
 from oskar.execution.base import (
     ExchangeAdapter,
@@ -95,6 +99,12 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def _untracked_msg(symbol: str, side: str, qty: float) -> str:
+    """Одна строка и у reconcile, и у проверки на старте: по ней дедуп алерта."""
+    return (f"позиция на бирже без сделки в журнале (ручная или второй запуск OSKAR?): "
+            f"{symbol} {side} qty {qty:g}")
+
+
 def _parse_iso(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -141,6 +151,8 @@ class PositionMonitor:
         self._replaced: dict[str, int] = {}  # "<decision>:<sl|tp>" -> сколько раз ставили
         self._protect_fail: dict[str, int] = {}  # "<decision>:<sl|tp>" -> неудач подряд
         self._orphan_scan_at: datetime | None = None
+        self._known_runs: set[str] = set()  # run_id, подтвержденные журналом (свои сироты)
+        self._reported_foreign: set[str] = set()  # "<orders|positions>:<объект>" — алерт уже был
         self.last_report: dict = {}
         self.ticks = 0
         self._stop = threading.Event()
@@ -571,11 +583,17 @@ class PositionMonitor:
 
     # ------------------------------------------------------------- reconcile
 
-    def _reconcile(self, rep: MonitorReport) -> None:
+    def _exchange_positions(self) -> dict[tuple[str, str], float]:
         on_exchange: dict[tuple[str, str], float] = {}
         for p in self._ex.positions():
             if p.qty > 0:
                 on_exchange[(p.symbol, p.side)] = on_exchange.get((p.symbol, p.side), 0.0) + p.qty
+        return on_exchange
+
+    def _reconcile(self, rep: MonitorReport) -> None:
+        """Позиция биржи без сделки журнала (ручная, вторая машина, потерянный журнал) не
+        закрывается и не игнорируется: SAFE MODE + алерт после подтверждения вторым тиком."""
+        on_exchange = self._exchange_positions()
         in_journal: dict[tuple[str, str], float] = {}
         for r in self._trades("open"):
             key = (r["symbol"], r["side"])
@@ -583,7 +601,7 @@ class PositionMonitor:
         found: list[str] = []
         for key, qty in on_exchange.items():
             if key not in in_journal:
-                found.append(f"позиция на бирже без сделки в журнале: {key[0]} {key[1]} qty {qty:g}")
+                found.append(_untracked_msg(key[0], key[1], qty))
             elif in_journal[key] and abs(qty - in_journal[key]) / in_journal[key] > QTY_TOLERANCE:
                 found.append(
                     f"qty расходится: {key[0]} {key[1]} биржа {qty:g} / журнал {in_journal[key]:g}"
@@ -610,15 +628,49 @@ class PositionMonitor:
 
     # --------------------------------------------------------------- orphans
 
-    def _scan_orphans(self, rep: MonitorReport) -> None:
+    def _run_known(self, run_id: str) -> bool:
+        if run_id in self._known_runs:
+            return True
+        current = getattr(self._state, "run_id", None)
+        try:
+            known = run_known(self._j, run_id, current)
+        except Exception as e:  # noqa: BLE001 - журнал не прочитан: чужой (не снимать надежнее)
+            logger.warning("run %s lookup failed (%s) - treated as foreign", run_id, e)
+            return False
+        if known:
+            self._known_runs.add(run_id)  # запуск журналу не «забывается»
+        return known
+
+    def _foreign_found(self, items: list[str], scope: str) -> None:
+        """Ордера/позиции чужого запуска (вторая машина?): НИЧЕГО не снимаем — SAFE MODE и
+        алерт, один раз на набор (новые объекты — новый алерт; ушедшие — можно снова)."""
+        current = {f"{scope}:{x}" for x in items}
+        new = current - self._reported_foreign
+        self._reported_foreign = {k for k in self._reported_foreign if not k.startswith(scope + ":")}
+        self._reported_foreign |= current
+        if not new:
+            return
+        logger.critical("foreign OSKAR %s on exchange (second machine?): %s", scope, "; ".join(items))
+        if self._state is not None:
+            engage_safe_mode(self._state, "на бирже ордера/позиции OSKAR чужого запуска (вторая машина?)")
+        shown = "; ".join(items[:5]) + (f" и еще {len(items) - 5}" if len(items) > 5 else "")
+        self._say(f"🛑 на бирже ордера/позиции OSKAR чужого запуска (вторая машина?): {shown} — "
+                  "новые входы остановлены (SAFE MODE), ничего не снимаю. Проверь, не запущен ли "
+                  "oskard на второй машине; снять — oskar panic-reset")
+
+    def _scan_orphans(self, rep: MonitorReport, force: bool = False) -> None:
         """Открытые ордера OSKAR (clientOrderId «OSKAR-...»), которых журнал не знает:
         процесс упал между отправкой входа и записью, или после закрытия сделки
         остался ее SL/TP. Сирота-вход позже открыл бы позицию мимо журнала, а
         забытый closePosition-стоп закрыл бы СЛЕДУЮЩУЮ позицию по символу — снимаем.
-        Чужие ордера (ручные, прикрепленные биржей без нашего cid) не трогаем."""
+        Чужие ордера (ручные, прикрепленные биржей без нашего cid) не трогаем.
+
+        Блок I, 2026-10-16: снимаем только сирот СВОИХ запусков (run_id из cid известен
+        журналу, core/run_registry.py). Чужой run_id — ордер второй машины: снять его = снять
+        стоп чужой позиции. Не трогаем, SAFE MODE + алерт (_foreign_found)."""
         now = self._now()
         last = self._orphan_scan_at
-        if last is not None and (now - last).total_seconds() < ORPHAN_SCAN_SEC:
+        if not force and last is not None and (now - last).total_seconds() < ORPHAN_SCAN_SEC:
             return
         self._orphan_scan_at = now
         from oskar.core.executor import inflight_client_ids
@@ -635,11 +687,16 @@ class PositionMonitor:
         ).fetchall()
         known_ids = {x for r in live for x in (r["entry_order_id"], r["sl_order_id"], r["tp_order_id"]) if x}
         known_cids |= {cid_base(str(r["client_order_id"])) for r in live}
+        foreign: list[str] = []
         for o in orders:
             cid = o.client_order_id.lower()
             if not cid.startswith("oskar-"):
                 continue
             if o.exchange_id in known_ids or cid_base(cid) in known_cids:
+                continue
+            run = cid_run_id(cid)
+            if run is None or not self._run_known(run):
+                foreign.append(f"{o.symbol} {o.kind} {o.client_order_id}")
                 continue
             self._ex.cancel_order(o.symbol, o.exchange_id)
             rep.orphans.append(f"{o.symbol}:{o.kind}:{o.exchange_id}")
@@ -649,6 +706,51 @@ class PositionMonitor:
             else:
                 logger.info("orphan %s %s %s cancelled (%s)", o.kind, o.symbol, o.exchange_id,
                             o.client_order_id)
+        self._foreign_found(foreign, "orders")
+
+    # ---------------------------------------------------------------- startup
+
+    def startup_check(self) -> MonitorReport:
+        """Старт демона, ДО запуска runner'а (первого входа): скан сирот (свои — снять,
+        чужого запуска — SAFE MODE, не трогать) и позиции биржи без сделки в журнале.
+        Биржа недоступна — не приговор: первый полный тик монитора повторит скан."""
+        rep = MonitorReport()
+        try:
+            self._scan_orphans(rep, force=True)
+        except Exception as e:  # noqa: BLE001
+            self._orphan_scan_at = None  # первый тик повторит
+            rep.errors.append(f"orphans: {type(e).__name__}: {e}")
+            logger.warning("startup orphan scan failed: %s", e)
+        self._guard(rep, "startup_positions", lambda: self._startup_positions(rep))
+        logger.info("startup check: %s", rep.as_dict())
+        return rep
+
+    def _untracked_positions(self) -> dict[tuple[str, str], float]:
+        """Позиции биржи без open/pending сделки журнала (pending: лимитка могла исполниться,
+        пока демон лежал — ее переведет первый тик)."""
+        on_exchange = self._exchange_positions()
+        tracked = {(r["symbol"], r["side"]) for r in self._j.execute(
+            "SELECT symbol, side FROM trades WHERE status IN ('open','pending')").fetchall()}
+        return {k: q for k, q in on_exchange.items() if k not in tracked}
+
+    def _startup_positions(self, rep: MonitorReport) -> None:
+        """Позиция без сделки при старте: вторая машина, ручная или потерянный журнал. Тот же
+        исход, что у reconcile (SAFE MODE + алерт, ничего не закрываем), но до первого входа.
+        Подтверждение повторным чтением (один кривой ответ биржи — не расхождение)."""
+        first = self._untracked_positions()
+        if not first:
+            return
+        confirmed = {k: q for k, q in self._untracked_positions().items() if k in first}
+        if not confirmed:
+            return
+        for (symbol, side), qty in confirmed.items():
+            m = _untracked_msg(symbol, side, qty)
+            # reconcile полного тика не повторяет тот же алерт
+            self._mismatch_streak[m] = CONFIRM_TICKS
+            self._reported_mismatches.add(m)
+            rep.mismatches.append(m)
+        self._foreign_found([f"позиция {s} {sd} qty {q:g} без сделки в журнале"
+                             for (s, sd), q in confirmed.items()], "positions")
 
     # ----------------------------------------------------------------- panic
 

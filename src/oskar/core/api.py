@@ -1,8 +1,8 @@
 """Управляющий API демона — 127.0.0.1:8321 (бинд порта = single-instance lock).
 
 Панель для Hermes-скиллов (oskar-control, oskar-approvals) и CLI. Никакой
-торговой логики здесь: approve/reject меняют pending_approvals; исполнение
-подхватывает цикл (Фаза 2). Истекший TTL необратим — fail-closed.
+торговой логики здесь: reject/snooze меняют pending_approvals, approve отдает решение
+исполнителю демона (ниже). Истекший TTL необратим — fail-closed.
 
 Защита (ревью 2026-10-13): loopback не защищает от страницы в браузере на той
 же машине — POST без preflight мог снять паузу или нажать panic/approve.
@@ -12,9 +12,15 @@ loopback-именами, автодокументация выключена.
 panic / panic-reset — тонкие обертки над core/emergency.py: та же функция
 обслуживает Telegram `/panic` и CLI `oskar panic` (ст. 6, ревью 2026-10-13).
 drawdown/reset — ручное снятие стопа по просадке (risk/drawdown.py, блок H 2026-10-16).
+
+Блок I, 2026-10-16: approve исполняет (approvals.approve_and_execute -> тот же охраняемый
+исполнитель, что у кнопок и автомата) и отвечает фактическим исходом; reject/snooze — как
+были. GET /positions и GET /pnl — срезы журнала для скилла oskar-control (ops/digest.py).
 """
 
+import logging
 import secrets
+from datetime import UTC, datetime, timedelta
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -29,9 +35,14 @@ from oskar.core.emergency import (  # noqa: F401 - PANIC_META_KEY/panic_engaged:
 from oskar.core.state import RuntimeState
 from oskar.risk.drawdown import DrawdownError, drawdown_status
 
+logger = logging.getLogger("oskar.api")
+
 
 def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | None = None,
-              trading_mode=None, drawdown=None) -> FastAPI:
+              trading_mode=None, drawdown=None, execute_fn=None, on_card_done=None) -> FastAPI:
+    """execute_fn — (decision_id, entry_type) -> ExecutionOutcome: equity_guarded исполнитель
+    демона (None — нет ключей биржи, approve отвечает 409). on_card_done(decision_id) — снять
+    кнопки с карточки, когда approve через API закрыл решение."""
     hardened = bool(api_token)
 
     def require_token(x_oskar_token: str = Header(default="")):
@@ -92,6 +103,28 @@ def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | N
             payload["data"] = health() if callable(health) else {}
         return payload
 
+    @app.get("/positions")
+    def positions():
+        """Открытые позиции и ждущие лимитки по журналу (монитор сверяет его с биржей)."""
+        from oskar.ops.digest import live_positions
+
+        rows = live_positions(state.journal)
+        return {
+            "open": sum(1 for r in rows if r["status"] == "open"),
+            "pending": sum(1 for r in rows if r["status"] == "pending"),
+            "positions": rows,
+        }
+
+    @app.get("/pnl")
+    def pnl(hours: float = 24.0):
+        """P&L закрытых сделок за окно: сверенный по филлам биржи и несверенный — раздельно.
+        hours<=0 — за всю историю журнала."""
+        from oskar.ops.digest import closed_pnl
+
+        now = datetime.now(UTC)
+        since = now - timedelta(hours=hours) if hours > 0 else None
+        return {"hours": hours if hours > 0 else None, **closed_pnl(state.journal, since, now)}
+
     @app.get("/pending")
     def pending():
         rows = state.journal.execute(
@@ -112,8 +145,29 @@ def build_app(state: RuntimeState, shadow=None, monitor=None, api_token: str | N
         return {"decision_id": decision_id, "resolution": out.resolution}
 
     @app.post("/decisions/{decision_id}/approve")
-    def approve(decision_id: str):
-        return _resolve(decision_id, "approve")
+    def approve(decision_id: str, entry: str | None = None):
+        """approve + исполнение. entry=market|limit; без него — выбор Trader'а. Ответ — исход
+        исполнителя (ok, note, kind, entry_sent, resolution). До биржи не дошло — approve
+        откатан, карточка жива (resolution=null); вход ушел — решение закрыто."""
+        from oskar.core.approvals import approve_and_execute
+
+        if execute_fn is None:
+            raise HTTPException(409, "исполнение не подключено (нет ключей биржи): approve не "
+                                     "записан, карточка жива — реши кнопкой")
+        res = approve_and_execute(
+            state.journal, decision_id, execute_fn, entry_type=entry,
+            paused=state.paused, safe_mode=state.safe_mode,
+        )
+        if not res.attempted:
+            raise HTTPException(res.code, res.note)
+        logger.info("API approve %s (%s): ok=%s kind=%s entry_sent=%s: %s", decision_id,
+                    res.entry_type, res.ok, res.kind, res.entry_sent, res.note)
+        if res.resolution == "approved" and on_card_done is not None:
+            try:
+                on_card_done(decision_id)
+            except Exception as e:  # noqa: BLE001 - косметика карточки
+                logger.warning("card finalize after API approve failed: %s", e)
+        return res.as_dict(decision_id)
 
     @app.post("/decisions/{decision_id}/reject")
     def reject(decision_id: str):

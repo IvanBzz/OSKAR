@@ -114,10 +114,19 @@ class TelegramSender:
                 },
             )
         payload = r.json()
-        return SentMessage(
+        sent = SentMessage(
             message_id=int(payload.get("result", {}).get("message_id", 0)),
             ok=bool(payload.get("ok")),
         )
+        # блок I, 2026-10-16: факт отправки карточки — в лог (без URL: в нем токен бота)
+        if sent.ok:
+            logger.info("setup card sent: %s %s %s (message %s, buttons=%s, chart=%s)",
+                        candidate.id, to_display(candidate.symbol), candidate.direction,
+                        sent.message_id, buttons, chart_png is not None)
+        else:
+            logger.warning("setup card REFUSED by telegram: %s (HTTP %s: %s)", candidate.id,
+                           getattr(r, "status_code", "?"), str(payload.get("description", ""))[:200])
+        return sent
 
 
 def _json(obj: Any) -> str:
